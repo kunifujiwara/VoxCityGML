@@ -1180,7 +1180,7 @@ def export_landcover_obj(
     output_dir: str,
     basename: str = "landcover",
     *,
-    citygml_path: str | None = None,
+    citygml_path: str | list[str] | None = None,
     rectangle_vertices=None,
     center_lon: float | None = None,
     center_lat: float | None = None,
@@ -1223,7 +1223,7 @@ def export_landcover_obj(
 # ------------------------------------------------------------------
 
 def _export_landcover_polygon_obj(
-    citygml_path: str,
+    citygml_path: str | list[str],
     rectangle_vertices,
     center_lon: float,
     center_lat: float,

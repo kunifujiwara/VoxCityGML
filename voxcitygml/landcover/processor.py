@@ -10,7 +10,7 @@ The land cover grid is used to set semantic labels on the topmost
 terrain voxels (the ground surface layer) in the final VoxCity model.
 """
 
-from typing import List, Tuple
+from typing import List, Tuple, Union
 import numpy as np
 
 
@@ -20,7 +20,7 @@ def get_land_cover_grid(
     land_cover_source: str,
     output_dir: str = "output",
     *,
-    citygml_path: str = "",
+    citygml_path: Union[str, List[str]] = "",
     **kwargs,
 ) -> np.ndarray:
     """Download / generate a land-cover classification grid.

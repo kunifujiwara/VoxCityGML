@@ -155,7 +155,7 @@ class VoxCityGML:
         print("\n[3/5] Acquiring land cover grid...")
         land_cover_grid = get_land_cover_grid(
             rectangle, cfg.meshsize, cfg.land_cover_source, cfg.output_dir,
-            citygml_path=citygml_paths[0],
+            citygml_path=citygml_paths,
         )
 
         # Resize to match DEM if shapes differ

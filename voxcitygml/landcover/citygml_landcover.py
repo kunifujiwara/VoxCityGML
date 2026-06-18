@@ -10,7 +10,7 @@ target rectangle and resolution.
 import logging
 import re
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Union
 
 import numpy as np
 from shapely.geometry import Polygon as ShapelyPolygon, box, Point
@@ -160,8 +160,26 @@ def _parse_landuse_polygons_regex(
     return features
 
 
-def _find_luse_files(citygml_path: str) -> List[Path]:
-    """Locate luse GML files in a CityGML dataset directory."""
+def _find_luse_files(citygml_path: Union[str, List[str]]) -> List[Path]:
+    """Locate luse GML files in one or more CityGML dataset directories.
+
+    *citygml_path* may be a single dataset root or a list of roots (as
+    returned by :func:`resolve_citygml_paths`).  When a list is given,
+    luse files from every dataset are collected and de-duplicated so the
+    target area is found regardless of which dataset contains it.
+    """
+    # Multiple dataset roots – collect luse files from each and dedupe
+    if isinstance(citygml_path, (list, tuple)):
+        collected: List[Path] = []
+        seen = set()
+        for p in citygml_path:
+            for f in _find_luse_files(p):
+                key = str(f.resolve())
+                if key not in seen:
+                    seen.add(key)
+                    collected.append(f)
+        return collected
+
     root = Path(citygml_path)
     # PLATEAU layout
     luse_dir = root / 'udx' / 'luse'
@@ -179,7 +197,7 @@ def _find_luse_files(citygml_path: str) -> List[Path]:
 
 
 def get_citygml_land_cover_grid(
-    citygml_path: str,
+    citygml_path: Union[str, List[str]],
     rectangle_vertices: List[Tuple[float, float]],
     meshsize: float,
 ) -> np.ndarray:
@@ -318,7 +336,7 @@ def get_citygml_land_cover_grid(
 # -----------------------------------------------------------------------
 
 def get_citygml_land_cover_polygons(
-    citygml_path: str,
+    citygml_path: Union[str, List[str]],
     rectangle_vertices: List[Tuple[float, float]],
 ) -> List[Tuple[int, ShapelyPolygon]]:
     """Return CityGML land use polygons clipped to the target rectangle.

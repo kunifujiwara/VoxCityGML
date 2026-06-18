@@ -121,7 +121,7 @@ def run_and_export(
     print("\n[3/6] Acquiring land cover grid...")
     land_cover_grid = get_land_cover_grid(
         rectangle, cfg.meshsize, cfg.land_cover_source, cfg.output_dir,
-        citygml_path=citygml_paths[0],
+        citygml_path=citygml_paths,
     )
     if land_cover_grid.shape != dem_grid.shape:
         from scipy.ndimage import zoom
@@ -237,7 +237,7 @@ def run_and_export(
             gp,
             output_dir=cfg.output_dir,
             basename=landcover_basename,
-            citygml_path=citygml_paths[0],
+            citygml_path=citygml_paths,
             rectangle_vertices=rectangle,
             center_lon=cfg.center_lon,
             center_lat=cfg.center_lat,

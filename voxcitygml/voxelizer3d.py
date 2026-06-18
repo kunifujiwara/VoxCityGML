@@ -13,6 +13,7 @@ from typing import List, Tuple, Optional
 
 import numpy as np
 from numba import njit, prange
+from scipy.ndimage import binary_fill_holes, zoom
 
 from .models import Mesh3D, CityGMLMeshCollection
 from .citygml.coordinates import swap_coordinates_3d, create_local_transformer
@@ -293,7 +294,7 @@ def _compute_grid_params_3d(
 def _allocate_voxel_grid(gp: Grid3DParams, max_voxel_ram_mb: Optional[float]) -> np.ndarray:
     bytes_per = np.dtype(np.int16).itemsize
     est_mb = gp.n_rows * gp.n_cols * gp.n_z * bytes_per / (1024 ** 2)
-    print(f"3D voxel grid: ({gp.n_rows}, {gp.n_cols}, {gp.n_z}) ~{est_mb:.1f} MB")
+    _log.info("3D voxel grid: (%d, %d, %d) ~%.1f MB", gp.n_rows, gp.n_cols, gp.n_z, est_mb)
     if max_voxel_ram_mb is not None and est_mb > max_voxel_ram_mb:
         raise MemoryError(
             f"Estimated voxel grid memory {est_mb:.1f} MB exceeds limit {max_voxel_ram_mb} MB."
@@ -438,47 +439,28 @@ def _fill_terrain_gaps_from_dem(
     _log.info("  Terrain DEM gap-fill: filled %d empty columns", n_gaps)
 
 
-def _cap_terrain_to_dem(
-    voxel_grid: np.ndarray,
-    gp: Grid3DParams,
-    dem_grid: np.ndarray,
-) -> None:
-    """Remove terrain voxels that protrude above the DEM surface.
-
-    The MeshLib level-set SDF tends to mark one extra voxel above the
-    actual terrain surface because it includes any voxel whose centre
-    falls inside the solid (or the narrow-band extends slightly beyond).
-    This shifts the effective ground level up by ~1 voxel and makes
-    buildings appear sunken.
-
-    This function clears GROUND_CODE voxels whose Z-index exceeds the
-    DEM-derived ground level, restoring the correct surface height
-    without losing the solid interior fill or the gap-fill coverage.
-    """
-    ground_levels = np.rint((dem_grid - gp.min_z) / gp.voxel_size).astype(np.intp)
-    ground_levels = np.clip(ground_levels, 0, gp.n_z - 1)
-
-    z_indices = np.arange(gp.n_z, dtype=np.intp)
-    # Mask: voxels ABOVE the DEM ground level
-    above_dem = z_indices[np.newaxis, np.newaxis, :] > ground_levels[:, :, np.newaxis]
-    # Only clear voxels that are currently GROUND_CODE
-    is_ground = voxel_grid == GROUND_CODE
-    to_clear = above_dem & is_ground
-
-    n_cleared = int(to_clear.sum())
-    if n_cleared > 0:
-        voxel_grid[to_clear] = 0
-        _log.info("  Terrain DEM cap: cleared %d over-estimated voxels", n_cleared)
-
-
 # ── MeshLib-based voxelization ────────────────────────────────────────
 
 def _meshlib_mesh_from_numpy(verts: np.ndarray, faces: np.ndarray):
-    """Convert numpy (float64) vertices & (int32) faces to a MeshLib Mesh."""
-    return _mrnp.meshFromFacesVerts(
+    """Convert numpy verts & faces to a MeshLib Mesh in a shifted local frame.
+
+    MeshLib's internal Vector3f is float32, so verts are cast to float32. To
+    avoid precision loss when the local-metre frame is far from zero (~10 cm
+    error at ±1e5 m), the bbox-min is subtracted first so float32 values stay
+    near the origin where precision is sub-millimeter.
+
+    Returns ``(mesh, shift)`` where *shift* is a float64 (3,) array that the
+    caller must add to any MeshLib-frame coordinate (e.g. SDF origin, bbox
+    min) to recover the original world coordinates.
+    """
+    verts_f64 = np.ascontiguousarray(verts, dtype=np.float64)
+    shift = verts_f64.min(axis=0)
+    verts_local = (verts_f64 - shift).astype(np.float32, copy=False)
+    mesh = _mrnp.meshFromFacesVerts(
         np.ascontiguousarray(faces, dtype=np.int32),
-        np.ascontiguousarray(verts, dtype=np.float32),
+        np.ascontiguousarray(verts_local),
     )
+    return mesh, shift
 
 
 def _voxelize_meshlib_levelset(
@@ -499,7 +481,7 @@ def _voxelize_meshlib_levelset(
     Returns True on success, False if the mesh cannot be voxelized this way.
     """
     try:
-        ml_mesh = _meshlib_mesh_from_numpy(verts, faces)
+        ml_mesh, shift = _meshlib_mesh_from_numpy(verts, faces)
         vs = float(gp.voxel_size)
 
         params = _mr.MeshToVolumeParams()
@@ -515,14 +497,15 @@ def _voxelize_meshlib_levelset(
         simple_vol = _mr.vdbVolumeToSimpleVolume(vdb_vol)
         sdf = _mrnp.getNumpy3Darray(simple_vol)  # shape (dx, dy, dz)
 
-        # Origin of the VDB grid in mesh-local metres
-        origin = np.array([out_xf.b.x, out_xf.b.y, out_xf.b.z], dtype=np.float64)
+        # Origin of the VDB grid in world (local-metre) coordinates: the
+        # shifted-frame origin from MeshLib plus the pre-shift applied in
+        # _meshlib_mesh_from_numpy.
+        origin = np.array([out_xf.b.x, out_xf.b.y, out_xf.b.z], dtype=np.float64) + shift
 
         inside_mask = sdf <= 0.0  # negative = inside the solid
 
         # The narrow-band SDF may leave far-interior voxels at the
         # background value (+).  Flood-fill guarantees a solid.
-        from scipy.ndimage import binary_fill_holes
         inside_mask = binary_fill_holes(inside_mask)
 
         # Map SDF voxel indices → main voxel-grid indices
@@ -553,7 +536,7 @@ def _voxelize_meshlib_winding(
     Returns True on success.
     """
     try:
-        ml_mesh = _meshlib_mesh_from_numpy(verts, faces)
+        ml_mesh, shift = _meshlib_mesh_from_numpy(verts, faces)
         vs = float(gp.voxel_size)
 
         box = ml_mesh.computeBoundingBox()
@@ -572,10 +555,12 @@ def _voxelize_meshlib_winding(
         simple_vol = _mr.meshToDistanceVolume(_mr.MeshPart(ml_mesh), params)
         sdf = _mrnp.getNumpy3Darray(simple_vol)  # may have NaN outside band
 
+        # SDF origin in world (local-metre) coordinates: shifted-frame
+        # origin plus the pre-shift applied in _meshlib_mesh_from_numpy.
         origin = np.array(
             [params.vol.origin.x, params.vol.origin.y, params.vol.origin.z],
             dtype=np.float64,
-        )
+        ) + shift
 
         # Inside = distance ≤ 0 (NaN is outside the narrow band)
         inside_mask = np.nan_to_num(sdf, nan=1.0) <= 0.0
@@ -583,7 +568,6 @@ def _voxelize_meshlib_winding(
         # The narrow band (maxDistSq) only computes SDF within a few
         # voxels of the surface.  Far-interior voxels are NaN → False.
         # Flood-fill closes the enclosed interior cheaply.
-        from scipy.ndimage import binary_fill_holes
         inside_mask = binary_fill_holes(inside_mask)
 
         _stamp_meshlib_mask(
@@ -828,6 +812,14 @@ def _voxelize_mesh_group(
                     class_code, overwrite,
                 )
                 if ok:
+                    # Union with surface shell so leaves / branches thinner
+                    # than one voxel are not lost by the narrow-band SDF.
+                    _overlay_surface_shell(
+                        verts, faces, gp, voxel_grid,
+                        class_code, overwrite,
+                        occupancy_threshold=occupancy_threshold,
+                        occupancy_subdivisions=occupancy_subdivisions,
+                    )
                     continue
             _voxelize_single_mesh(
                 verts, faces, gp, voxel_grid, class_code, overwrite,
@@ -1345,7 +1337,6 @@ def _fill_interior(surface: np.ndarray) -> np.ndarray:
     """Fill the interior of a closed surface shell using scipy's binary_fill_holes."""
     if surface.size == 0:
         return surface
-    from scipy.ndimage import binary_fill_holes
     return binary_fill_holes(surface)
 
 
@@ -1373,7 +1364,10 @@ def _apply_land_cover(
     ground_levels = np.where(has_ground, actual_z, dem_levels)
     ground_levels = np.clip(ground_levels, 0, gp.n_z - 1)
 
-    valid = (ground_levels >= 0) & (ground_levels < gp.n_z)
+    # Skip cells with code 0 — they would otherwise overwrite the ground
+    # voxel below (only OpenStreetMap codes are pre-shifted by +1; CityGML
+    # and generic sources may legitimately produce 0 for "unknown").
+    valid = (ground_levels >= 0) & (ground_levels < gp.n_z) & (land_cover != 0)
     rows, cols = np.where(valid)
     voxel_grid[rows, cols, ground_levels[rows, cols]] = land_cover[rows, cols]
 
@@ -1392,7 +1386,7 @@ def _apply_canopy(
     top_arr = canopy_top.astype(np.float64)
     has_tree = top_arr > 0
     if not np.any(has_tree):
-        print("  [canopy] No cells with canopy_top > 0 – skipping.")
+        _log.info("  [canopy] No cells with canopy_top > 0 – skipping.")
         return
 
     n_tree_cells = int(np.count_nonzero(has_tree))
@@ -1435,10 +1429,12 @@ def _apply_canopy(
         voxel_grid[all_r[mask], all_c[mask], all_z[mask]] = TREE_CODE
         n_placed = int(mask.sum())
 
-    print(f"  [canopy] {n_tree_cells} cells with canopy > 0, "
-          f"{len(rs)} valid after z-range check, "
-          f"{n_placed} tree voxels placed"
-          f"{f', {n_skipped_mesh} cells skipped (3D mesh)' if n_skipped_mesh else ''}")
+    _log.info(
+        "  [canopy] %d cells with canopy > 0, %d valid after z-range check, "
+        "%d tree voxels placed%s",
+        n_tree_cells, len(rs), n_placed,
+        f", {n_skipped_mesh} cells skipped (3D mesh)" if n_skipped_mesh else "",
+    )
 
 
 def _convert_land_cover(land_cover_grid: np.ndarray, land_cover_source: str) -> np.ndarray:
@@ -1452,13 +1448,11 @@ def _convert_land_cover(land_cover_grid: np.ndarray, land_cover_source: str) -> 
 
 
 def _resize_int_grid(grid: np.ndarray, target_rows: int, target_cols: int) -> np.ndarray:
-    from scipy.ndimage import zoom
     factor = (target_rows / grid.shape[0], target_cols / grid.shape[1])
     return zoom(grid, factor, order=0).astype(grid.dtype)
 
 
 def _resize_float_grid(grid: np.ndarray, target_rows: int, target_cols: int) -> np.ndarray:
-    from scipy.ndimage import zoom
     factor = (target_rows / grid.shape[0], target_cols / grid.shape[1])
     return zoom(grid, factor, order=1)
 

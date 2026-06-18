@@ -228,3 +228,4 @@ class VoxelizerConfig:
     building_lod: Optional[int] = None
     dem_path: Optional[str] = None
     tree_citygml_path: Optional[str] = None
+    terrain_underground_depth: float = 0.0

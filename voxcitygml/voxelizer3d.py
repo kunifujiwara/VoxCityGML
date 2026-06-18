@@ -128,6 +128,7 @@ def voxelize_citygml_meshes(
     max_voxel_ram_mb: Optional[float] = None,
     occupancy_threshold: float = 0.0,
     occupancy_subdivisions: int = 3,
+    underground_depth: float = 0.0,
 ) -> np.ndarray:
     """Voxelize CityGML meshes on a shared 3D grid.
 
@@ -153,6 +154,7 @@ def voxelize_citygml_meshes(
         center_lat,
         meshsize,
         collection,
+        underground_depth=underground_depth,
     )
 
     voxel_grid = _allocate_voxel_grid(gp, max_voxel_ram_mb=max_voxel_ram_mb)
@@ -246,6 +248,7 @@ def _compute_grid_params_3d(
     center_lat: float,
     meshsize: float,
     collection: CityGMLMeshCollection,
+    underground_depth: float = 0.0,
 ) -> Tuple[Grid3DParams, object]:
     transformer = create_local_transformer(center_lon, center_lat)
 
@@ -271,6 +274,10 @@ def _compute_grid_params_3d(
 
     z_min -= meshsize
     z_max += meshsize
+
+    # Extend the grid floor further underground so the terrain solid
+    # (which extrudes down to min_z) is thickened towards the subsurface.
+    z_min -= max(0.0, float(underground_depth))
 
     n_cols = max(1, int((max_x - min_x) / meshsize + 0.5))
     n_rows = max(1, int((max_y - min_y) / meshsize + 0.5))

@@ -171,6 +171,7 @@ def run_and_export(
         max_voxel_ram_mb=cfg.max_voxel_ram_mb,
         occupancy_threshold=cfg.occupancy_threshold,
         occupancy_subdivisions=cfg.occupancy_subdivisions,
+        underground_depth=cfg.terrain_underground_depth,
     )
 
     # ── Export 1: Voxel OBJ (greedy meshed) ──────────────────────────
@@ -187,6 +188,7 @@ def run_and_export(
         meshsize=cfg.meshsize,
         output_dir=cfg.output_dir,
         basename=voxel_basename,
+        underground_depth=cfg.terrain_underground_depth,
     )
 
     # ── Export 2: Mesh OBJ (same coordinate system as voxel OBJ) ─────
@@ -222,6 +224,7 @@ def run_and_export(
             occupancy_threshold=cfg.occupancy_threshold,
             occupancy_subdivisions=cfg.occupancy_subdivisions,
             mesh_groups=mesh_groups,
+            underground_depth=cfg.terrain_underground_depth,
         )
 
     # ── Export 4: Land-cover 2-D flat mesh OBJ ───────────────────────

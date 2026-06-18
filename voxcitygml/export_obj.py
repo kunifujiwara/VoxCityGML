@@ -875,6 +875,7 @@ def export_voxels_obj(
     meshsize: float,
     output_dir: str,
     basename: str = "voxels",
+    underground_depth: float = 0.0,
 ) -> Tuple[str, Grid3DParams]:
     """Export a voxel grid as OBJ + MTL using greedy meshing.
 
@@ -886,6 +887,7 @@ def export_voxels_obj(
 
     gp, _ = _compute_grid_params_3d(
         rectangle_vertices, center_lon, center_lat, meshsize, collection,
+        underground_depth=underground_depth,
     )
 
     # Build material dict and code->name mapping
@@ -945,6 +947,7 @@ def export_per_category_voxels_obj(
     occupancy_threshold: float = 0.0,
     occupancy_subdivisions: int = 3,
     mesh_groups: Optional[Dict[str, List[Tuple[np.ndarray, np.ndarray]]]] = None,
+    underground_depth: float = 0.0,
 ) -> Tuple[str, Grid3DParams]:
     """Voxelize each mesh category independently and export as OBJ + MTL.
 
@@ -965,6 +968,7 @@ def export_per_category_voxels_obj(
 
     gp, transformer = _compute_grid_params_3d(
         rectangle_vertices, center_lon, center_lat, meshsize, collection,
+        underground_depth=underground_depth,
     )
 
     cat_code_map: Dict[str, int] = {

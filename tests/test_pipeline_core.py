@@ -64,12 +64,24 @@ def test_run_core_returns_artifacts(stub_pipeline, tmp_path):
     assert art.dem_grid.shape == (10, 10)
     assert len(art.collection.buildings) == 1
     assert len(art.rectangle) == 4
+    # run_core must not mutate cfg; the resolved value lives on the
+    # artifacts instead.
+    assert cfg.land_cover_source == 'OpenStreetMap'
+    assert art.land_cover_source == 'OpenStreetMap'
 
 
 def test_run_core_passes_underground_depth(stub_pipeline, tmp_path):
     cfg = _config(tmp_path)
     pl.run_core(cfg)
     assert stub_pipeline['voxelize_kwargs']['underground_depth'] == 7.5
+
+
+def test_run_core_forwards_parse_kwargs(stub_pipeline, tmp_path):
+    cfg = _config(tmp_path)
+    pl.run_core(cfg)
+    parse_kwargs = stub_pipeline['parse_kwargs']
+    assert 'tree_citygml_path' in parse_kwargs
+    assert 'dem_path' in parse_kwargs
 
 
 def test_run_raises_when_no_buildings(stub_pipeline, monkeypatch, tmp_path):
@@ -85,3 +97,50 @@ def test_run_assembles_voxcity(stub_pipeline, tmp_path):
     city = pl.VoxCityGML(cfg).run()
     # a real voxcity.models.VoxCity comes back from assemble_voxcity
     assert city.voxels.classes.shape == (10, 10, 5)
+
+
+def test_run_and_export_uses_resolved_center(monkeypatch, tmp_path):
+    """run_and_export must route through run_core and use its resolved
+    center_lon/center_lat (not cfg's, which are wrong for
+    rectangle_vertices configs)."""
+    import voxcitygml.pipeline_export as pe
+
+    sentinel_lon, sentinel_lat = 12345.0, 6789.0
+    fake_artifacts = pl.PipelineArtifacts(
+        collection=CityGMLMeshCollection(),
+        rectangle=[(0, 0), (0, 0), (0, 0), (0, 0)],
+        buffered_rectangle=[(0, 0), (0, 0), (0, 0), (0, 0)],
+        center_lon=sentinel_lon,
+        center_lat=sentinel_lat,
+        citygml_paths=[str(tmp_path)],
+        land_cover_source='OpenStreetMap',
+        canopy_height_source='Static',
+        dem_grid=np.zeros((10, 10)),
+        land_cover_grid=np.zeros((10, 10), dtype=np.int32),
+        building_height_grid=np.zeros((10, 10)),
+        building_min_height_grid=np.empty((10, 10), dtype=object),
+        building_id_grid=np.zeros((10, 10)),
+        canopy_top=np.zeros((10, 10)),
+        canopy_bottom=np.zeros((10, 10)),
+        voxel_grid=np.zeros((10, 10, 5), dtype=np.int16),
+    )
+
+    captured = {}
+
+    def fake_export_voxels_obj(voxel_grid, collection, rectangle, **kwargs):
+        captured['voxel_kwargs'] = kwargs
+        return ('v.obj', object())
+
+    monkeypatch.setattr(pe, 'run_core', lambda cfg: fake_artifacts)
+    monkeypatch.setattr(pe, 'export_voxels_obj', fake_export_voxels_obj)
+    monkeypatch.setattr(pe, 'export_meshes_obj', lambda *a, **k: ('m.obj', {}))
+    monkeypatch.setattr(pe, 'export_per_category_voxels_obj',
+                        lambda *a, **k: ('p.obj', None))
+    monkeypatch.setattr(pe, 'export_landcover_obj', lambda *a, **k: 'l.obj')
+
+    cfg = _config(tmp_path)
+    result = pe.run_and_export(cfg)
+
+    assert captured['voxel_kwargs']['center_lon'] == sentinel_lon
+    assert captured['voxel_kwargs']['center_lat'] == sentinel_lat
+    assert result == ('m.obj', 'v.obj', 'p.obj', 'l.obj')

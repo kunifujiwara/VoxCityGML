@@ -111,7 +111,7 @@ def run_and_export(
         print("=" * 60)
         lc_obj = export_landcover_obj(
             land_cover_grid,
-            cfg.land_cover_source,
+            art.land_cover_source,
             dem_grid,
             gp,
             output_dir=cfg.output_dir,

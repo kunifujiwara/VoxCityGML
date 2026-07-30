@@ -22,7 +22,7 @@ Steps
 
 import os
 from dataclasses import dataclass
-from typing import Optional
+from typing import List, Optional, Tuple
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")  # non-interactive backend; avoids Tk crash in voxcity's plt.show()
@@ -87,8 +87,8 @@ class VoxCityGML:
             extras={
                 "citygml_path": cfg.citygml_path,
                 "citygml_paths": art.citygml_paths,
-                "land_cover_source": cfg.land_cover_source,
-                "canopy_height_source": cfg.canopy_height_source,
+                "land_cover_source": art.land_cover_source,
+                "canopy_height_source": art.canopy_height_source,
                 "citygml_collection": art.collection,
             },
         )
@@ -115,11 +115,13 @@ class VoxCityGML:
 class PipelineArtifacts:
     """Everything the pipeline produces before VoxCity assembly/export."""
     collection: CityGMLMeshCollection
-    rectangle: list                # [(lon, lat), ...] target rect
-    buffered_rectangle: list
+    rectangle: List[Tuple[float, float]]      # [(lon, lat), ...] target rect
+    buffered_rectangle: List[Tuple[float, float]]
     center_lon: float
     center_lat: float
-    citygml_paths: list
+    citygml_paths: List[str]
+    land_cover_source: str
+    canopy_height_source: str
     dem_grid: np.ndarray
     land_cover_grid: np.ndarray
     building_height_grid: np.ndarray
@@ -134,6 +136,14 @@ def run_core(cfg: VoxelizerConfig) -> PipelineArtifacts:
     """Shared pipeline core: parse → grids → 3-D voxel grid.
 
     Used by both ``VoxCityGML.run()`` and ``run_and_export()``.
+
+    Does not mutate ``cfg``: auto-selected land-cover / canopy-height
+    sources are resolved to local variables and returned on
+    ``PipelineArtifacts`` instead of being written back onto the config.
+
+    Raises ValueError when no buildings intersect the target area —
+    deliberate behavior change from the pre-refactor pipeline, required
+    by the web-app integration.
     """
     os.makedirs(cfg.output_dir, exist_ok=True)
 
@@ -143,13 +153,15 @@ def run_core(cfg: VoxelizerConfig) -> PipelineArtifacts:
         from voxcity.downloader.gee import initialize_earth_engine
         initialize_earth_engine(project=cfg.gee_project)
 
-    if cfg.land_cover_source is None or cfg.canopy_height_source is None:
+    land_cover_source = cfg.land_cover_source
+    canopy_height_source = cfg.canopy_height_source
+    if land_cover_source is None or canopy_height_source is None:
         from voxcity.generator.api import auto_select_data_sources
         auto = auto_select_data_sources(rectangle)
-        if cfg.land_cover_source is None:
-            cfg.land_cover_source = auto['land_cover_source']
-        if cfg.canopy_height_source is None:
-            cfg.canopy_height_source = auto['canopy_height_source']
+        if land_cover_source is None:
+            land_cover_source = auto['land_cover_source']
+        if canopy_height_source is None:
+            canopy_height_source = auto['canopy_height_source']
 
     citygml_paths = resolve_citygml_paths(cfg.citygml_path)
     print("=" * 60)
@@ -158,8 +170,8 @@ def run_core(cfg: VoxelizerConfig) -> PipelineArtifacts:
     print(f"  CityGML path(s):    {', '.join(citygml_paths)}")
     print(f"  Centre:             ({center_lon:.6f}, {center_lat:.6f})")
     print(f"  Voxel size:         {cfg.meshsize} m")
-    print(f"  Land cover source:  {cfg.land_cover_source}")
-    print(f"  Canopy source:      {cfg.canopy_height_source}")
+    print(f"  Land cover source:  {land_cover_source}")
+    print(f"  Canopy source:      {canopy_height_source}")
     if cfg.building_lod is not None:
         print(f"  Building LOD:       {cfg.building_lod}")
     print("=" * 60)
@@ -213,7 +225,7 @@ def run_core(cfg: VoxelizerConfig) -> PipelineArtifacts:
     # -- Step 3: Land cover -------------------------------------------
     print("\n[3/5] Acquiring land cover grid...")
     land_cover_grid = get_land_cover_grid(
-        rectangle, cfg.meshsize, cfg.land_cover_source, cfg.output_dir,
+        rectangle, cfg.meshsize, land_cover_source, cfg.output_dir,
         citygml_path=citygml_paths,
     )
     if land_cover_grid.shape != dem_grid.shape:
@@ -237,7 +249,7 @@ def run_core(cfg: VoxelizerConfig) -> PipelineArtifacts:
     print("\n[5/5] Acquiring canopy height data...")
     canopy_top, canopy_bottom = get_canopy_grids(
         rectangle, cfg.meshsize,
-        cfg.canopy_height_source, cfg.land_cover_source,
+        canopy_height_source, land_cover_source,
         land_cover_grid, dem_grid, cfg.output_dir,
         vegetation_meshes=collection.vegetation,
         trunk_height_ratio=cfg.trunk_height_ratio,
@@ -256,7 +268,7 @@ def run_core(cfg: VoxelizerConfig) -> PipelineArtifacts:
             land_cover_grid=land_cover_grid,
             canopy_top=canopy_top,
             canopy_bottom=canopy_bottom,
-            land_cover_source=cfg.land_cover_source,
+            land_cover_source=land_cover_source,
             trunk_height_ratio=cfg.trunk_height_ratio,
             max_voxel_ram_mb=cfg.max_voxel_ram_mb,
             occupancy_threshold=cfg.occupancy_threshold,
@@ -267,7 +279,7 @@ def run_core(cfg: VoxelizerConfig) -> PipelineArtifacts:
         from voxcity.generator.voxelizer import Voxelizer
         voxelizer = Voxelizer(
             voxel_size=cfg.meshsize,
-            land_cover_source=cfg.land_cover_source,
+            land_cover_source=land_cover_source,
             trunk_height_ratio=cfg.trunk_height_ratio,
         )
         voxel_grid = voxelizer.generate_combined(
@@ -287,6 +299,8 @@ def run_core(cfg: VoxelizerConfig) -> PipelineArtifacts:
         center_lon=center_lon,
         center_lat=center_lat,
         citygml_paths=citygml_paths,
+        land_cover_source=land_cover_source,
+        canopy_height_source=canopy_height_source,
         dem_grid=dem_grid,
         land_cover_grid=land_cover_grid,
         building_height_grid=building_height_grid,

@@ -245,7 +245,8 @@ class VoxelizerConfig:
 # Rectangle resolution
 # ---------------------------------------------------------------------------
 
-def _buffered_vertices(vertices, buffer_meters):
+def _buffered_vertices(vertices: List[Tuple[float, float]],
+                       buffer_meters: float) -> List[Tuple[float, float]]:
     """Expand a rectangle outward by ~buffer_meters on every side.
 
     Scales each vertex away from the centroid by a factor derived from the
@@ -266,7 +267,9 @@ def _buffered_vertices(vertices, buffer_meters):
              c_lat + (v[1] - c_lat) * factor) for v in vertices]
 
 
-def resolve_rectangles(cfg: 'VoxelizerConfig'):
+def resolve_rectangles(
+    cfg: VoxelizerConfig,
+) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]], float, float]:
     """Resolve the target and buffered rectangles from a config.
 
     Returns
@@ -277,8 +280,18 @@ def resolve_rectangles(cfg: 'VoxelizerConfig'):
     """
     from .citygml.coordinates import create_rectangle
 
+    if cfg.buffer_meters < 0:
+        raise ValueError(
+            f"buffer_meters must be >= 0, got {cfg.buffer_meters}")
+
     if cfg.rectangle_vertices is not None:
-        rect = [tuple(v) for v in cfg.rectangle_vertices]
+        rect = []
+        for v in cfg.rectangle_vertices:
+            if len(v) < 2:
+                raise ValueError(
+                    f"each rectangle vertex must have at least 2 "
+                    f"components (lon, lat), got {v!r}")
+            rect.append(tuple(v[:2]))
         if len(rect) != 4:
             raise ValueError(
                 f"rectangle_vertices must have 4 vertices, got {len(rect)}")
@@ -289,8 +302,8 @@ def resolve_rectangles(cfg: 'VoxelizerConfig'):
 
     if not cfg.size_meters or cfg.size_meters <= 0:
         raise ValueError(
-            "Either rectangle_vertices or center_lon/center_lat/size_meters "
-            "must be provided")
+            "rectangle_vertices not set and size_meters is not positive; "
+            "provide rectangle_vertices or center_lon/center_lat/size_meters")
     rect = create_rectangle(cfg.center_lon, cfg.center_lat, cfg.size_meters)
     buffered = create_rectangle(
         cfg.center_lon, cfg.center_lat,

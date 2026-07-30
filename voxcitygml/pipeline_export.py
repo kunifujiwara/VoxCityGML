@@ -6,19 +6,11 @@ This reuses the existing pipeline logic and hooks into it after the
 CityGML parse (for mesh export) and after voxelization (for voxel export).
 """
 
-import os
-import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 
-from .models import VoxelizerConfig, CityGMLMeshCollection, resolve_citygml_paths
-from .citygml.coordinates import create_rectangle
-from .citygml.parser import parse_citygml_directory, merge_terrain_meshes
-from .terrain.processor import terrain_meshes_to_dem_grid
-from .landcover.processor import get_land_cover_grid
-from .buildings.processor import meshes_to_building_grids
-from .canopy.processor import get_canopy_grids
-from .voxelizer3d import voxelize_citygml_meshes
+from .models import VoxelizerConfig
+from .pipeline import run_core
 from .export_obj import export_meshes_obj, export_voxels_obj, export_per_category_voxels_obj, export_landcover_obj
 
 
@@ -49,130 +41,14 @@ def run_and_export(
     watertight_meshes : bool
         Apply the watertight cascade to buildings before mesh export.
     """
-    os.makedirs(cfg.output_dir, exist_ok=True)
-
-    rectangle = create_rectangle(cfg.center_lon, cfg.center_lat, cfg.size_meters)
-    buffered_rect = create_rectangle(
-        cfg.center_lon, cfg.center_lat,
-        cfg.size_meters + 2 * cfg.buffer_meters,
-    )
-
-    # GEE init
-    if cfg.gee_project:
-        from voxcity.downloader.gee import initialize_earth_engine
-        initialize_earth_engine(project=cfg.gee_project)
-
-    # Auto-select data sources
-    if cfg.land_cover_source is None or cfg.canopy_height_source is None:
-        from voxcity.generator.api import auto_select_data_sources
-        auto = auto_select_data_sources(rectangle)
-        if cfg.land_cover_source is None:
-            cfg.land_cover_source = auto['land_cover_source']
-        if cfg.canopy_height_source is None:
-            cfg.canopy_height_source = auto['canopy_height_source']
-
-    # Resolve citygml_path (auto-discover datasets in parent folders)
-    citygml_paths = resolve_citygml_paths(cfg.citygml_path)
-
-    print("=" * 60)
-    print("VoxCityGML Pipeline  +  OBJ Export")
-    print("=" * 60)
-    print(f"  CityGML path(s):    {', '.join(citygml_paths)}")
-    print(f"  Centre:             ({cfg.center_lon:.6f}, {cfg.center_lat:.6f})")
-    print(f"  Area:               {cfg.size_meters} m")
-    print(f"  Voxel size:         {cfg.meshsize} m")
-    print(f"  Workers:            {cfg.n_workers}")
-    if cfg.building_lod is not None:
-        print(f"  Building LOD:       {cfg.building_lod}")
-    print("=" * 60)
-
-    # ── Step 1 – Parse CityGML ───────────────────────────────────────
-    print("\n[1/6] Parsing CityGML data...")
-    collection = parse_citygml_directory(
-        citygml_paths[0],
-        rectangle_vertices=buffered_rect,
-        n_workers=cfg.n_workers,
-        feature_types=['terrain', 'building', 'bridge', 'vegetation'],
-        building_lod=cfg.building_lod,
-        dem_path=cfg.dem_path,
-    )
-    for extra_path in citygml_paths[1:]:
-        print(f"  Parsing additional CityGML directory: {extra_path}")
-        extra_collection = parse_citygml_directory(
-            extra_path,
-            rectangle_vertices=buffered_rect,
-            n_workers=cfg.n_workers,
-            feature_types=['terrain', 'building', 'bridge', 'vegetation'],
-            building_lod=cfg.building_lod,
-        )
-        collection.merge(extra_collection)
-    if collection.terrain:
-        collection.terrain = merge_terrain_meshes(collection.terrain)
-
-    # ── Step 2 – DEM ─────────────────────────────────────────────────
-    print("\n[2/6] Creating DEM grid from terrain TIN...")
-    dem_grid = terrain_meshes_to_dem_grid(
-        collection.terrain, rectangle, cfg.meshsize,
-    )
-    print(f"  DEM grid shape: {dem_grid.shape}, "
-          f"elevation range: [{dem_grid.min():.1f}, {dem_grid.max():.1f}] m")
-
-    # ── Step 3 – Land cover ──────────────────────────────────────────
-    print("\n[3/6] Acquiring land cover grid...")
-    land_cover_grid = get_land_cover_grid(
-        rectangle, cfg.meshsize, cfg.land_cover_source, cfg.output_dir,
-        citygml_path=citygml_paths,
-    )
-    if land_cover_grid.shape != dem_grid.shape:
-        from scipy.ndimage import zoom
-        factor = (dem_grid.shape[0] / land_cover_grid.shape[0],
-                  dem_grid.shape[1] / land_cover_grid.shape[1])
-        land_cover_grid = zoom(land_cover_grid, factor, order=0).astype(land_cover_grid.dtype)
-
-    # ── Step 4 – Buildings & bridges (2-D grids for metadata) ────────
-    print("\n[4/6] Rasterising buildings and bridges...")
-    building_height_grid, building_min_height_grid, building_id_grid = \
-        meshes_to_building_grids(
-            collection.buildings, collection.bridges,
-            rectangle, cfg.meshsize, dem_grid,
-        )
-
-    # ── Step 5 – Canopy ──────────────────────────────────────────────
-    print("\n[5/6] Acquiring canopy height data...")
-    canopy_top, canopy_bottom = get_canopy_grids(
-        rectangle, cfg.meshsize,
-        cfg.canopy_height_source, cfg.land_cover_source,
-        land_cover_grid, dem_grid, cfg.output_dir,
-        vegetation_meshes=collection.vegetation,
-        trunk_height_ratio=cfg.trunk_height_ratio,
-        static_tree_height=cfg.static_tree_height,
-    )
-    if canopy_top.shape != dem_grid.shape:
-        from scipy.ndimage import zoom
-        factor = (dem_grid.shape[0] / canopy_top.shape[0],
-                  dem_grid.shape[1] / canopy_top.shape[1])
-        canopy_top = zoom(canopy_top, factor, order=1)
-        canopy_bottom = zoom(canopy_bottom, factor, order=1)
-
-    # ── Step 6 – 3-D Voxelization ────────────────────────────────────
-    print("\n[6/6] Voxelising all components...")
-    voxel_grid = voxelize_citygml_meshes(
-        collection,
-        rectangle,
-        cfg.center_lon,
-        cfg.center_lat,
-        cfg.meshsize,
-        dem_grid=dem_grid,
-        land_cover_grid=land_cover_grid,
-        canopy_top=canopy_top,
-        canopy_bottom=canopy_bottom,
-        land_cover_source=cfg.land_cover_source,
-        trunk_height_ratio=cfg.trunk_height_ratio,
-        max_voxel_ram_mb=cfg.max_voxel_ram_mb,
-        occupancy_threshold=cfg.occupancy_threshold,
-        occupancy_subdivisions=cfg.occupancy_subdivisions,
-        underground_depth=cfg.terrain_underground_depth,
-    )
+    art = run_core(cfg)
+    collection = art.collection
+    rectangle = art.rectangle
+    land_cover_grid = art.land_cover_grid
+    dem_grid = art.dem_grid
+    voxel_grid = art.voxel_grid
+    citygml_paths = art.citygml_paths
+    center_lon, center_lat = art.center_lon, art.center_lat
 
     # ── Export 1: Voxel OBJ (greedy meshed) ──────────────────────────
     # Export voxels first to obtain Grid3DParams for the mesh transform
@@ -183,8 +59,8 @@ def run_and_export(
         voxel_grid,
         collection,
         rectangle,
-        center_lon=cfg.center_lon,
-        center_lat=cfg.center_lat,
+        center_lon=center_lon,
+        center_lat=center_lat,
         meshsize=cfg.meshsize,
         output_dir=cfg.output_dir,
         basename=voxel_basename,
@@ -197,8 +73,8 @@ def run_and_export(
     print("=" * 60)
     mesh_obj, mesh_groups = export_meshes_obj(
         collection,
-        center_lon=cfg.center_lon,
-        center_lat=cfg.center_lat,
+        center_lon=center_lon,
+        center_lat=center_lat,
         output_dir=cfg.output_dir,
         gp=gp,
         basename=mesh_basename,
@@ -215,8 +91,8 @@ def run_and_export(
         per_cat_obj, _ = export_per_category_voxels_obj(
             collection,
             rectangle,
-            center_lon=cfg.center_lon,
-            center_lat=cfg.center_lat,
+            center_lon=center_lon,
+            center_lat=center_lat,
             meshsize=cfg.meshsize,
             output_dir=cfg.output_dir,
             basename=per_category_basename,
@@ -242,8 +118,8 @@ def run_and_export(
             basename=landcover_basename,
             citygml_path=citygml_paths,
             rectangle_vertices=rectangle,
-            center_lon=cfg.center_lon,
-            center_lat=cfg.center_lat,
+            center_lon=center_lon,
+            center_lat=center_lat,
         )
 
     # ── Summary ──────────────────────────────────────────────────────

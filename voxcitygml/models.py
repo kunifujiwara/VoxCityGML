@@ -208,8 +208,14 @@ class VoxelizerConfig:
         include_bridges: If True (default), CityGML bridge features are
                      voxelized along with buildings.  Set to False to
                      exclude bridges from the voxel model entirely.
+        rectangle_vertices: Optional explicit target rectangle
+                      ``[(lon, lat), ...]`` in VoxCity order
+                      [SW, NW, NE, SE].  When given, ``center_lon`` /
+                      ``center_lat`` / ``size_meters`` are ignored and the
+                      centre is derived from the vertex centroid.
     """
     citygml_path: Union[str, List[str]] = ""
+    rectangle_vertices: Optional[List[Tuple[float, float]]] = None
     center_lon: float = 0.0
     center_lat: float = 0.0
     size_meters: float = 500.0
@@ -233,3 +239,60 @@ class VoxelizerConfig:
     tree_citygml_path: Optional[str] = None
     terrain_underground_depth: float = 0.0
     include_bridges: bool = True
+
+
+# ---------------------------------------------------------------------------
+# Rectangle resolution
+# ---------------------------------------------------------------------------
+
+def _buffered_vertices(vertices, buffer_meters):
+    """Expand a rectangle outward by ~buffer_meters on every side.
+
+    Scales each vertex away from the centroid by a factor derived from the
+    shortest side, so the result always contains the original rectangle
+    (over-buffering the longer side is acceptable: the buffered rectangle is
+    only used as a parse filter).
+    """
+    from pyproj import Geod
+    geod = Geod(ellps="WGS84")
+    sw, nw, ne, se = vertices
+    _, _, d_ns = geod.inv(sw[0], sw[1], nw[0], nw[1])
+    _, _, d_ew = geod.inv(sw[0], sw[1], se[0], se[1])
+    min_side = max(1.0, min(d_ns, d_ew))
+    factor = 1.0 + 2.0 * buffer_meters / min_side
+    c_lon = sum(v[0] for v in vertices) / 4.0
+    c_lat = sum(v[1] for v in vertices) / 4.0
+    return [(c_lon + (v[0] - c_lon) * factor,
+             c_lat + (v[1] - c_lat) * factor) for v in vertices]
+
+
+def resolve_rectangles(cfg: 'VoxelizerConfig'):
+    """Resolve the target and buffered rectangles from a config.
+
+    Returns
+    -------
+    (rectangle, buffered_rectangle, center_lon, center_lat)
+        ``rectangle`` and ``buffered_rectangle`` are ``[(lon, lat), ...]``
+        in VoxCity order [SW, NW, NE, SE].
+    """
+    from .citygml.coordinates import create_rectangle
+
+    if cfg.rectangle_vertices is not None:
+        rect = [tuple(v) for v in cfg.rectangle_vertices]
+        if len(rect) != 4:
+            raise ValueError(
+                f"rectangle_vertices must have 4 vertices, got {len(rect)}")
+        buffered = _buffered_vertices(rect, cfg.buffer_meters)
+        center_lon = sum(v[0] for v in rect) / 4.0
+        center_lat = sum(v[1] for v in rect) / 4.0
+        return rect, buffered, center_lon, center_lat
+
+    if not cfg.size_meters or cfg.size_meters <= 0:
+        raise ValueError(
+            "Either rectangle_vertices or center_lon/center_lat/size_meters "
+            "must be provided")
+    rect = create_rectangle(cfg.center_lon, cfg.center_lat, cfg.size_meters)
+    buffered = create_rectangle(
+        cfg.center_lon, cfg.center_lat,
+        cfg.size_meters + 2 * cfg.buffer_meters)
+    return rect, buffered, cfg.center_lon, cfg.center_lat

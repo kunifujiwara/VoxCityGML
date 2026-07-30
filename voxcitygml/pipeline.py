@@ -135,6 +135,13 @@ class VoxCityGML:
         if collection.terrain:
             collection.terrain = merge_terrain_meshes(collection.terrain)
 
+        # Optionally drop bridges so they are excluded from every
+        # downstream stage (metadata grids and 3-D voxelization alike).
+        if not cfg.include_bridges and collection.bridges:
+            print(f"  Excluding {len(collection.bridges)} bridge(s) "
+                  f"from voxelization")
+            collection.bridges = []
+
         # ==============================================================
         # Step 2 – Terrain TIN → DEM grid
         # ==============================================================

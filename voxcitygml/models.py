@@ -205,6 +205,9 @@ class VoxelizerConfig:
                      semantic 3-D tree models).  These are parsed as
                      vegetation and merged with any vegetation found in
                      ``citygml_path``.
+        include_bridges: If True (default), CityGML bridge features are
+                     voxelized along with buildings.  Set to False to
+                     exclude bridges from the voxel model entirely.
     """
     citygml_path: Union[str, List[str]] = ""
     center_lon: float = 0.0
@@ -229,3 +232,4 @@ class VoxelizerConfig:
     dem_path: Optional[str] = None
     tree_citygml_path: Optional[str] = None
     terrain_underground_depth: float = 0.0
+    include_bridges: bool = True

@@ -93,7 +93,9 @@ def merge_terrain_meshes(terrain_meshes: List[Mesh3D]) -> List[Mesh3D]:
 def _parse_single_file(gml_file: Path, feature_type: str,
                         rect_polygon, prepared_rect,
                         building_lod: Optional[int] = None,
-                        source_epsg: Optional[str] = None) -> List[Mesh3D]:
+                        source_epsg: Optional[str] = None,
+                        *,
+                        failures: Optional[List[str]] = None) -> List[Mesh3D]:
     """Parse a single GML file.
 
     If *source_epsg* is given (e.g. ``'EPSG:25832'``), all extracted
@@ -158,7 +160,9 @@ def _parse_single_file(gml_file: Path, feature_type: str,
             return []
         return meshes
     except Exception as exc:
-        log.debug("Error parsing %s: %s", gml_file, exc)
+        log.warning("Failed to parse %s: %s", gml_file, exc)
+        if failures is not None:
+            failures.append(str(gml_file))
         return []
 
 
@@ -227,6 +231,8 @@ def parse_citygml_directory(
     if feature_types is None:
         feature_types = ['building', 'bridge', 'terrain', 'vegetation']
 
+    parse_failures: List[str] = []
+
     rect_polygon = None
     prepared_rect = None
     if rectangle_vertices is not None:
@@ -264,6 +270,7 @@ def parse_citygml_directory(
                 meshes = _parse_single_file(
                     gml_file, ftype, rect_polygon, prepared_rect,
                     building_lod=building_lod, source_epsg=source_epsg,
+                    failures=parse_failures,
                 )
                 if meshes:
                     all_meshes.extend(meshes)
@@ -292,7 +299,15 @@ def parse_citygml_directory(
                 gml_files, collection, feature_types,
                 rect_polygon, prepared_rect,
                 building_lod, source_epsg,
+                failures=parse_failures,
             )
+
+    if parse_failures:
+        print(f"WARNING: {len(parse_failures)} file(s) failed to parse:")
+        for f in parse_failures[:10]:
+            print(f"  - {f}")
+        if len(parse_failures) > 10:
+            print(f"  ... and {len(parse_failures) - 10} more")
 
     # ------------------------------------------------------------------
     # GeoTIFF DEM fallback (explicit path only)
@@ -478,6 +493,8 @@ def _parse_flat_directory(
     rect_polygon, prepared_rect,
     building_lod: Optional[int],
     source_epsg: Optional[str],
+    *,
+    failures: Optional[List[str]] = None,
 ) -> None:
     """Parse a flat directory of GML files, auto-detecting feature types."""
     # Group files by detected feature type
@@ -501,6 +518,7 @@ def _parse_flat_directory(
             meshes = _parse_single_file(
                 gml_file, ftype, rect_polygon, prepared_rect,
                 building_lod=building_lod, source_epsg=source_epsg,
+                failures=failures,
             )
             if meshes:
                 all_meshes.extend(meshes)

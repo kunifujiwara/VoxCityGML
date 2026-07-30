@@ -1,12 +1,17 @@
 """
 Shared grid-sizing utilities compatible with voxcity.
 
-All grid dimensions and pixel sizes are computed using the same algorithm
-as ``voxcity.geoprocessor.raster.core.calculate_grid_size``:
+Cell-count sizing (rows/cols) is delegated to
+``voxcity.geoprocessor.raster.core.compute_grid_geometry`` so the two
+codebases can never drift apart. That function computes:
 
 1.  Geodesic distances (WGS-84 ellipsoid) along N-S and E-W sides.
 2.  ``int(distance / meshsize + 0.5)`` rounding for cell count.
-3.  ``pixel_width = (max_lon − min_lon) / n_cols``
+
+On top of the delegated ``n_rows``/``n_cols``, this module adds the
+voxcitygml-specific bbox/pixel conveniences:
+
+    ``pixel_width = (max_lon − min_lon) / n_cols``
     ``pixel_height = (max_lat − min_lat) / n_rows``
     so cells tile the rectangle exactly.
 
@@ -21,7 +26,8 @@ from dataclasses import dataclass
 from typing import List, Tuple
 
 import numpy as np
-from pyproj import Geod
+
+from voxcity.geoprocessor.raster.core import compute_grid_geometry
 
 
 # -----------------------------------------------------------------------
@@ -83,6 +89,10 @@ def compute_grid_params(
 ) -> GridParams:
     """Compute grid parameters **exactly matching voxcity's algorithm**.
 
+    Cell-count sizing (``n_rows``/``n_cols``) is delegated to
+    ``voxcity.geoprocessor.raster.core.compute_grid_geometry`` so this
+    module can never drift from voxcity's own grid sizing.
+
     Parameters
     ----------
     rectangle_vertices : [(lon, lat), …]
@@ -94,17 +104,15 @@ def compute_grid_params(
     -------
     GridParams
     """
-    sw, nw, ne, se = rectangle_vertices
-
-    geod = Geod(ellps="WGS84")
-
-    # N-S distance (side_1): SW → NW
-    _, _, dist_ns = geod.inv(sw[0], sw[1], nw[0], nw[1])
-    # E-W distance (side_2): SW → SE
-    _, _, dist_ew = geod.inv(sw[0], sw[1], se[0], se[1])
-
-    n_rows = max(1, int(dist_ns / meshsize + 0.5))   # same as voxcity
-    n_cols = max(1, int(dist_ew / meshsize + 0.5))
+    geom = compute_grid_geometry(rectangle_vertices, meshsize)
+    if geom is None:
+        raise ValueError(
+            "compute_grid_geometry returned None for the given "
+            "rectangle_vertices/meshsize (insufficient inputs)"
+        )
+    # grid_size[0] is along side_1 (SW→NW, N-S → rows),
+    # grid_size[1] is along side_2 (SW→SE, E-W → cols).
+    n_rows, n_cols = geom["grid_size"]
 
     lons = [v[0] for v in rectangle_vertices]
     lats = [v[1] for v in rectangle_vertices]

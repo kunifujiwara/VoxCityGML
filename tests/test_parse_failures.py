@@ -2,8 +2,6 @@
 import logging
 from pathlib import Path
 
-import numpy as np
-
 from voxcitygml.citygml.parser import _parse_single_file, parse_citygml_directory
 
 
@@ -21,7 +19,8 @@ def test_parse_single_file_warns_on_failure(tmp_path, caplog):
         result = _parse_single_file(bad, 'building', None, None,
                                     failures=failures)
     assert result == []
-    assert failures == [str(bad)]
+    assert len(failures) == 1
+    assert failures[0].startswith(str(bad))
     assert any("53393671_bldg_6697_op.gml" in r.getMessage() for r in caplog.records)
 
 
@@ -33,3 +32,4 @@ def test_directory_parse_reports_summary(tmp_path, capsys):
     assert collection.buildings == []
     out = capsys.readouterr().out
     assert "1 file(s) failed to parse" in out
+    assert "53393671_bldg_6697_op.gml" in out

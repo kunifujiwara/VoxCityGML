@@ -162,7 +162,7 @@ def _parse_single_file(gml_file: Path, feature_type: str,
     except Exception as exc:
         log.warning("Failed to parse %s: %s", gml_file, exc)
         if failures is not None:
-            failures.append(str(gml_file))
+            failures.append(f"{gml_file}: {exc}")
         return []
 
 
@@ -302,6 +302,7 @@ def parse_citygml_directory(
                 failures=parse_failures,
             )
 
+    # Keep this summary after all failure-accumulating parse paths.
     if parse_failures:
         print(f"WARNING: {len(parse_failures)} file(s) failed to parse:")
         for f in parse_failures[:10]:

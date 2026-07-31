@@ -12,7 +12,11 @@ it parses the intersecting CityGML tiles and voxelizes them. It runs by
 default because it is the proof the whole chain works; skip it explicitly
 with ``pytest -m "not slow"``.
 """
+import json
 import os
+import shutil
+import time
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -166,3 +170,140 @@ def test_lod2_generate_voxcity_end_to_end(tmp_path):
     assert slope > MIN_ROOF_SLOPE_FRACTION, (
         f"roof slope fraction {slope:.3f} <= {MIN_ROOF_SLOPE_FRACTION}: the "
         f"voxel grid looks like a flat LOD1 extrusion, not LOD2 roof geometry")
+
+
+# ---------------------------------------------------------------------------
+# Parse cache
+# ---------------------------------------------------------------------------
+
+def _assert_meshes_identical(cold_meshes, warm_meshes, label):
+    """Cold (XML) and warm (cache) meshes must agree bitwise, matched by id.
+
+    Counts and totals alone would pass on reordered or numerically altered
+    geometry, so this compares the raw bytes of every array.
+    """
+    assert len(warm_meshes) == len(cold_meshes) > 0, (
+        f"{label}: {len(cold_meshes)} cold vs {len(warm_meshes)} warm meshes")
+    cold_by_id = {m.feature_id: m for m in cold_meshes}
+    warm_by_id = {m.feature_id: m for m in warm_meshes}
+    # Matching by id is only meaningful if ids are unique.
+    assert len(cold_by_id) == len(cold_meshes), f"{label}: duplicate feature_ids"
+    assert set(warm_by_id) == set(cold_by_id), f"{label}: feature_id sets differ"
+
+    for fid, cold in cold_by_id.items():
+        warm = warm_by_id[fid]
+        for name in ('vertices', 'faces', 'normals', 'colors'):
+            a, b = getattr(cold, name), getattr(warm, name)
+            if a is None or b is None:
+                assert a is b is None, f"{label}/{fid}: {name} presence differs"
+                continue
+            assert (a.dtype, a.shape) == (b.dtype, b.shape), (
+                f"{label}/{fid}: {name} is {a.dtype}{a.shape} cold vs "
+                f"{b.dtype}{b.shape} warm")
+            assert a.tobytes() == b.tobytes(), (
+                f"{label}/{fid}: {name} is not bitwise identical")
+        assert cold.attributes.keys() == warm.attributes.keys(), (
+            f"{label}/{fid}: attribute keys differ")
+        for key, cold_val in cold.attributes.items():
+            warm_val = warm.attributes[key]
+            if isinstance(cold_val, np.ndarray):
+                assert isinstance(warm_val, np.ndarray)
+                assert cold_val.dtype == warm_val.dtype
+                assert cold_val.tobytes() == warm_val.tobytes(), (
+                    f"{label}/{fid}: attribute {key!r} not bitwise identical")
+            else:
+                # Type too: JSON round-tripping a np.bool_ as 'False' would be
+                # truthy on the warm path and falsy on the cold one.
+                assert type(cold_val) is type(warm_val), (
+                    f"{label}/{fid}: attribute {key!r} changed type "
+                    f"{type(cold_val)} -> {type(warm_val)}")
+                assert cold_val == warm_val, (
+                    f"{label}/{fid}: attribute {key!r} changed value")
+
+
+@requires_dataset
+@pytest.mark.slow
+def test_parse_cache_round_trip_on_real_dataset(tmp_path):
+    """Second parse must hit the cache: identical meshes, much faster.
+
+    The unit tests stub the extractor, so this is the only proof the cache
+    round-trips real PLATEAU XML.
+    """
+    from voxcitygml.citygml.coordinates import (
+        create_rectangle, file_intersects_rectangle, rectangle_to_shapely,
+    )
+    from voxcitygml.citygml.parse_cache import CACHE_DIR_NAME, load_cached_meshes
+    from voxcitygml.citygml.parser import parse_citygml_directory
+
+    rect = create_rectangle(139.7725, 35.6481, 200)
+    rect_polygon = rectangle_to_shapely(rect)
+
+    # Work on a copy of the intersecting tiles so the real dataset's cache
+    # state cannot make the first parse a hit (the test must own its fixture).
+    # Tiles are selected with the same mesh-code filter the parser uses:
+    # building tiles are 1/10 sub-meshes (53393671) while DEM tiles are whole
+    # 2nd-level meshes (533936), so a literal filename prefix would copy no
+    # terrain at all and every terrain assertion below would pass vacuously.
+    dataset = tmp_path / "dataset"
+    copied = {}
+    for sub in ("udx/bldg", "udx/dem"):
+        src_dir = os.path.join(DATASET, *sub.split("/"))
+        dst_dir = dataset / sub
+        dst_dir.mkdir(parents=True)
+        names = [n for n in os.listdir(src_dir)
+                 if n.endswith(".gml") and file_intersects_rectangle(n, rect_polygon)]
+        for name in names:
+            shutil.copy2(os.path.join(src_dir, name), dst_dir / name)
+        copied[sub] = names
+    assert copied["udx/bldg"], "no building tile intersects the test rectangle"
+    assert copied["udx/dem"], "no DEM tile intersects the test rectangle"
+
+    kwargs = dict(rectangle_vertices=rect,
+                  feature_types=["building", "terrain"], building_lod=2)
+
+    t0 = time.perf_counter()
+    cold = parse_citygml_directory(str(dataset), **kwargs)
+    t_cold = time.perf_counter() - t0
+    cache_root = dataset / CACHE_DIR_NAME
+    assert cache_root.is_dir(), "cache dir was not created"
+
+    t0 = time.perf_counter()
+    warm = parse_citygml_directory(str(dataset), **kwargs)
+    t_warm = time.perf_counter() - t0
+    print(f"\nparse cache: cold {t_cold:.2f}s -> warm {t_warm:.2f}s "
+          f"({t_cold / t_warm:.1f}x)")
+
+    # Both feature types must have been stored, otherwise the "warm" run
+    # below is partly another cold parse and proves less than it looks.
+    bldg_entries = sorted(cache_root.glob("udx/bldg/*.building.lod2.npz"))
+    dem_entries = sorted(cache_root.glob("udx/dem/*.terrain.npz"))
+    assert len(bldg_entries) == len(copied["udx/bldg"]), "building tile not cached"
+    assert len(dem_entries) == len(copied["udx/dem"]), "DEM tile not cached"
+
+    _assert_meshes_identical(cold.buildings, warm.buildings, "buildings")
+    _assert_meshes_identical(cold.terrain, warm.terrain, "terrain")
+
+    # ``triangle_coords`` is elided on store and rebuilt as ``vertices[faces]``
+    # on load, so it is the one array a real-data test must check directly:
+    # the filtered meshes compared above no longer carry it.
+    with np.load(dem_entries[0], allow_pickle=False) as data:
+        meta = json.loads(data["meta"].tobytes().decode("utf-8"))
+        stored_keys = set(data.files)
+    assert any("triangle_coords" in m["derived_attrs"] for m in meta["meshes"]), (
+        "triangle_coords was not elided from the terrain cache entry")
+    assert not [k for k in stored_keys if k.endswith("_triangle_coords")], (
+        "triangle_coords was stored verbatim despite being elided")
+
+    dem_gml = Path(dataset, "udx", "dem", copied["udx/dem"][0])
+    reloaded = load_cached_meshes(dem_gml, "terrain", None, meta["source_epsg"])
+    assert reloaded, "terrain cache entry did not load back"
+    for mesh in reloaded:
+        tri = mesh.attributes["triangle_coords"]
+        assert tri.shape == (len(mesh.faces), 3, 3)
+        assert np.array_equal(tri, mesh.vertices[mesh.faces]), (
+            "rebuilt triangle_coords disagrees with vertices[faces]")
+
+    # Generous bound: the XML parse is seconds, the npz load tens of ms. A 2x
+    # margin absorbs CI noise while still failing if caching regresses.
+    assert t_warm < t_cold / 2, (
+        f"cache gave no speedup: {t_cold:.2f}s -> {t_warm:.2f}s")

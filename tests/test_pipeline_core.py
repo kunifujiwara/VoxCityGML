@@ -1,4 +1,6 @@
 """Tests for the unified pipeline core (heavy stages monkeypatched)."""
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
@@ -85,8 +87,12 @@ def test_run_core_forwards_parse_kwargs(stub_pipeline, tmp_path):
 
 
 def test_run_core_forwards_use_parse_cache(stub_pipeline, tmp_path):
+    # Constructor kwarg, not attribute assignment: VoxelizerConfig is a plain
+    # mutable dataclass, so setting the attribute afterwards would still pass
+    # if the field were dropped from models.py.
+    assert VoxelizerConfig(citygml_path=str(tmp_path)).use_parse_cache is True
     cfg = _config(tmp_path)
-    cfg.use_parse_cache = False
+    cfg = replace(cfg, use_parse_cache=False)
     pl.run_core(cfg)
     assert stub_pipeline['parse_kwargs']['use_parse_cache'] is False
 

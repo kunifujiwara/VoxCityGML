@@ -30,6 +30,7 @@ dependencies = [
     "geopandas",
     "shapely",
     "pyproj",
+    "mapbox-earcut",
     "numba",
     "matplotlib",
     "seaborn",

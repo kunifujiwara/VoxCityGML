@@ -444,6 +444,32 @@ def test_reprojection_happens_before_caching(utm_extractor):
     _assert_meshes_equal(first, second)
 
 
+def test_detected_epsg_with_none_param_still_hits_and_matches(utm_extractor,
+                                                              monkeypatch):
+    """source_epsg=None + a real per-file detection must still round-trip.
+
+    The cache key records the *parameter* (None), not the effective CRS, so
+    both calls agree on the key. What must not differ is the payload: the
+    miss reprojects with the detected CRS before storing, so the hit has to
+    come back bitwise identical -- not raw UTM.
+    """
+    src, calls = utm_extractor
+    monkeypatch.setattr(parser_mod, "detect_crs_from_root",
+                        lambda root: "EPSG:25832")
+
+    miss = _parse_single_file(src, "building", None, None, building_lod=2,
+                              source_epsg=None)
+    hit = _parse_single_file(src, "building", None, None, building_lod=2,
+                             source_epsg=None)
+
+    assert calls["n"] == 1, "second call must be served from the cache"
+    lat, lon = hit[0].vertices[0][:2]
+    assert 47.0 < lat < 49.0 and 10.0 < lon < 13.0, (
+        f"cached vertices not reprojected: {lat}, {lon}")
+    assert hit[0].vertices.tobytes() == miss[0].vertices.tobytes(), (
+        "cache hit must be bitwise identical to the miss")
+
+
 def test_source_epsg_change_reparses(utm_extractor):
     """Dataset CRS detection can change without the GML file changing."""
     src, calls = utm_extractor

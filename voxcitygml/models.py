@@ -208,6 +208,9 @@ class VoxelizerConfig:
         include_bridges: If True (default), CityGML bridge features are
                      voxelized along with buildings.  Set to False to
                      exclude bridges from the voxel model entirely.
+        use_parse_cache: If True (default), cache parsed CityGML meshes as
+            binary snapshots in ``.voxcitygml_cache`` beside the dataset and
+            reuse them on later runs. Set False to always parse the XML.
         rectangle_vertices: Optional explicit target rectangle
                       ``[(lon, lat), ...]`` in VoxCity order
                       [SW, NW, NE, SE].  When given, ``center_lon`` /
@@ -239,6 +242,7 @@ class VoxelizerConfig:
     tree_citygml_path: Optional[str] = None
     terrain_underground_depth: float = 0.0
     include_bridges: bool = True
+    use_parse_cache: bool = True
 
 
 # ---------------------------------------------------------------------------

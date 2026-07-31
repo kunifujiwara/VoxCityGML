@@ -197,6 +197,7 @@ def run_core(cfg: VoxelizerConfig) -> PipelineArtifacts:
         building_lod=cfg.building_lod,
         dem_path=cfg.dem_path,
         tree_citygml_path=cfg.tree_citygml_path,
+        use_parse_cache=cfg.use_parse_cache,
     )
     for extra_path in citygml_paths[1:]:
         print(f"  Parsing additional CityGML directory: {extra_path}")
@@ -206,6 +207,7 @@ def run_core(cfg: VoxelizerConfig) -> PipelineArtifacts:
             n_workers=cfg.n_workers,
             feature_types=['terrain', 'building', 'bridge', 'vegetation'],
             building_lod=cfg.building_lod,
+            use_parse_cache=cfg.use_parse_cache,
         )
         collection.merge(extra_collection)
 

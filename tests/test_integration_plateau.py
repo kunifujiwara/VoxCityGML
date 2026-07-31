@@ -139,6 +139,11 @@ def test_lod2_generate_voxcity_end_to_end(tmp_path):
         canopy_height_source="Static",
         output_dir=str(tmp_path),
         save_output=False,
+        # Parse the XML for real every run. With the cache on (the default)
+        # this test would exercise the parse cache instead of the parser
+        # after its first run -- and would deposit tens of megabytes into
+        # the user's dataset directory as a side effect.
+        use_parse_cache=False,
     )
     city = generate_voxcity(cfg)
 

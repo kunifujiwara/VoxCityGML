@@ -84,6 +84,13 @@ def test_run_core_forwards_parse_kwargs(stub_pipeline, tmp_path):
     assert 'dem_path' in parse_kwargs
 
 
+def test_run_core_forwards_use_parse_cache(stub_pipeline, tmp_path):
+    cfg = _config(tmp_path)
+    cfg.use_parse_cache = False
+    pl.run_core(cfg)
+    assert stub_pipeline['parse_kwargs']['use_parse_cache'] is False
+
+
 def test_run_raises_when_no_buildings(stub_pipeline, monkeypatch, tmp_path):
     monkeypatch.setattr(pl, 'parse_citygml_directory',
                         lambda path, **kwargs: CityGMLMeshCollection())

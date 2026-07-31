@@ -90,9 +90,11 @@ is snapshotted in binary form and reused on every later run.
   are invalidated automatically when the source file changes.
 - **Size:** entries can be tens of megabytes. Terrain (DEM) tiles are the
   largest; a typical PLATEAU DEM tile is roughly 50 MB.
-- **Disabling:** pass `use_parse_cache=False` to `parse_citygml_directory` to
-  always parse the XML. If the dataset directory is read-only, caching quietly
-  turns itself off and parsing continues unaffected.
+- **Disabling:** set `VoxelizerConfig(use_parse_cache=False)` to always parse
+  the XML (the same switch is available as `use_parse_cache=False` on
+  `parse_citygml_directory` if you call the parser directly). If the dataset
+  directory is read-only, caching quietly turns itself off and parsing
+  continues unaffected.
 
 ## Pipeline Overview
 

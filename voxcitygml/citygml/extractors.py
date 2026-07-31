@@ -1,6 +1,13 @@
 """
 Feature extractors for CityGML objects.
 Transplanted from citygml_mesher.extractors (terrain, buildings, bridges, vegetation).
+
+NOTE: the output of these extractors is snapshotted by ``parse_cache``. If you
+change what a mesh contains (geometry, attribute names, attribute value types),
+bump ``CACHE_VERSION`` in ``parse_cache.py`` -- otherwise caches already written
+into users' dataset directories keep serving the old shape. Attribute values
+must stay JSON-round-trip identical (str/int/float/bool/None/list/dict with
+string keys); numpy scalars and tuples are not cacheable.
 """
 
 import logging

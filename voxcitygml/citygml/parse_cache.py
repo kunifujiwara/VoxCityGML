@@ -9,13 +9,27 @@ Layout: ``<dataset>/.voxcitygml_cache/<relative-path>.{ftype}[.lodK].npz``
 where the dataset root is the directory containing ``udx`` (PLATEAU) or the
 GML file's own directory (flat layouts). ``building`` files are keyed by the
 requested LOD (``auto`` when None -- auto-selection may pick different LODs per
-building, so it must not share a key with an explicit LOD).
+building, so it must not share a key with an explicit LOD). Note that each LOD
+key stores a **full independent snapshot**: a dataset queried at LOD1, LOD2 and
+``auto`` holds three complete copies of its building meshes, so disk use for
+the largest feature type can reach 3x.
 
 Validity: recorded source size + mtime_ns must match the GML file and the
-format version must match ``CACHE_VERSION``. Writes are atomic
-(temp file + ``os.replace``), so parallel workers never observe a torn file.
+format version must match ``CACHE_VERSION``. Bump ``CACHE_VERSION`` whenever
+extraction output changes (see ``extractors.py``) -- it is the only thing that
+invalidates caches already sitting in users' dataset directories. Writes are
+atomic (temp file + ``os.replace``), so parallel workers never observe a torn
+file.
 
-The cache is strictly an accelerator: every failure in load or store logs one
+Mesh attributes are stored as strict JSON (ndarray values are split out into
+the npz alongside the geometry). Values must therefore be JSON-round-trip
+identical -- ``str``/``int``/``float``/``bool``/``None``/``list``/``dict`` with
+string keys. Anything else (numpy scalars such as ``np.int64``/``np.bool_``,
+tuples, non-string dict keys) either fails to serialize or comes back as a
+different type, so a cache hit would disagree with a cache miss; when strict
+serialization fails the file is simply not cached.
+
+The cache is strictly an accelerator: every failure in load or store logs a
 warning and the caller falls back to normal parsing.
 """
 
@@ -35,10 +49,41 @@ log = logging.getLogger(__name__)
 CACHE_VERSION = 1
 CACHE_DIR_NAME = ".voxcitygml_cache"
 
+# A read-only or network-mounted dataset makes every store fail. Warning once
+# per (file x feature type) would emit hundreds of identical lines per request,
+# so failures are counted and writes latch off. State is per-process, so each
+# multiprocessing worker bounds its own noise.
+_MAX_STORE_FAILURE_WARNINGS = 3
+_store_failures = 0
+_stores_disabled = False
 
-def _dataset_root_for(gml_file: Path) -> Path:
-    """Dataset root: the directory containing ``udx``, else the file's dir."""
-    resolved = gml_file.resolve()
+
+def reset_store_failures() -> None:
+    """Re-enable cache writes after the failure latch tripped (for tests)."""
+    global _store_failures, _stores_disabled
+    _store_failures = 0
+    _stores_disabled = False
+
+
+def _note_store_failure(gml_file, cache_file, reason: str) -> None:
+    """Warn about a store that did not happen; latch writes off after a few."""
+    global _store_failures, _stores_disabled
+    _store_failures += 1
+    if _store_failures <= _MAX_STORE_FAILURE_WARNINGS:
+        log.warning("Parse cache store failed for %s (cache file %s); parsing "
+                    "continues uncached: %s", gml_file, cache_file, reason)
+    if _store_failures >= _MAX_STORE_FAILURE_WARNINGS and not _stores_disabled:
+        _stores_disabled = True
+        log.warning("Parse cache: %d store failures; disabling cache writes for "
+                    "the rest of this process (is the dataset directory "
+                    "read-only?). Parsing is unaffected.", _store_failures)
+
+
+def _dataset_root_for(resolved: Path) -> Path:
+    """Dataset root for an already-resolved GML path.
+
+    The directory containing ``udx`` (PLATEAU), else the file's own directory.
+    """
     parts = resolved.parts
     if "udx" in parts:
         # Nearest enclosing ``udx`` -- a path may contain several (e.g. a
@@ -52,9 +97,9 @@ def _dataset_root_for(gml_file: Path) -> Path:
 def _cache_path(gml_file: Path, feature_type: str,
                 building_lod: Optional[int]) -> Path:
     """Cache file path for one (GML file, feature type, LOD) combination."""
-    gml_file = Path(gml_file)
-    root = _dataset_root_for(gml_file)
-    rel = gml_file.resolve().relative_to(root)
+    resolved = Path(gml_file).resolve()
+    root = _dataset_root_for(resolved)
+    rel = resolved.relative_to(root)
     suffix = f".{feature_type}"
     if feature_type == "building":
         suffix += f".lod{building_lod if building_lod is not None else 'auto'}"
@@ -64,13 +109,14 @@ def _cache_path(gml_file: Path, feature_type: str,
 def load_cached_meshes(gml_file: Path, feature_type: str,
                        building_lod: Optional[int]) -> Optional[List[Mesh3D]]:
     """Return cached meshes for *gml_file*, or None on miss/stale/error."""
+    cache_file = None
     try:
         cache_file = _cache_path(gml_file, feature_type, building_lod)
         if not cache_file.exists():
             return None
         st = os.stat(gml_file)
         with np.load(cache_file, allow_pickle=False) as data:
-            meta = json.loads(data["meta"].item())
+            meta = json.loads(data["meta"].tobytes().decode("utf-8"))
             if meta.get("version") != CACHE_VERSION:
                 return None
             if (meta.get("src_size") != st.st_size
@@ -92,8 +138,10 @@ def load_cached_meshes(gml_file: Path, feature_type: str,
                 ))
         return meshes
     except Exception as exc:
-        log.warning("Parse cache load failed for %s (re-parsing): %s",
-                    gml_file, exc)
+        log.warning("Parse cache unusable for %s (cache file %s); falling back "
+                    "to normal parsing -- delete the %s directory if this "
+                    "persists: %s",
+                    gml_file, cache_file, CACHE_DIR_NAME, exc)
         return None
 
 
@@ -101,10 +149,12 @@ def store_cached_meshes(gml_file: Path, feature_type: str,
                         building_lod: Optional[int],
                         meshes: List[Mesh3D]) -> None:
     """Snapshot *meshes* (unfiltered, reprojected). Never raises."""
+    if _stores_disabled:
+        return
     tmp_name = None
+    cache_file = None
     try:
         cache_file = _cache_path(gml_file, feature_type, building_lod)
-        cache_file.parent.mkdir(parents=True, exist_ok=True)
         st = os.stat(gml_file)
 
         # Array keys are ``v{i}``/``f{i}``/``n{i}``/``c{i}``/``a{i}_{name}``.
@@ -141,9 +191,23 @@ def store_cached_meshes(gml_file: Path, feature_type: str,
             "src_mtime_ns": st.st_mtime_ns,
             "meshes": meta_meshes,
         }
-        # default=str stringifies anything json can't encode (spec behavior)
-        arrays["meta"] = np.array(json.dumps(meta, default=str))
+        # Strict: a lenient encoder (``default=str``) would let a cache hit
+        # differ from a cache miss -- np.bool_(False) would come back as the
+        # truthy string 'False'. Skipping keeps hit == miss by construction.
+        try:
+            meta_json = json.dumps(meta)
+        except TypeError as exc:
+            _note_store_failure(
+                gml_file, cache_file,
+                f"attribute is not JSON-serializable ({exc}); extend the "
+                f"serializer if this type is now expected")
+            return
+        # utf-8 bytes, not a unicode array: np.array(str) is UTF-32, 4x larger
+        # to write and read back. json.dumps escapes non-ASCII by default and
+        # the utf-8 round-trip is exact either way.
+        arrays["meta"] = np.frombuffer(meta_json.encode("utf-8"), dtype=np.uint8)
 
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp_name = tempfile.mkstemp(
             dir=str(cache_file.parent), suffix=".tmp")
         with os.fdopen(fd, "wb") as fh:
@@ -151,8 +215,7 @@ def store_cached_meshes(gml_file: Path, feature_type: str,
         os.replace(tmp_name, cache_file)
         tmp_name = None
     except Exception as exc:
-        log.warning("Parse cache store failed for %s (continuing): %s",
-                    gml_file, exc)
+        _note_store_failure(gml_file, cache_file, str(exc))
     finally:
         if tmp_name is not None:
             try:

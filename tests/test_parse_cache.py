@@ -6,9 +6,18 @@ import numpy as np
 import pytest
 
 from voxcitygml.models import Mesh3D
+from voxcitygml.citygml import parse_cache
 from voxcitygml.citygml.parse_cache import (
-    load_cached_meshes, store_cached_meshes, _cache_path,
+    load_cached_meshes, store_cached_meshes, reset_store_failures, _cache_path,
 )
+
+
+@pytest.fixture(autouse=True)
+def _clear_store_latch():
+    """Store failures latch writes off process-wide; isolate every test."""
+    reset_store_failures()
+    yield
+    reset_store_failures()
 
 
 def _src(tmp_path, name="53393671_bldg_6697_op.gml", content="<x/>"):
@@ -93,6 +102,37 @@ def test_source_change_invalidates(tmp_path):
     assert load_cached_meshes(src, "building", 2) is None
 
 
+def test_same_size_mtime_change_invalidates(tmp_path):
+    """An edit that preserves byte count must still invalidate (mtime clause)."""
+    src = _src(tmp_path, content="<x/>")
+    store_cached_meshes(src, "building", 2, [_mesh(0)])
+    assert load_cached_meshes(src, "building", 2) is not None
+    src.write_text("<y/>", encoding="utf-8")  # same size, different content
+    os.utime(src, ns=(1_000_000_000, 1_234_567_891))
+    assert load_cached_meshes(src, "building", 2) is None
+
+
+def test_same_mtime_size_change_invalidates(tmp_path):
+    """Size is the backstop when mtime is unchanged (coarse clocks, restores)."""
+    src = _src(tmp_path, content="<x/>")
+    mtime_ns = os.stat(src).st_mtime_ns
+    store_cached_meshes(src, "building", 2, [_mesh(0)])
+    src.write_text("<x>much longer</x>", encoding="utf-8")
+    os.utime(src, ns=(mtime_ns, mtime_ns))  # pretend the clock never moved
+    assert os.stat(src).st_mtime_ns == mtime_ns
+    assert load_cached_meshes(src, "building", 2) is None
+
+
+def test_cache_version_bump_invalidates(tmp_path, monkeypatch):
+    """CACHE_VERSION is what retires caches after an extractor change."""
+    src = _src(tmp_path)
+    store_cached_meshes(src, "building", 2, [_mesh(0)])
+    assert load_cached_meshes(src, "building", 2) is not None
+    monkeypatch.setattr(parse_cache, "CACHE_VERSION",
+                        parse_cache.CACHE_VERSION + 1)
+    assert load_cached_meshes(src, "building", 2) is None
+
+
 def test_building_lod_keys_separately(tmp_path):
     src = _src(tmp_path)
     store_cached_meshes(src, "building", 1, [_mesh(1)])
@@ -110,6 +150,8 @@ def test_corrupt_cache_falls_back_to_none(tmp_path):
     assert load_cached_meshes(src, "building", 2) is None
 
 
+@pytest.mark.skipif(os.name == "nt",
+                    reason="chmod on directories is a no-op on Windows NTFS")
 def test_readonly_cache_dir_store_does_not_raise(tmp_path):
     src = _src(tmp_path)
     cache_dir = _cache_path(src, "building", 2).parent
@@ -121,14 +163,35 @@ def test_readonly_cache_dir_store_does_not_raise(tmp_path):
         os.chmod(cache_dir, stat.S_IWRITE | stat.S_IREAD | stat.S_IEXEC)
 
 
-def test_unserializable_attribute_does_not_raise(tmp_path):
+@pytest.mark.parametrize("value", [
+    object(),          # no encoder at all
+    np.bool_(False),   # would become the truthy string 'False' if stringified
+    np.int64(7),       # would become '7'
+])
+def test_unserializable_attribute_skips_cache(tmp_path, value):
+    """A hit must never disagree with a miss, so odd types are not cached."""
     src = _src(tmp_path)
-    meshes = [_mesh(0, attributes={"weird": object()})]
-    store_cached_meshes(src, "building", 2, meshes)  # must not raise
-    # json default=str stringifies object(); load must still work
-    loaded = load_cached_meshes(src, "building", 2)
-    if loaded is not None:  # stored with stringified attribute
-        assert isinstance(loaded[0].attributes["weird"], str)
+    store_cached_meshes(src, "building", 2,
+                        [_mesh(0, attributes={"weird": value})])  # no raise
+    assert not _cache_path(src, "building", 2).exists()
+    assert load_cached_meshes(src, "building", 2) is None
+
+
+def test_store_failures_latch_writes_off(tmp_path):
+    """A read-only dataset must not warn once per file, forever."""
+    missing = tmp_path / "does_not_exist.gml"  # os.stat fails every time
+    for _ in range(parse_cache._MAX_STORE_FAILURE_WARNINGS):
+        store_cached_meshes(missing, "building", 2, [_mesh(0)])
+    assert parse_cache._stores_disabled
+
+    # Latched off: even a perfectly good store is now skipped.
+    good = _src(tmp_path)
+    store_cached_meshes(good, "building", 2, [_mesh(0)])
+    assert not _cache_path(good, "building", 2).exists()
+
+    reset_store_failures()
+    store_cached_meshes(good, "building", 2, [_mesh(0)])
+    assert _cache_path(good, "building", 2).exists()
 
 
 def test_plateau_layout_cache_sits_beside_dataset(tmp_path):
@@ -141,3 +204,23 @@ def test_plateau_layout_cache_sits_beside_dataset(tmp_path):
     cp = _cache_path(src, "building", 2)
     assert cp == (dataset / ".voxcitygml_cache" / "udx" / "bldg"
                   / "53393671_bldg_6697_op.gml.building.lod2.npz")
+
+
+def test_nested_udx_uses_innermost_dataset_root(tmp_path):
+    """A parent folder named 'udx' must not pull the cache out of the dataset."""
+    dataset = tmp_path / "udx" / "13102_dataset"
+    bldg_dir = dataset / "udx" / "bldg"
+    bldg_dir.mkdir(parents=True)
+    src = bldg_dir / "53393671_bldg_6697_op.gml"
+    src.write_text("<x/>", encoding="utf-8")
+    cp = _cache_path(src, "building", 2)
+    assert cp == (dataset / ".voxcitygml_cache" / "udx" / "bldg"
+                  / "53393671_bldg_6697_op.gml.building.lod2.npz")
+
+
+def test_meta_is_stored_as_utf8_bytes_not_utf32(tmp_path):
+    """np.array(str) would be UTF-32: 4x the bytes on a hot path."""
+    src = _src(tmp_path)
+    store_cached_meshes(src, "building", 2, [_mesh(0)])
+    with np.load(_cache_path(src, "building", 2), allow_pickle=False) as data:
+        assert data["meta"].dtype == np.uint8

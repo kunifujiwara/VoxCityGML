@@ -1,13 +1,26 @@
 """End-to-end LOD2 integration test against a local PLATEAU dataset.
 
 Skipped automatically when the dataset is not present (e.g. CI).
+
+Set ``VOXCITYGML_PLATEAU_TEST_DATA`` to run it against a dataset stored
+somewhere other than the default path below -- any PLATEAU dataset
+directory (the one containing ``udx/``) whose coverage includes the
+target rectangle will do.
+
+This test is marked ``slow`` and takes roughly 35-125 s, since it parses
+the intersecting CityGML tiles and voxelizes them. It runs by default
+because it is the proof the whole chain works; skip it explicitly with
+``pytest -m "not slow"``.
 """
 import os
 
 import numpy as np
 import pytest
 
-DATASET = r"D:\03_Data\citygml\plateau\13102_chuo-ku_pref_2023_citygml_2_op"
+DATASET = os.environ.get(
+    "VOXCITYGML_PLATEAU_TEST_DATA",
+    r"D:\03_Data\citygml\plateau\13102_chuo-ku_pref_2023_citygml_2_op",
+)
 
 pytestmark = pytest.mark.skipif(
     not os.path.isdir(DATASET),

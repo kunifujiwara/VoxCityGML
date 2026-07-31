@@ -31,6 +31,7 @@ dependencies = [
     "shapely",
     "pyproj",
     "mapbox-earcut",
+    "trimesh",
     "numba",
     "matplotlib",
     "seaborn",
@@ -65,5 +66,10 @@ addopts = [
     "--ignore=tests/test_visualize.py",
 ]
 markers = [
+    # Slow tests run by default: the PLATEAU integration test is the proof that
+    # the CityGML -> VoxCity chain works end to end, and deselecting it by
+    # default is the surest way for it to silently never run. Opt out with:
+    #     pytest -m "not slow"
+    # Point it at a local dataset with $VOXCITYGML_PLATEAU_TEST_DATA.
     "slow: long-running integration tests",
 ]

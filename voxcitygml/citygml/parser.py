@@ -39,6 +39,12 @@ from .parse_cache import load_cached_meshes, store_cached_meshes
 
 log = logging.getLogger(__name__)
 
+# Feature types the extractor/filter pair understands. Anything else is
+# rejected before parsing so it can never be written to the cache: an entry
+# saying "this file contains nothing" is structurally valid and correctly
+# versioned, so no CACHE_VERSION bump would ever retire it.
+_KNOWN_TYPES = ('building', 'bridge', 'terrain', 'vegetation')
+
 
 
 def _filter_meshes_by_rectangle(meshes: List[Mesh3D],
@@ -109,6 +115,8 @@ def _parse_single_file(gml_file: Path, feature_type: str,
     dataset and reused on later calls; the rectangle filter is always
     applied afresh, so cached results are rectangle-independent.
     """
+    if feature_type not in _KNOWN_TYPES:
+        return []
     try:
         # Reconstruct prepared_rect if only rect_polygon is given
         # (PreparedGeometry is not picklable for multiprocessing)
@@ -122,14 +130,16 @@ def _parse_single_file(gml_file: Path, feature_type: str,
 
         meshes = None
         if use_cache:
-            meshes = load_cached_meshes(gml_file, feature_type, building_lod)
+            meshes = load_cached_meshes(
+                gml_file, feature_type, building_lod, source_epsg)
         # ``None`` is a miss; ``[]`` is a legitimate cached result. Testing
         # truthiness here would re-parse every empty tile on every request.
         if meshes is None:
             meshes = _extract_file_meshes(
                 gml_file, feature_type, building_lod, source_epsg)
             if use_cache:
-                store_cached_meshes(gml_file, feature_type, building_lod, meshes)
+                store_cached_meshes(gml_file, feature_type, building_lod,
+                                    meshes, source_epsg)
 
         return _filter_for_type(meshes, feature_type, rect_polygon, prepared_rect)
     except Exception as exc:
@@ -188,7 +198,7 @@ def _filter_for_type(meshes: List[Mesh3D], feature_type: str,
         return filter_terrain_by_rectangle_vectorized(meshes, rect_polygon, prepared_rect)
     if feature_type == 'vegetation':
         return _filter_meshes_by_rectangle(meshes, rect_polygon, prepared_rect)
-    return meshes
+    return []  # unknown type: matches _extract_file_meshes' own fallthrough
 
 
 def _reproject_meshes(meshes: List[Mesh3D], source_epsg: str) -> List[Mesh3D]:

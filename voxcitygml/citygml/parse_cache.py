@@ -14,12 +14,28 @@ key stores a **full independent snapshot**: a dataset queried at LOD1, LOD2 and
 ``auto`` holds three complete copies of its building meshes, so disk use for
 the largest feature type can reach 3x.
 
-Validity: recorded source size + mtime_ns must match the GML file and the
+Validity: recorded source size + mtime_ns must match the GML file, the
+recorded ``source_epsg`` must match the one the caller is parsing with (stored
+vertices are post-reprojection, and the dataset-level CRS is sampled from a few
+files, so it can change while this file's own size/mtime do not), and the
 format version must match ``CACHE_VERSION``. Bump ``CACHE_VERSION`` whenever
 extraction output changes (see ``extractors.py``) -- it is the only thing that
 invalidates caches already sitting in users' dataset directories. Writes are
 atomic (temp file + ``os.replace``), so parallel workers never observe a torn
 file.
+
+Storage decisions, measured on the 194 MB Chuo-ku DEM tile (571k triangles):
+
+* **Derived arrays are elided.** ``triangle_coords`` is bitwise identical to
+  ``vertices[faces]``, so it is dropped on store and rebuilt on load: 89.1 ->
+  48.0 MB, write 0.056 -> 0.028 s, read 0.047 -> 0.040 s (including the 0.015 s
+  rebuild). Smaller *and* faster on both axes; the equality check costs 0.019 s
+  against a 2.14 s terrain parse (<1% of the cold path it runs on).
+* **Uncompressed.** ``savez_compressed`` would reach 15.0 MB but costs 1.142 s
+  to write (a ~50% tax on the cold path) and 0.183 s to read -- worse than
+  elision on both. Caveat for anyone revisiting this: those read numbers are
+  warm-page-cache; a genuinely cold read from a slow or network disk moves
+  fewer bytes and could favour compression.
 
 Mesh attributes are stored as strict JSON (ndarray values are split out into
 the npz alongside the geometry). Values must therefore be JSON-round-trip
@@ -106,8 +122,24 @@ def _cache_path(gml_file: Path, feature_type: str,
     return root / CACHE_DIR_NAME / rel.parent / (rel.name + suffix + ".npz")
 
 
+def _derived_from_geometry(value: np.ndarray, vertices: np.ndarray,
+                           faces: np.ndarray) -> bool:
+    """True when *value* is exactly ``vertices[faces]`` and need not be stored."""
+    if value.shape != (len(faces), 3, 3):
+        return False
+    try:
+        expanded = vertices[faces]
+    except Exception:
+        # Malformed faces (out-of-range indices): store the array verbatim
+        # rather than treating this as a cache-store failure.
+        return False
+    return value.dtype == expanded.dtype and np.array_equal(value, expanded)
+
+
 def load_cached_meshes(gml_file: Path, feature_type: str,
-                       building_lod: Optional[int]) -> Optional[List[Mesh3D]]:
+                       building_lod: Optional[int],
+                       source_epsg: Optional[str] = None,
+                       ) -> Optional[List[Mesh3D]]:
     """Return cached meshes for *gml_file*, or None on miss/stale/error."""
     cache_file = None
     try:
@@ -122,14 +154,26 @@ def load_cached_meshes(gml_file: Path, feature_type: str,
             if (meta.get("src_size") != st.st_size
                     or meta.get("src_mtime_ns") != st.st_mtime_ns):
                 return None
+            # Vertices are stored post-reprojection, so an entry is only valid
+            # for the CRS it was written with. ``source_epsg`` is derived from
+            # the file *set* (``_detect_dataset_crs`` samples a few files), so
+            # it can change while this file's own size/mtime do not.
+            if meta.get("source_epsg") != source_epsg:
+                return None
             meshes: List[Mesh3D] = []
             for i, mm in enumerate(meta["meshes"]):
+                vertices = data[f"v{i}"]
+                faces = data[f"f{i}"]
                 attributes = dict(mm["attrs"])
                 for name in mm["array_attrs"]:
                     attributes[name] = data[f"a{i}_{name}"]
+                # ``.get``: entries written before derived-attribute elision
+                # carry every array in ``array_attrs`` and load unchanged.
+                for name in mm.get("derived_attrs", []):
+                    attributes[name] = vertices[faces]
                 meshes.append(Mesh3D(
-                    vertices=data[f"v{i}"],
-                    faces=data[f"f{i}"],
+                    vertices=vertices,
+                    faces=faces,
                     normals=data[f"n{i}"] if mm["has_normals"] else None,
                     colors=data[f"c{i}"] if mm["has_colors"] else None,
                     feature_type=mm["feature_type"],
@@ -147,7 +191,8 @@ def load_cached_meshes(gml_file: Path, feature_type: str,
 
 def store_cached_meshes(gml_file: Path, feature_type: str,
                         building_lod: Optional[int],
-                        meshes: List[Mesh3D]) -> None:
+                        meshes: List[Mesh3D],
+                        source_epsg: Optional[str] = None) -> None:
     """Snapshot *meshes* (unfiltered, reprojected). Never raises."""
     global _store_failures
     if _stores_disabled:
@@ -171,11 +216,20 @@ def store_cached_meshes(gml_file: Path, feature_type: str,
                 arrays[f"n{i}"] = m.normals
             if m.colors is not None:
                 arrays[f"c{i}"] = m.colors
-            attrs, array_attrs = {}, []
+            attrs, array_attrs, derived_attrs = {}, [], []
             for name, value in m.attributes.items():
                 if isinstance(value, np.ndarray):
-                    arrays[f"a{i}_{name}"] = value
-                    array_attrs.append(name)
+                    # Terrain carries ``triangle_coords`` == ``vertices[faces]``
+                    # -- roughly half the entry. Eliding what is provably
+                    # redundant and rebuilding it on load is smaller *and*
+                    # faster on both write and read. Generic on purpose: only
+                    # an array just proven equal is dropped, so an extractor
+                    # emitting a genuinely independent array still stores it.
+                    if _derived_from_geometry(value, m.vertices, m.faces):
+                        derived_attrs.append(name)
+                    else:
+                        arrays[f"a{i}_{name}"] = value
+                        array_attrs.append(name)
                 else:
                     attrs[name] = value
             meta_meshes.append({
@@ -183,6 +237,7 @@ def store_cached_meshes(gml_file: Path, feature_type: str,
                 "feature_id": m.feature_id,
                 "attrs": attrs,
                 "array_attrs": array_attrs,
+                "derived_attrs": derived_attrs,
                 "has_normals": m.normals is not None,
                 "has_colors": m.colors is not None,
             })
@@ -190,6 +245,7 @@ def store_cached_meshes(gml_file: Path, feature_type: str,
             "version": CACHE_VERSION,
             "src_size": st.st_size,
             "src_mtime_ns": st.st_mtime_ns,
+            "source_epsg": source_epsg,
             "meshes": meta_meshes,
         }
         # Strict: a lenient encoder (``default=str``) would let a cache hit

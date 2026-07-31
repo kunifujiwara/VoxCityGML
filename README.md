@@ -77,6 +77,23 @@ common workflows:
 | `compare_pedestrian_solar.py` | Statistical comparison of solar irradiance across cities |
 | `lod_comparison_pedestrian_solar.py` | Paired LoD2 vs LoD1 solar irradiance analysis |
 
+## Parse Cache
+
+Parsing CityGML XML dominates run time, so the first parse of each `.gml` file
+is snapshotted in binary form and reused on every later run.
+
+- **Where:** a `.voxcitygml_cache/` directory created **inside your CityGML
+  dataset directory** (next to `udx/` for PLATEAU datasets), mirroring the
+  dataset's own layout.
+- **Safe to delete at any time.** It is purely an accelerator — if it is
+  missing, unreadable, or out of date, the GML is simply parsed again. Entries
+  are invalidated automatically when the source file changes.
+- **Size:** entries can be tens of megabytes. Terrain (DEM) tiles are the
+  largest; a typical PLATEAU DEM tile is roughly 50 MB.
+- **Disabling:** pass `use_parse_cache=False` to `parse_citygml_directory` to
+  always parse the XML. If the dataset directory is read-only, caching quietly
+  turns itself off and parsing continues unaffected.
+
 ## Pipeline Overview
 
 1. **Parse** CityGML → extract terrain, building, bridge, and vegetation meshes

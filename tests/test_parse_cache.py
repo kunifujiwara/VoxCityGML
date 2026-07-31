@@ -143,6 +143,64 @@ def test_building_lod_keys_separately(tmp_path):
     assert load_cached_meshes(src, "building", None)[0].feature_id == "bldg_3"
 
 
+def test_derived_triangle_coords_elided_and_rebuilt(tmp_path):
+    """triangle_coords == vertices[faces]: don't store it, rebuild on load."""
+    src = _src(tmp_path, name="dem.gml")
+    v = np.arange(27, dtype=np.float64).reshape(9, 3)
+    f = np.arange(9, dtype=np.int32).reshape(3, 3)
+    tri = v[f]
+    store_cached_meshes(src, "terrain", None, [
+        _mesh(0, vertices=v, faces=f, feature_type="terrain",
+              attributes={"triangle_coords": tri, "kind": "TIN"})])
+
+    with np.load(_cache_path(src, "terrain", None), allow_pickle=False) as data:
+        assert "a0_triangle_coords" not in data.files, "derived array stored"
+
+    loaded = load_cached_meshes(src, "terrain", None)
+    got = loaded[0].attributes["triangle_coords"]
+    assert got.tobytes() == tri.tobytes(), "rebuild must be bitwise identical"
+    assert got.dtype == tri.dtype and got.shape == tri.shape
+    assert loaded[0].attributes["kind"] == "TIN"
+
+
+def test_independent_array_of_derived_shape_is_still_stored(tmp_path):
+    """Same shape as vertices[faces] but different values -> must be stored."""
+    src = _src(tmp_path, name="dem.gml")
+    v = np.arange(27, dtype=np.float64).reshape(9, 3)
+    f = np.arange(9, dtype=np.int32).reshape(3, 3)
+    other = v[f] + 1.0  # right shape, wrong values
+    store_cached_meshes(src, "terrain", None, [
+        _mesh(0, vertices=v, faces=f, feature_type="terrain",
+              attributes={"triangle_coords": other})])
+    with np.load(_cache_path(src, "terrain", None), allow_pickle=False) as data:
+        assert "a0_triangle_coords" in data.files
+    loaded = load_cached_meshes(src, "terrain", None)
+    np.testing.assert_array_equal(loaded[0].attributes["triangle_coords"], other)
+
+
+def test_out_of_range_faces_do_not_break_store(tmp_path):
+    """A malformed faces array must fall back to storing, not fail the store."""
+    src = _src(tmp_path, name="dem.gml")
+    v = np.arange(9, dtype=np.float64).reshape(3, 3)
+    f = np.array([[0, 1, 99]], dtype=np.int32)  # 99 is out of range
+    tri = np.zeros((1, 3, 3))
+    store_cached_meshes(src, "terrain", None, [
+        _mesh(0, vertices=v, faces=f, feature_type="terrain",
+              attributes={"triangle_coords": tri})])
+    assert _cache_path(src, "terrain", None).exists()
+    loaded = load_cached_meshes(src, "terrain", None)
+    np.testing.assert_array_equal(loaded[0].attributes["triangle_coords"], tri)
+
+
+def test_source_epsg_mismatch_invalidates(tmp_path):
+    """Vertices are cached post-reprojection, so the CRS is part of validity."""
+    src = _src(tmp_path)
+    store_cached_meshes(src, "building", 2, [_mesh(0)], "EPSG:25832")
+    assert load_cached_meshes(src, "building", 2, "EPSG:25832") is not None
+    assert load_cached_meshes(src, "building", 2, "EPSG:32633") is None
+    assert load_cached_meshes(src, "building", 2, None) is None
+
+
 def test_corrupt_cache_falls_back_to_none(tmp_path):
     src = _src(tmp_path)
     store_cached_meshes(src, "building", 2, [_mesh(0)])
@@ -337,3 +395,62 @@ def test_rectangle_filter_applied_after_cache_hit(fake_extractor):
     assert len(_parse_single_file(plain, "building", near, None,
                                   building_lod=2)) == 1
     assert calls["n"] == 1, "filtering must not re-parse"
+
+
+def test_unknown_feature_type_is_rejected_before_caching(fake_extractor):
+    """An unknown type must not parse, and must not poison the cache with []."""
+    src, calls = fake_extractor
+    assert _parse_single_file(src, "sculpture", None, None) == []
+    assert calls["n"] == 0, "must not parse an unsupported feature type"
+    assert not _cache_path(src, "sculpture", None).exists()
+
+
+# ---------------------------------------------------------------------------
+# Projected-CRS (reprojection) path -- no other test exercises it, since
+# PLATEAU is EPSG:6697 which resolves to None (geographic, never reprojected).
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def utm_extractor(monkeypatch, tmp_path):
+    """Extractor returning UTM-32N metres (Munich), as a European dataset would."""
+    src = tmp_path / "munich_tile.gml"
+    src.write_text("<CityModel/>", encoding="utf-8")
+    calls = {"n": 0}
+    utm = np.array([[691000.0, 5334000.0, 10.0],
+                    [691010.0, 5334010.0, 12.0],
+                    [691020.0, 5334000.0, 11.0]])
+
+    def fake_extract(root, ns, prefer_lod=None, max_lod=4):
+        calls["n"] += 1
+        return [_mesh(0, vertices=utm.copy(),
+                      faces=np.array([[0, 1, 2]], dtype=np.int32))]
+
+    monkeypatch.setattr(parser_mod, "extract_buildings_from_root", fake_extract)
+    return src, calls
+
+
+def test_reprojection_happens_before_caching(utm_extractor):
+    """Cached vertices must already be WGS84 (lat, lon, z), not raw UTM."""
+    src, calls = utm_extractor
+    first = _parse_single_file(src, "building", None, None, building_lod=2,
+                               source_epsg="EPSG:25832")
+    second = _parse_single_file(src, "building", None, None, building_lod=2,
+                                source_epsg="EPSG:25832")
+    assert calls["n"] == 1, "second call must be served from the cache"
+    # Munich is ~48.1 N, 11.6 E -- proves the cached array is reprojected.
+    lat, lon = second[0].vertices[0][:2]
+    assert 47.0 < lat < 49.0, f"latitude not reprojected: {lat}"
+    assert 10.0 < lon < 13.0, f"longitude not reprojected: {lon}"
+    _assert_meshes_equal(first, second)
+
+
+def test_source_epsg_change_reparses(utm_extractor):
+    """Dataset CRS detection can change without the GML file changing."""
+    src, calls = utm_extractor
+    a = _parse_single_file(src, "building", None, None, building_lod=2,
+                           source_epsg="EPSG:25832")
+    b = _parse_single_file(src, "building", None, None, building_lod=2,
+                           source_epsg="EPSG:32633")
+    assert calls["n"] == 2, "a different source_epsg must not reuse the entry"
+    # Different CRS -> genuinely different coordinates, not a stale replay.
+    assert a[0].vertices[0][1] != b[0].vertices[0][1]

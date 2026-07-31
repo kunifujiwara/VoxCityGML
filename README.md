@@ -85,16 +85,26 @@ is snapshotted in binary form and reused on every later run.
 - **Where:** a `.voxcitygml_cache/` directory created **inside your CityGML
   dataset directory** (next to `udx/` for PLATEAU datasets), mirroring the
   dataset's own layout.
-- **Safe to delete at any time.** It is purely an accelerator — if it is
-  missing, unreadable, or out of date, the GML is simply parsed again. Entries
-  are invalidated automatically when the source file changes.
-- **Size:** entries can be tens of megabytes. Terrain (DEM) tiles are the
-  largest; a typical PLATEAU DEM tile is roughly 50 MB.
+- **Safe to delete at any time** — the whole directory, or any file inside it.
+  It is purely an accelerator: if an entry is missing, unreadable, or out of
+  date, the GML is simply parsed again. Entries are invalidated automatically
+  when the source file changes. A stray `.tmp` file, left behind only by a
+  hard kill or power loss mid-write, is inert and can be deleted too.
+- **Size:** budget roughly the size of the dataset itself, with individual
+  entries in the tens of megabytes — terrain (DEM) tiles are much the largest,
+  around 50 MB each. Each distinct cache key holds a full independent
+  snapshot, so a dataset queried at LOD1, LOD2 *and* automatic LOD keeps three
+  complete copies of its building meshes. For a full-city dataset this is a
+  multi-gigabyte commitment.
+- **No eviction.** Nothing is reclaimed automatically. A *changed* GML file is
+  fine — its entry is overwritten in place — but entries belonging to GML
+  files you later delete or rename are orphaned and remain until you remove
+  them yourself.
 - **Disabling:** set `VoxelizerConfig(use_parse_cache=False)` to always parse
   the XML (the same switch is available as `use_parse_cache=False` on
   `parse_citygml_directory` if you call the parser directly). If the dataset
-  directory is read-only, caching quietly turns itself off and parsing
-  continues unaffected.
+  directory is read-only, caching disables itself after a few warnings and
+  parsing continues unaffected.
 
 ## Pipeline Overview
 

@@ -39,11 +39,13 @@ Storage decisions, measured on the 194 MB Chuo-ku DEM tile (571k triangles):
 
 Mesh attributes are stored as strict JSON (ndarray values are split out into
 the npz alongside the geometry). Values must therefore be JSON-round-trip
-identical -- ``str``/``int``/``float``/``bool``/``None``/``list``/``dict`` with
-string keys. Anything else (numpy scalars such as ``np.int64``/``np.bool_``,
-tuples, non-string dict keys) either fails to serialize or comes back as a
-different type, so a cache hit would disagree with a cache miss; when strict
-serialization fails the file is simply not cached.
+identical -- exactly ``str``/``int``/``float``/``bool``/``None``, or a
+``list``/``dict`` (string keys) of those. Anything else would make a cache hit
+disagree with a cache miss, so ``_json_exact`` rejects it up front and the file
+is simply not cached. The check is by exact type, because the encoder alone
+does not catch every case: it raises on ``np.int64``/``np.bool_``/``object()``
+but silently coerces ``tuple`` -> ``list``, non-string dict keys -> ``str``,
+and the float/str subclasses ``np.float64``/``np.str_`` -> plain builtins.
 
 The cache is strictly an accelerator: every failure in load or store logs a
 warning and the caller falls back to normal parsing.
@@ -122,6 +124,30 @@ def _cache_path(gml_file: Path, feature_type: str,
     return root / CACHE_DIR_NAME / rel.parent / (rel.name + suffix + ".npz")
 
 
+# Types that JSON returns *as the same type*. Checked with ``type(v) is`` and
+# not ``isinstance``: np.float64 subclasses float and np.str_ subclasses str,
+# so both pass an isinstance check yet come back as the plain builtin -- a hit
+# would then disagree with a miss. Relying on json.dumps to raise is not
+# enough either: it silently coerces tuple -> list and int dict keys -> str.
+_JSON_SCALARS = (str, int, float, bool, type(None))
+
+
+def _json_exact(value) -> bool:
+    """True when *value* round-trips through JSON as an identical type.
+
+    NaN/Infinity are plain floats and do round-trip through Python's encoder,
+    so they are accepted -- which is why this is a type check rather than a
+    ``json.loads(json.dumps(v)) == v`` comparison (NaN != NaN would reject).
+    """
+    if type(value) in _JSON_SCALARS:
+        return True
+    if type(value) is list:
+        return all(_json_exact(v) for v in value)
+    if type(value) is dict:
+        return all(type(k) is str and _json_exact(v) for k, v in value.items())
+    return False
+
+
 def _derived_from_geometry(value: np.ndarray, vertices: np.ndarray,
                            faces: np.ndarray) -> bool:
     """True when *value* is exactly ``vertices[faces]`` and need not be stored."""
@@ -192,8 +218,19 @@ def load_cached_meshes(gml_file: Path, feature_type: str,
 def store_cached_meshes(gml_file: Path, feature_type: str,
                         building_lod: Optional[int],
                         meshes: List[Mesh3D],
-                        source_epsg: Optional[str] = None) -> None:
-    """Snapshot *meshes* (unfiltered, reprojected). Never raises."""
+                        source_epsg: Optional[str] = None,
+                        src_stat: Optional[os.stat_result] = None) -> None:
+    """Snapshot *meshes* (unfiltered, reprojected). Never raises.
+
+    *src_stat* must be the ``os.stat`` of *gml_file* taken **before** the
+    extraction that produced *meshes*. If the source is replaced while it is
+    being parsed (an rsync/robocopy/OneDrive re-sync of a live dataset), a stat
+    taken afterwards would describe the new bytes while the arrays hold the old
+    ones -- and that entry would then validate forever, serving stale geometry.
+    Recording the pre-parse stat makes such an entry fail validation instead,
+    which costs one re-parse. Callers that cannot straddle the parse may omit
+    it and accept that window.
+    """
     global _store_failures
     if _stores_disabled:
         return
@@ -201,7 +238,7 @@ def store_cached_meshes(gml_file: Path, feature_type: str,
     cache_file = None
     try:
         cache_file = _cache_path(gml_file, feature_type, building_lod)
-        st = os.stat(gml_file)
+        st = src_stat if src_stat is not None else os.stat(gml_file)
 
         # Array keys are ``v{i}``/``f{i}``/``n{i}``/``c{i}``/``a{i}_{name}``.
         # The mesh index is a pure digit run and the separator is not a digit,
@@ -230,6 +267,14 @@ def store_cached_meshes(gml_file: Path, feature_type: str,
                     else:
                         arrays[f"a{i}_{name}"] = value
                         array_attrs.append(name)
+                elif not _json_exact(value):
+                    _note_store_failure(
+                        gml_file, cache_file,
+                        f"attribute {name!r} of type "
+                        f"{type(value).__name__} does not survive a JSON "
+                        f"round-trip as the same type; extend the serializer "
+                        f"if this type is now expected")
+                    return
                 else:
                     attrs[name] = value
             meta_meshes.append({

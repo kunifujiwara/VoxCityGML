@@ -8,6 +8,7 @@ reprojected to (lat, lon, z) at parse time.
 """
 
 import logging
+import os
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -35,7 +36,9 @@ from .extractors import (
     filter_terrain_by_rectangle_vectorized,
     extract_vegetation_from_root,
 )
-from .parse_cache import load_cached_meshes, store_cached_meshes
+from .parse_cache import (
+    load_cached_meshes, store_cached_meshes, reset_store_failures,
+)
 
 log = logging.getLogger(__name__)
 
@@ -135,11 +138,15 @@ def _parse_single_file(gml_file: Path, feature_type: str,
         # ``None`` is a miss; ``[]`` is a legitimate cached result. Testing
         # truthiness here would re-parse every empty tile on every request.
         if meshes is None:
+            # Stat before extraction, never after: a source replaced mid-parse
+            # must invalidate the entry rather than stamp the new size/mtime
+            # onto arrays holding the old content.
+            src_stat = os.stat(gml_file) if use_cache else None
             meshes = _extract_file_meshes(
                 gml_file, feature_type, building_lod, source_epsg)
             if use_cache:
                 store_cached_meshes(gml_file, feature_type, building_lod,
-                                    meshes, source_epsg)
+                                    meshes, source_epsg, src_stat=src_stat)
 
         return _filter_for_type(meshes, feature_type, rect_polygon, prepared_rect)
     except Exception as exc:
@@ -180,6 +187,8 @@ def _extract_file_meshes(gml_file: Path, feature_type: str,
     elif feature_type == 'vegetation':
         meshes = extract_vegetation_from_root(root, ns)
     else:
+        # Unreachable via _parse_single_file, which gates on _KNOWN_TYPES;
+        # kept only so this function is total if called directly.
         return []
 
     if file_epsg:
@@ -198,7 +207,10 @@ def _filter_for_type(meshes: List[Mesh3D], feature_type: str,
         return filter_terrain_by_rectangle_vectorized(meshes, rect_polygon, prepared_rect)
     if feature_type == 'vegetation':
         return _filter_meshes_by_rectangle(meshes, rect_polygon, prepared_rect)
-    return []  # unknown type: matches _extract_file_meshes' own fallthrough
+    # Unreachable: _parse_single_file gates on _KNOWN_TYPES. Passing the input
+    # through matches the ``rect_polygon is None`` early return above, so an
+    # unhandled type behaves the same way whether or not a rectangle is given.
+    return meshes
 
 
 def _reproject_meshes(meshes: List[Mesh3D], source_epsg: str) -> List[Mesh3D]:
@@ -260,6 +272,15 @@ def parse_citygml_directory(
     Returns:
         CityGMLMeshCollection with parsed meshes.
     """
+    # Re-arm cache writes per call, not per process. The failure latch exists
+    # to bound warning noise within one run, but it cannot tell a permanently
+    # read-only dataset from a transient hiccup (on Windows, os.replace fails
+    # with "access is denied" while a concurrent request holds an entry open
+    # for reading). Without this, a long-lived server would silently lose
+    # caching for good after a few unrelated collisions.
+    if use_parse_cache:
+        reset_store_failures()
+
     collection = CityGMLMeshCollection()
     citygml_root = Path(citygml_path)
 

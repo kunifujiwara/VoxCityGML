@@ -222,9 +222,17 @@ def test_readonly_cache_dir_store_does_not_raise(tmp_path):
 
 
 @pytest.mark.parametrize("value", [
-    object(),          # no encoder at all
-    np.bool_(False),   # would become the truthy string 'False' if stringified
-    np.int64(7),       # would become '7'
+    object(),           # no encoder at all
+    np.bool_(False),    # would become the truthy string 'False' if stringified
+    np.int64(7),        # would become '7'
+    # These four the encoder accepts *silently*, coercing the type -- so a hit
+    # would disagree with a miss unless the type check rejects them up front.
+    (1.0, 2.0),         # tuple -> list
+    {1: "a"},           # int dict key -> "1"
+    np.float64(3.5),    # float subclass -> plain float
+    np.str_("s"),       # str subclass -> plain str
+    [np.int64(1)],      # nested in a list
+    {"k": (1, 2)},      # nested in a dict
 ])
 def test_unserializable_attribute_skips_cache(tmp_path, value):
     """A hit must never disagree with a miss, so odd types are not cached."""
@@ -233,6 +241,26 @@ def test_unserializable_attribute_skips_cache(tmp_path, value):
                         [_mesh(0, attributes={"weird": value})])  # no raise
     assert not _cache_path(src, "building", 2).exists()
     assert load_cached_meshes(src, "building", 2) is None
+
+
+@pytest.mark.parametrize("value", [
+    "s", 7, 3.5, True, False, None,
+    float("nan"), float("inf"),   # plain floats: they do round-trip
+    [1, "a", None], {"k": [1.5, {"n": True}]}, [], {},
+])
+def test_exactly_round_tripping_attributes_are_cached(tmp_path, value):
+    """The type guard must not over-reject: these all survive JSON exactly."""
+    src = _src(tmp_path)
+    store_cached_meshes(src, "building", 2,
+                        [_mesh(0, attributes={"v": value})])
+    loaded = load_cached_meshes(src, "building", 2)
+    assert loaded is not None, f"{value!r} should have been cached"
+    got = loaded[0].attributes["v"]
+    assert type(got) is type(value)
+    if isinstance(value, float) and np.isnan(value):
+        assert np.isnan(got)
+    else:
+        assert got == value
 
 
 def test_store_failures_latch_writes_off(tmp_path):
@@ -395,6 +423,35 @@ def test_rectangle_filter_applied_after_cache_hit(fake_extractor):
     assert len(_parse_single_file(plain, "building", near, None,
                                   building_lod=2)) == 1
     assert calls["n"] == 1, "filtering must not re-parse"
+
+
+def test_source_replaced_during_parse_is_not_served_later(fake_extractor,
+                                                          monkeypatch):
+    """A mid-parse re-sync must invalidate, not stamp the new stat on old bytes.
+
+    The stat has to be taken *before* extraction. Taken after, the entry would
+    record the new size/mtime alongside arrays holding the old content, and
+    every later load would validate it and serve stale geometry forever.
+    """
+    src, calls = fake_extractor
+    real_extract = parser_mod._extract_file_meshes
+
+    def extract_then_replace_source(gml_file, feature_type, building_lod,
+                                    source_epsg):
+        meshes = real_extract(gml_file, feature_type, building_lod, source_epsg)
+        # rsync/robocopy/OneDrive swaps the file while we were parsing it.
+        gml_file.write_text("<CityModel><newer/></CityModel>", encoding="utf-8")
+        return meshes
+
+    monkeypatch.setattr(parser_mod, "_extract_file_meshes",
+                        extract_then_replace_source)
+    _parse_single_file(src, "building", None, None, building_lod=2)
+    assert calls["n"] == 1
+
+    # Whether or not an entry was written, it must not validate against the
+    # file now on disk -- the parsed content is not that file's content.
+    assert load_cached_meshes(src, "building", 2) is None, \
+        "entry recorded the post-parse stat and would serve stale geometry"
 
 
 def test_unknown_feature_type_is_rejected_before_caching(fake_extractor):

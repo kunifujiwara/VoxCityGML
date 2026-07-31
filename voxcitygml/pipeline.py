@@ -107,6 +107,17 @@ class VoxCityGML:
         return city
 
 
+def generate_voxcity(config: VoxelizerConfig):
+    """Run the full CityGML → VoxCity pipeline and return a ``VoxCity``.
+
+    Thin public wrapper around :class:`VoxCityGML` for application use::
+
+        from voxcitygml import generate_voxcity, VoxelizerConfig
+        city = generate_voxcity(VoxelizerConfig(...))
+    """
+    return VoxCityGML(config).run()
+
+
 # ------------------------------------------------------------------
 # Shared pipeline core
 # ------------------------------------------------------------------

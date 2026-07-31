@@ -12,7 +12,7 @@ Pipeline:
     5. Integrate all components → VoxCity model
 
 Usage:
-    from voxcitygml import VoxCityGML, VoxelizerConfig
+    from voxcitygml import generate_voxcity, VoxelizerConfig
 
     config = VoxelizerConfig(
         citygml_path="path/to/plateau_dataset",
@@ -21,11 +21,11 @@ Usage:
         size_meters=500,
         meshsize=1.0,
     )
-    city = VoxCityGML(config).run()
+    city = generate_voxcity(config)
 """
 
 from .models import VoxelizerConfig
-from .pipeline import VoxCityGML
+from .pipeline import VoxCityGML, generate_voxcity
 
 __version__ = "0.1.0"
 __author__ = "Kunihiko Fujiwara"
@@ -33,4 +33,5 @@ __author__ = "Kunihiko Fujiwara"
 __all__ = [
     "VoxCityGML",
     "VoxelizerConfig",
+    "generate_voxcity",
 ]

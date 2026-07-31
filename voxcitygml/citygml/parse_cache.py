@@ -59,7 +59,7 @@ _stores_disabled = False
 
 
 def reset_store_failures() -> None:
-    """Re-enable cache writes after the failure latch tripped (for tests)."""
+    """Re-enable cache writes after the failure latch tripped."""
     global _store_failures, _stores_disabled
     _store_failures = 0
     _stores_disabled = False
@@ -149,6 +149,7 @@ def store_cached_meshes(gml_file: Path, feature_type: str,
                         building_lod: Optional[int],
                         meshes: List[Mesh3D]) -> None:
     """Snapshot *meshes* (unfiltered, reprojected). Never raises."""
+    global _store_failures
     if _stores_disabled:
         return
     tmp_name = None
@@ -195,7 +196,7 @@ def store_cached_meshes(gml_file: Path, feature_type: str,
         # differ from a cache miss -- np.bool_(False) would come back as the
         # truthy string 'False'. Skipping keeps hit == miss by construction.
         try:
-            meta_json = json.dumps(meta)
+            meta_json = json.dumps(meta, ensure_ascii=False)
         except TypeError as exc:
             _note_store_failure(
                 gml_file, cache_file,
@@ -203,8 +204,10 @@ def store_cached_meshes(gml_file: Path, feature_type: str,
                 f"serializer if this type is now expected")
             return
         # utf-8 bytes, not a unicode array: np.array(str) is UTF-32, 4x larger
-        # to write and read back. json.dumps escapes non-ASCII by default and
-        # the utf-8 round-trip is exact either way.
+        # to write and read back. ``ensure_ascii=False`` keeps Japanese PLATEAU
+        # attributes as utf-8 rather than \\uXXXX escapes (~1.4x smaller); both
+        # forms ``json.loads`` identically, so entries written either way stay
+        # readable and no CACHE_VERSION bump is needed.
         arrays["meta"] = np.frombuffer(meta_json.encode("utf-8"), dtype=np.uint8)
 
         cache_file.parent.mkdir(parents=True, exist_ok=True)
@@ -214,6 +217,10 @@ def store_cached_meshes(gml_file: Path, feature_type: str,
             np.savez(fh, **arrays)
         os.replace(tmp_name, cache_file)
         tmp_name = None
+        # Consecutive, not cumulative: a working store clears the count so
+        # unrelated hiccups spread over a long-running process never add up
+        # to a permanent shutdown of caching.
+        _store_failures = 0
     except Exception as exc:
         _note_store_failure(gml_file, cache_file, str(exc))
     finally:

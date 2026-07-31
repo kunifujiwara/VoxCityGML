@@ -35,6 +35,7 @@ from .extractors import (
     filter_terrain_by_rectangle_vectorized,
     extract_vegetation_from_root,
 )
+from .parse_cache import load_cached_meshes, store_cached_meshes
 
 log = logging.getLogger(__name__)
 
@@ -95,12 +96,18 @@ def _parse_single_file(gml_file: Path, feature_type: str,
                         building_lod: Optional[int] = None,
                         source_epsg: Optional[str] = None,
                         *,
-                        failures: Optional[List[str]] = None) -> List[Mesh3D]:
+                        failures: Optional[List[str]] = None,
+                        use_cache: bool = True) -> List[Mesh3D]:
     """Parse a single GML file.
 
     If *source_epsg* is given (e.g. ``'EPSG:25832'``), all extracted
     vertex coordinates are reprojected to WGS84 (lat, lon, z) before
     the meshes are returned.
+
+    When *use_cache* is True (default), the unfiltered, reprojected
+    extraction result is snapshotted to ``.voxcitygml_cache`` beside the
+    dataset and reused on later calls; the rectangle filter is always
+    applied afresh, so cached results are rectangle-independent.
     """
     try:
         # Reconstruct prepared_rect if only rect_polygon is given
@@ -113,57 +120,75 @@ def _parse_single_file(gml_file: Path, feature_type: str,
             if not file_intersects_rectangle(gml_file.name, rect_polygon):
                 return []
 
-        tree = ET.parse(str(gml_file))
-        root = tree.getroot()
-        ns = build_namespaces(root)
+        meshes = None
+        if use_cache:
+            meshes = load_cached_meshes(gml_file, feature_type, building_lod)
+        # ``None`` is a miss; ``[]`` is a legitimate cached result. Testing
+        # truthiness here would re-parse every empty tile on every request.
+        if meshes is None:
+            meshes = _extract_file_meshes(
+                gml_file, feature_type, building_lod, source_epsg)
+            if use_cache:
+                store_cached_meshes(gml_file, feature_type, building_lod, meshes)
 
-        # Auto-detect CRS from file if not already known
-        file_epsg = source_epsg
-        if file_epsg is None:
-            file_epsg = detect_crs_from_root(root)
-
-        if feature_type == 'building':
-            meshes = extract_buildings_from_root(
-                root, ns,
-                prefer_lod=building_lod,
-                max_lod=4,
-            )
-            if file_epsg:
-                meshes = _reproject_meshes(meshes, file_epsg)
-            if rect_polygon is not None and meshes:
-                meshes = _filter_building_and_bridge_meshes(meshes, rect_polygon, prepared_rect)
-        elif feature_type == 'bridge':
-            meshes = extract_bridges_from_root(root, ns)
-            if file_epsg:
-                meshes = _reproject_meshes(meshes, file_epsg)
-            if rect_polygon is not None and meshes:
-                meshes = _filter_building_and_bridge_meshes(meshes, rect_polygon, prepared_rect)
-        elif feature_type == 'terrain':
-            try:
-                with open(str(gml_file), 'r', encoding='utf-8') as f:
-                    content = f.read()
-                meshes = extract_terrain_from_root(None, None, gml_content=content)
-            except Exception:
-                meshes = extract_terrain_from_root(root, ns)
-            if file_epsg:
-                meshes = _reproject_meshes(meshes, file_epsg)
-            if rect_polygon is not None and meshes:
-                meshes = filter_terrain_by_rectangle_vectorized(meshes, rect_polygon, prepared_rect)
-            return meshes
-        elif feature_type == 'vegetation':
-            meshes = extract_vegetation_from_root(root, ns)
-            if file_epsg:
-                meshes = _reproject_meshes(meshes, file_epsg)
-            if rect_polygon is not None and meshes:
-                meshes = _filter_meshes_by_rectangle(meshes, rect_polygon, prepared_rect)
-        else:
-            return []
-        return meshes
+        return _filter_for_type(meshes, feature_type, rect_polygon, prepared_rect)
     except Exception as exc:
         log.warning("Failed to parse %s: %s", gml_file, exc)
         if failures is not None:
             failures.append(f"{gml_file}: {exc}")
         return []
+
+
+def _extract_file_meshes(gml_file: Path, feature_type: str,
+                         building_lod: Optional[int],
+                         source_epsg: Optional[str]) -> List[Mesh3D]:
+    """Extract + reproject one GML file. Rectangle-independent (cacheable)."""
+    tree = ET.parse(str(gml_file))
+    root = tree.getroot()
+    ns = build_namespaces(root)
+
+    # Auto-detect CRS from file if not already known
+    file_epsg = source_epsg
+    if file_epsg is None:
+        file_epsg = detect_crs_from_root(root)
+
+    if feature_type == 'building':
+        meshes = extract_buildings_from_root(
+            root, ns,
+            prefer_lod=building_lod,
+            max_lod=4,
+        )
+    elif feature_type == 'bridge':
+        meshes = extract_bridges_from_root(root, ns)
+    elif feature_type == 'terrain':
+        try:
+            with open(str(gml_file), 'r', encoding='utf-8') as f:
+                content = f.read()
+            meshes = extract_terrain_from_root(None, None, gml_content=content)
+        except Exception:
+            meshes = extract_terrain_from_root(root, ns)
+    elif feature_type == 'vegetation':
+        meshes = extract_vegetation_from_root(root, ns)
+    else:
+        return []
+
+    if file_epsg:
+        meshes = _reproject_meshes(meshes, file_epsg)
+    return meshes
+
+
+def _filter_for_type(meshes: List[Mesh3D], feature_type: str,
+                     rect_polygon, prepared_rect) -> List[Mesh3D]:
+    """Apply the per-feature-type rectangle filter (post-parse, post-cache)."""
+    if rect_polygon is None or not meshes:
+        return meshes
+    if feature_type in ('building', 'bridge'):
+        return _filter_building_and_bridge_meshes(meshes, rect_polygon, prepared_rect)
+    if feature_type == 'terrain':
+        return filter_terrain_by_rectangle_vectorized(meshes, rect_polygon, prepared_rect)
+    if feature_type == 'vegetation':
+        return _filter_meshes_by_rectangle(meshes, rect_polygon, prepared_rect)
+    return meshes
 
 
 def _reproject_meshes(meshes: List[Mesh3D], source_epsg: str) -> List[Mesh3D]:
@@ -190,6 +215,7 @@ def parse_citygml_directory(
     building_lod: Optional[int] = None,
     dem_path: Optional[str] = None,
     tree_citygml_path: Optional[str] = None,
+    use_parse_cache: bool = True,
 ) -> CityGMLMeshCollection:
     """Parse all CityGML files in a dataset directory.
 
@@ -217,6 +243,9 @@ def parse_citygml_directory(
             containing vegetation/tree data (e.g. Munich semantic tree models).
             If supplied, vegetation GML files are loaded from this directory
             *in addition to* any vegetation found in the main citygml_path.
+        use_parse_cache: If True (default), cache parsed meshes as binary
+            snapshots in ``.voxcitygml_cache`` beside the dataset and reuse
+            them on later calls. Set False to always parse the XML.
 
     Returns:
         CityGMLMeshCollection with parsed meshes.
@@ -271,6 +300,7 @@ def parse_citygml_directory(
                     gml_file, ftype, rect_polygon, prepared_rect,
                     building_lod=building_lod, source_epsg=source_epsg,
                     failures=parse_failures,
+                    use_cache=use_parse_cache,
                 )
                 if meshes:
                     all_meshes.extend(meshes)
@@ -300,6 +330,7 @@ def parse_citygml_directory(
                 rect_polygon, prepared_rect,
                 building_lod, source_epsg,
                 failures=parse_failures,
+                use_cache=use_parse_cache,
             )
 
     # Keep this summary after all failure-accumulating parse paths.
@@ -352,6 +383,7 @@ def parse_citygml_directory(
                                 _parse_single_file, gml_file, 'vegetation',
                                 rect_polygon, None,  # prepared_rect rebuilt in child
                                 None, tree_epsg,
+                                use_cache=use_parse_cache,
                             ): gml_file
                             for gml_file in tree_gml_files
                         }
@@ -369,6 +401,7 @@ def parse_citygml_directory(
                         meshes = _parse_single_file(
                             gml_file, 'vegetation', rect_polygon, prepared_rect,
                             building_lod=None, source_epsg=tree_epsg,
+                            use_cache=use_parse_cache,
                         )
                         if meshes:
                             tree_meshes.extend(meshes)
@@ -496,6 +529,7 @@ def _parse_flat_directory(
     source_epsg: Optional[str],
     *,
     failures: Optional[List[str]] = None,
+    use_cache: bool = True,
 ) -> None:
     """Parse a flat directory of GML files, auto-detecting feature types."""
     # Group files by detected feature type
@@ -520,6 +554,7 @@ def _parse_flat_directory(
                 gml_file, ftype, rect_polygon, prepared_rect,
                 building_lod=building_lod, source_epsg=source_epsg,
                 failures=failures,
+                use_cache=use_cache,
             )
             if meshes:
                 all_meshes.extend(meshes)

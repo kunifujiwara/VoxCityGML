@@ -224,3 +224,116 @@ def test_meta_is_stored_as_utf8_bytes_not_utf32(tmp_path):
     store_cached_meshes(src, "building", 2, [_mesh(0)])
     with np.load(_cache_path(src, "building", 2), allow_pickle=False) as data:
         assert data["meta"].dtype == np.uint8
+
+
+def test_non_ascii_attributes_round_trip_unescaped(tmp_path):
+    """PLATEAU attributes are Japanese; \\uXXXX escaping would inflate meta."""
+    src = _src(tmp_path)
+    attrs = {"usage": "業務施設", "name": "東京都庁舎"}
+    store_cached_meshes(src, "building", 2, [_mesh(0, attributes=attrs)])
+    loaded = load_cached_meshes(src, "building", 2)
+    assert loaded[0].attributes == attrs
+    with np.load(_cache_path(src, "building", 2), allow_pickle=False) as data:
+        meta_bytes = data["meta"].tobytes()
+    assert "業務施設".encode("utf-8") in meta_bytes, "meta must not be \\u-escaped"
+
+
+# ---------------------------------------------------------------------------
+# Integration with _parse_single_file
+# ---------------------------------------------------------------------------
+import voxcitygml.citygml.parser as parser_mod
+from voxcitygml.citygml.parser import _parse_single_file
+
+
+@pytest.fixture
+def fake_extractor(monkeypatch, tmp_path):
+    """Minimal real XML file + stubbed building extractor with call counter."""
+    src = tmp_path / "53393671_bldg_6697_op.gml"
+    src.write_text("<CityModel/>", encoding="utf-8")
+    calls = {"n": 0}
+
+    def fake_extract(root, ns, prefer_lod=None, max_lod=4):
+        calls["n"] += 1
+        return [_mesh(seed=prefer_lod or 0)]
+
+    monkeypatch.setattr(parser_mod, "extract_buildings_from_root", fake_extract)
+    monkeypatch.setattr(parser_mod, "detect_crs_from_root", lambda root: None)
+    return src, calls
+
+
+def test_second_parse_hits_cache(fake_extractor):
+    src, calls = fake_extractor
+    first = _parse_single_file(src, "building", None, None, building_lod=2)
+    second = _parse_single_file(src, "building", None, None, building_lod=2)
+    assert calls["n"] == 1, "extractor must not run on cache hit"
+    _assert_meshes_equal(first, second)
+
+
+def test_lod_change_reparses(fake_extractor):
+    src, calls = fake_extractor
+    _parse_single_file(src, "building", None, None, building_lod=1)
+    _parse_single_file(src, "building", None, None, building_lod=2)
+    assert calls["n"] == 2, "different building_lod must not share a cache key"
+
+
+def test_use_cache_false_bypasses(fake_extractor):
+    src, calls = fake_extractor
+    _parse_single_file(src, "building", None, None, building_lod=2,
+                       use_cache=False)
+    _parse_single_file(src, "building", None, None, building_lod=2,
+                       use_cache=False)
+    assert calls["n"] == 2
+    assert not _cache_path(src, "building", 2).exists()
+
+
+def test_corrupt_gml_still_reports_failure(fake_extractor, monkeypatch):
+    """The Task-3 (parse-failures) contract must survive the restructure."""
+    src, _ = fake_extractor
+
+    def boom(root, ns, prefer_lod=None, max_lod=4):
+        raise ValueError("broken file")
+
+    monkeypatch.setattr(parser_mod, "extract_buildings_from_root", boom)
+    failures = []
+    result = _parse_single_file(src, "building", None, None, building_lod=3,
+                                failures=failures)
+    assert result == []
+    assert len(failures) == 1 and "broken file" in failures[0]
+
+
+def test_empty_extraction_is_cached_not_reparsed(fake_extractor, monkeypatch):
+    """`[]` is a real cached value; only None means miss (cheapest tiles!)."""
+    src, calls = fake_extractor
+
+    def empty(root, ns, prefer_lod=None, max_lod=4):
+        calls["n"] += 1
+        return []
+
+    monkeypatch.setattr(parser_mod, "extract_buildings_from_root", empty)
+    assert _parse_single_file(src, "building", None, None, building_lod=2) == []
+    assert _parse_single_file(src, "building", None, None, building_lod=2) == []
+    assert calls["n"] == 1, "an empty result must be a cache hit, not a re-parse"
+
+
+def test_rectangle_filter_applied_after_cache_hit(fake_extractor):
+    """Cached meshes are unfiltered: a later, different rectangle must apply."""
+    from shapely.geometry import Polygon as _Poly
+
+    src, calls = fake_extractor
+    # A name without a leading mesh code, so the filename pre-filter (which
+    # would short-circuit before extraction) always passes.
+    plain = src.parent / "trees.gml"
+    plain.write_text("<CityModel/>", encoding="utf-8")
+
+    unfiltered = _parse_single_file(plain, "building", None, None,
+                                    building_lod=2)
+    assert len(unfiltered) == 1
+
+    # Rectangle far from the mesh (_mesh vertices are in [0, 1)).
+    far = _Poly([(10, 10), (10, 11), (11, 11), (11, 10)])
+    assert _parse_single_file(plain, "building", far, None, building_lod=2) == []
+    # Rectangle covering the mesh -> the cached mesh comes back.
+    near = _Poly([(-1, -1), (-1, 2), (2, 2), (2, -1)])
+    assert len(_parse_single_file(plain, "building", near, None,
+                                  building_lod=2)) == 1
+    assert calls["n"] == 1, "filtering must not re-parse"

@@ -221,6 +221,130 @@ def test_missing_luse_directory_still_raises(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# _cell_window rejects windows it cannot use
+# ---------------------------------------------------------------------------
+
+def test_cell_window_returns_none_for_polygon_off_the_grid():
+    """A feature that survived the bbox pre-filter but misses the rotated
+    rectangle must produce no window rather than an empty-slice loop."""
+    from voxcitygml.landcover.citygml_landcover import _cell_window
+
+    gp = compute_grid_params(
+        geodesic_rect(139.7725, 35.6481, 200.0, 150.0, 30.0), 2.0)
+    # Well to the north-east of the rectangle, but inside nothing.
+    far_lon, far_lat = 139.79, 35.66
+    assert _cell_window(gp, (far_lon, far_lat, far_lon + 1e-4,
+                             far_lat + 1e-4)) is None
+    # ...and a bbox that does overlap still yields a window.
+    lon, lat = gp.cell_centre(gp.n_rows // 2, gp.n_cols // 2)
+    assert _cell_window(gp, (lon, lat, lon, lat)) is not None
+
+
+def test_cell_window_returns_none_for_nan_bounds():
+    """shapely 2.x reports an empty geometry's bounds as four NaNs.
+
+    ``buffer(0)`` collapses a zero-area or self-intersecting ring to an
+    empty polygon, and real CityGML contains such rings.  A length-only
+    check does not catch it, and ``int(np.floor(nan))`` raises
+    ``ValueError`` -- from *outside* the per-feature try/except, so one bad
+    ring would abort the entire land-cover build.
+    """
+    from shapely.geometry import Polygon as ShapelyPolygon
+    from voxcitygml.landcover.citygml_landcover import _cell_window
+
+    gp = compute_grid_params(create_rectangle(139.7725, 35.6481, 200), 2.0)
+
+    empty = ShapelyPolygon([(0.0, 0.0)] * 4).buffer(0)
+    assert empty.is_empty
+    assert len(empty.bounds) == 4 and not np.isfinite(empty.bounds).all(), (
+        "shapely no longer reports NaN bounds for empty geometry -- this "
+        "test's premise needs rechecking")
+
+    assert _cell_window(gp, empty.bounds) is None
+
+
+def test_degenerate_ring_does_not_abort_the_build(tmp_path):
+    """One collapsing ring must not take the whole grid down with it.
+
+    The degenerate point sits at the grid *centre* on purpose: a point
+    outside the rectangle is dropped by the bbox pre-filter in
+    ``_parse_landuse_polygons_regex`` and never reaches ``_cell_window``,
+    which would make this test pass vacuously.
+    """
+    rect = create_rectangle(139.7725, 35.6481, 200)
+    gp = compute_grid_params(rect, 2.0)
+    good = _frame_quad(gp, -0.5, gp.n_rows - 0.5, -0.5, gp.n_cols - 0.5,
+                       pad=1.0)
+    centre = gp.cell_centre(gp.n_rows // 2, gp.n_cols // 2)
+    # Three identical points: a zero-area ring that buffer(0) empties.
+    degenerate = [centre, centre, centre]
+    root = _write_luse_dataset(tmp_path, [(LUSE_WATER, degenerate),
+                                          (LUSE_FOREST, good)])
+
+    grid = get_citygml_land_cover_grid(root, rect, 2.0)
+
+    assert grid.shape == gp.shape
+    assert (grid == VOX_TREE).all()
+
+
+# ---------------------------------------------------------------------------
+# Vector export path: clipped to the rectangle, not to its bounding box
+#
+# ``export_obj.export_landcover_obj`` routes to the polygon exporter for
+# exactly ``land_cover_source == 'CityGML'``, which is what the rotated
+# end-to-end test now uses.  Clipping to the bbox left the exported
+# land-cover mesh overhanging the tile at every non-zero rotation.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("rotation", [0.0, 30.0])
+def test_export_polygons_are_clipped_to_the_rotated_rectangle(tmp_path,
+                                                              rotation):
+    from shapely.geometry import Polygon as ShapelyPolygon
+    from shapely.ops import unary_union
+    from voxcitygml.landcover.citygml_landcover import (
+        get_citygml_land_cover_polygons)
+
+    rect = geodesic_rect(139.7725, 35.6481, 200.0, 150.0, rotation)
+    gp = compute_grid_params(rect, 2.0)
+    rect_poly = ShapelyPolygon(rect)
+    bbox_poly = ShapelyPolygon([
+        (gp.min_lon, gp.min_lat), (gp.min_lon, gp.max_lat),
+        (gp.max_lon, gp.max_lat), (gp.max_lon, gp.min_lat)])
+
+    # Land use covering the whole bounding box and then some, so the clip
+    # is the only thing that can bound the output.
+    over = bbox_poly.buffer(0.002)
+    root = _write_luse_dataset(
+        tmp_path, [(LUSE_FOREST, list(over.exterior.coords)[:-1])])
+
+    entries = get_citygml_land_cover_polygons(root, rect)
+    assert entries, "no polygons extracted"
+
+    covered = unary_union([p for _c, p in entries])
+    # Everything returned lies inside the rectangle (tolerance for the
+    # intersection's floating-point boundary; the bbox clip overshoots by
+    # 9 orders of magnitude more than this at 30 deg).
+    assert covered.difference(rect_poly).area < 1e-9 * rect_poly.area
+    # ...and it covers essentially all of it.
+    assert covered.area == pytest.approx(rect_poly.area, rel=1e-9)
+
+    # The discriminator. Measured on real PLATEAU luse for this rectangle:
+    #   rotation  0 -> bbox 30000.3 m2 vs rectangle 30000.0 m2 (1.000x)
+    #   rotation 30 -> bbox 57063.3 m2 vs rectangle 30000.0 m2 (1.902x)
+    # so the bbox clip returned 1.846x the rectangle's area at 30 deg.
+    ratio = bbox_poly.area / rect_poly.area
+    if rotation == 0.0:
+        # Not an exact match even here: a geodesically-built rectangle
+        # carries ~1e-4 relative skew, so its bbox is marginally larger.
+        # The containment assertion above is tight enough to catch even
+        # that, which is why the rotation-0 case is not just a smoke test.
+        assert ratio == pytest.approx(1.0, rel=1e-3)
+    else:
+        assert ratio > 1.5, ratio
+        assert covered.area < 0.75 * bbox_poly.area
+
+
+# ---------------------------------------------------------------------------
 # Real PLATEAU data, cross-checked against an independent vector reference
 # ---------------------------------------------------------------------------
 

@@ -19,10 +19,10 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Union
 
 import numpy as np
-from shapely.geometry import Polygon as ShapelyPolygon, box, Point
+from shapely.geometry import Polygon as ShapelyPolygon, Point
 from shapely.prepared import prep as shapely_prep
 
-from ..grid_utils import compute_grid_params
+from ..grid_utils import GridParams, compute_grid_params
 
 try:
     import lxml.etree as ET
@@ -204,7 +204,10 @@ def _find_luse_files(citygml_path: Union[str, List[str]]) -> List[Path]:
     return []
 
 
-def _cell_window(gp, bounds) -> Optional[Tuple[int, int, int, int]]:
+def _cell_window(
+    gp: GridParams,
+    bounds: Tuple[float, ...],
+) -> Optional[Tuple[int, int, int, int]]:
     """Candidate ``(r_start, r_end, c_start, c_end)`` for a lon/lat bbox.
 
     Maps the bbox's four corners through the affine frame and takes the
@@ -215,11 +218,17 @@ def _cell_window(gp, bounds) -> Optional[Tuple[int, int, int, int]]:
     (and therefore of those inside any polygon it bounds), for a rotated
     rectangle as well as an axis-aligned one.
 
-    Returns ``None`` when the bbox misses the grid entirely, or is empty
-    (``buffer(0)`` on a self-intersecting ring can collapse a polygon to
-    nothing, and an empty geometry has no ``bounds``).
+    Returns ``None`` when the bbox misses the grid entirely, or is not a
+    usable box.  ``buffer(0)`` on a self-intersecting or zero-area ring
+    can collapse a polygon to nothing, and on shapely 2.x an empty
+    geometry's ``bounds`` is ``(nan, nan, nan, nan)`` — four values, so a
+    length check alone does not catch it.  Left unguarded that reaches
+    ``int(np.floor(nan))`` and raises ``ValueError: cannot convert float
+    NaN to integer``, which aborts the whole land-cover build from a
+    single bad ring (the call site sits outside the per-feature
+    ``try/except``).
     """
-    if len(bounds) != 4:
+    if len(bounds) != 4 or not np.all(np.isfinite(bounds)):
         return None
     bmin_lon, bmin_lat, bmax_lon, bmax_lat = bounds
     corner_lons = np.array([bmin_lon, bmin_lon, bmax_lon, bmax_lon])
@@ -386,6 +395,11 @@ def get_citygml_land_cover_polygons(
     **raw vector geometry** (as Shapely polygons in *lon, lat* WGS 84) so
     that exporters can write true polygon meshes rather than grid quads.
 
+    Clipping is to the rectangle polygon, so the result respects rotation
+    — matching the rectangle-aligned frame that
+    ``export_obj._export_landcover_polygon_obj`` (the sole caller) draws
+    it in.
+
     Parameters
     ----------
     citygml_path : str
@@ -409,7 +423,16 @@ def get_citygml_land_cover_polygons(
     min_lon, max_lon = min(lons), max(lons)
     min_lat, max_lat = min(lats), max(lats)
 
-    clip_box = box(min_lon, min_lat, max_lon, max_lat)
+    # Clip to the rectangle **itself**, not to its bounding box.  The two
+    # coincide only for an unrotated rectangle; at 30 deg the bbox is ~1.9x
+    # the area, and the extra was exported as land-cover mesh overhanging
+    # the tile (this feeds ``export_obj._export_landcover_polygon_obj``,
+    # which is selected for exactly ``land_cover_source == 'CityGML'``).
+    # The bbox is still what the file/feature pre-filters below use: it
+    # contains the rectangle at any rotation, so it never drops a feature.
+    clip_poly = ShapelyPolygon([(v[0], v[1]) for v in rectangle_vertices])
+    if not clip_poly.is_valid:
+        clip_poly = clip_poly.buffer(0)
 
     result: List[Tuple[int, ShapelyPolygon]] = []
 
@@ -442,7 +465,7 @@ def get_citygml_land_cover_polygons(
                 continue
 
             # Clip to target rectangle
-            clipped = poly_lonlat.intersection(clip_box)
+            clipped = poly_lonlat.intersection(clip_poly)
             if clipped.is_empty:
                 continue
 

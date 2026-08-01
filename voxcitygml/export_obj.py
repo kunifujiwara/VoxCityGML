@@ -1263,7 +1263,11 @@ def _export_landcover_polygon_obj(
 
     # Coordinate transform: WGS 84 (lon, lat) → local metres → OBJ.
     # Same rectangle-aligned frame as the voxel / mesh exports, so the
-    # land-cover layer overlays them for rotated rectangles too.
+    # land-cover layer overlays them for rotated rectangles too.  The
+    # frame alone is not enough: ``get_citygml_land_cover_polygons``
+    # clips to the rectangle polygon, not to its bounding box, so the
+    # layer also has the same *extent* as the other exports (clipping to
+    # the bbox left it overhanging the tile by ~90% extra area at 30 deg).
     transformer = create_rectangle_frame_transformer(
         center_lon, center_lat, rectangle_vertices)
 

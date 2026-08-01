@@ -214,7 +214,14 @@ def transform_to_local_meters(vertices: np.ndarray,
 
 
 def create_local_transformer(center_lon: float, center_lat: float) -> Transformer:
-    """Create a reusable transformer for WGS84 → local metres."""
+    """Create a reusable transformer for WGS84 → local metres.
+
+    **Not rotation-aware.**  The axes are east/north, so a rotated target
+    rectangle is *not* axis-aligned in this frame and any bbox or row/col
+    arithmetic derived from it will be inflated and mis-oriented.  When
+    placing geometry on a target rectangle's grid, use
+    :func:`create_rectangle_frame_transformer` instead.
+    """
     proj_string = (
         f"+proj=tmerc +lat_0={center_lat} +lon_0={center_lon} "
         "+k=0.9999 +x_0=0 +y_0=0 +ellps=GRS80 +units=m +no_defs"
@@ -228,6 +235,12 @@ class _RectangleFrameTransformer:
 
     Only the forward ``transform(lons, lats)`` is provided — nothing in
     the package uses the inverse direction.
+
+    Interface note: this duck-types ``pyproj.Transformer.transform`` but
+    **always returns ndarrays**, whereas pyproj mirrors its input type
+    (list in → list out).  Every consumer feeds the result straight into
+    ``np.column_stack`` or ``min``/``max``, so the divergence is benign;
+    matching pyproj per-input-type would add complexity for no benefit.
     """
 
     __slots__ = ("_base", "_cos", "_sin")
@@ -256,12 +269,17 @@ def create_rectangle_frame_transformer(center_lon: float, center_lat: float,
     plain local transformer.
 
     **NW→NE, not SW→SE, deliberately.**  The 2-D ``GridParams`` frame is
-    anchored on NW with ``e_col`` along NW→NE and ``e_row`` along NW→SW.  A
-    geodesic quadrilateral is not a true parallelogram, so NW→NE and SW→SE
-    are not parallel — deriving θ from the other pair would make the 2-D and
-    3-D frames exact on different corners and leave a sub-cell seam between
-    the rasterized DEM / building grids and the voxel grid.  Sharing the
-    vertex pair keeps them consistent by construction.
+    anchored on NW with ``e_col`` along NW→NE and ``e_row`` along NW→SW.
+    Sharing the vertex pair makes the 2-D and 3-D frames exact on the same
+    side by construction, rather than by numerical coincidence.
+
+    Measured, the choice is second-order: a geodesic quadrilateral is very
+    nearly a parallelogram (NW→NE and SW→SE differ by ~1e-5 rad), so
+    deriving θ from SW→SE instead moves the 2-D/3-D agreement by less than
+    1e-5 cells.  Both pairs sit far below the *inherent* geodesic-vs-affine
+    residual of 0.02–0.28 cells (see ``test_frames_agree_on_rowcol``).  The
+    NW→NE choice is therefore about having one defensible rule, not about a
+    measurable error reduction — do not expect a test to distinguish them.
 
     Parameters
     ----------

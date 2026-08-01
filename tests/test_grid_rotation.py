@@ -385,10 +385,10 @@ def test_rectangle_frame_is_not_the_plain_frame_when_rotated():
 
 @pytest.mark.parametrize("rotation", [0.0, 15.0, 30.0, 45.0, 90.0, 137.0])
 def test_voxelizer_grid_tight_for_rotated_rect(rotation):
-    """3-D grid dims follow the rectangle sides, not the lon/lat bbox.
+    """3-D grid *dimensions* follow the rectangle sides, not the lon/lat bbox.
 
-    Also pins 2-D/3-D consistency: the voxel grid must have the same
-    (n_rows, n_cols) as the rasterized DEM / building / land-cover grids.
+    This pins grid **shape** only.  Frame origin/orientation agreement is a
+    separate concern, pinned by ``test_frames_agree_on_rowcol`` below.
     """
     from voxcity.geoprocessor.raster.core import compute_grid_geometry
     from voxcitygml.voxelizer3d import _compute_grid_params_3d
@@ -401,7 +401,126 @@ def test_voxelizer_grid_tight_for_rotated_rect(rotation):
     n_rows_v, n_cols_v = compute_grid_geometry(rect, 5.0)["grid_size"]
     assert abs(gp3.n_rows - n_rows_v) <= 2
     assert abs(gp3.n_cols - n_cols_v) <= 2
-    # and against the 2-D affine frame used by the rasterizers
+    # and the same shape as the 2-D affine frame used by the rasterizers
     gp2 = compute_grid_params(rect, 5.0)
     assert abs(gp3.n_rows - gp2.n_rows) <= 2
     assert abs(gp3.n_cols - gp2.n_cols) <= 2
+
+
+# ---------------------------------------------------------------------
+# 2-D / 3-D frame alignment: same origin AND same orientation
+#
+# Matching (n_rows, n_cols) is not alignment -- a whole- or half-cell
+# translational offset between the rasterized DEM / building grids and
+# the voxel grid would leave the shapes identical.  These pin the thing
+# that actually matters: a fixed geographic point lands on the same
+# (row, col) in both frames.
+# ---------------------------------------------------------------------
+
+def _rowcol_3d(gp3, transformer, lon, lat):
+    """Continuous (row, col) in the 3-D voxel frame.
+
+    Mirrors ``Grid3DParams.index_of``: cell *centres* sit at
+    ``min_x + (col + 0.5) * vs`` and ``max_y - (row + 0.5) * vs``, so the
+    continuous index carries the same -0.5 centring as the 2-D
+    ``GridParams.lonlat_to_rowcol``.
+    """
+    x, y = transformer.transform(lon, lat)
+    row = (gp3.max_y - y) / gp3.voxel_size - 0.5
+    col = (x - gp3.min_x) / gp3.voxel_size - 0.5
+    return row, col
+
+
+@pytest.mark.parametrize("rotation", [0.0, 15.0, 30.0, 45.0, 90.0, 137.0])
+@pytest.mark.parametrize("width,height,tol", [
+    (1500.0, 600.0, 0.05),
+    (900.0, 900.0, 0.05),
+    (4000.0, 4000.0, 0.30),     # residual grows with extent; still sub-cell
+])
+def test_frames_agree_on_rowcol(rotation, width, height, tol):
+    """A fixed geographic point maps to the same cell in 2-D and 3-D.
+
+    Probes the four grid corners plus interior points -- a translational or
+    rotational mismatch between the frames shows up worst at the corners,
+    which is exactly where an axis-aligned-bbox frame would diverge.
+
+    The residual that remains is inherent, not a frame error: it is the
+    cost of modelling a geodesic quadrilateral with an affine frame (2-D)
+    and a tmerc projection with k=0.9999 (3-D).  It is always well under
+    half a cell, so a point never lands in the wrong cell.
+    """
+    from voxcitygml.voxelizer3d import _compute_grid_params_3d
+    from voxcitygml.models import CityGMLMeshCollection
+
+    clon, clat = 139.77, 35.65
+    rect = _geodesic_rect(clon, clat, width, height, rotation)
+    gp2 = compute_grid_params(rect, 5.0)
+    gp3, transformer = _compute_grid_params_3d(rect, clon, clat, 5.0,
+                                               CityGMLMeshCollection())
+    assert (gp3.n_rows, gp3.n_cols) == gp2.shape
+
+    # Four corners + centre + two off-diagonal interior points.
+    rows = np.array([0, 0, gp2.n_rows - 1, gp2.n_rows - 1, gp2.n_rows // 2,
+                     gp2.n_rows // 4, 3 * gp2.n_rows // 4], dtype=float)
+    cols = np.array([0, gp2.n_cols - 1, 0, gp2.n_cols - 1, gp2.n_cols // 2,
+                     3 * gp2.n_cols // 4, gp2.n_cols // 4], dtype=float)
+
+    lon, lat = gp2.rowcol_to_lonlat(rows, cols)
+    row3, col3 = _rowcol_3d(gp3, transformer, lon, lat)
+
+    np.testing.assert_allclose(row3, rows, atol=tol)
+    np.testing.assert_allclose(col3, cols, atol=tol)
+    # Never off by half a cell => never the wrong cell.
+    assert np.max(np.abs(row3 - rows)) < 0.5
+    assert np.max(np.abs(col3 - cols)) < 0.5
+
+
+@pytest.mark.parametrize("rotation", [0.0, 30.0, 45.0, 90.0])
+def test_nw_vertex_lands_on_3d_grid_origin(rotation):
+    """The NW vertex is the (row 0, col 0) corner of the voxel grid.
+
+    i.e. it projects onto ``(min_x, max_y)``.  ``max_y`` is exact because
+    theta is derived from NW->NE (so y_NW == y_NE); ``min_x`` carries only
+    the geodesic residual between the NW and SW corners.
+    """
+    from voxcitygml.voxelizer3d import _compute_grid_params_3d
+    from voxcitygml.models import CityGMLMeshCollection
+
+    clon, clat = 139.77, 35.65
+    rect = _geodesic_rect(clon, clat, 1500.0, 600.0, rotation)
+    _sw, nw, ne, _se = rect
+    gp3, transformer = _compute_grid_params_3d(rect, clon, clat, 5.0,
+                                               CityGMLMeshCollection())
+    # Transform NW and NE together (pyproj deprecates 1-element arrays).
+    x, y = transformer.transform(np.array([nw[0], ne[0]]),
+                                 np.array([nw[1], ne[1]]))
+    # theta pins NW/NE to be exactly level.  This is the *only* assertion
+    # in the suite that distinguishes the NW->NE choice from SW->SE: the
+    # row/col agreement above is insensitive to it (measured <1e-5 cells).
+    # Production lands at ~1e-14; deriving theta from SW->SE gives ~1.4e-9.
+    assert abs(y[0] - y[1]) < 1e-11
+    assert abs(y[0] - gp3.max_y) < 1e-6                  # exact by construction
+    assert abs(x[0] - gp3.min_x) < 0.05 * gp3.voxel_size  # sub-cell
+
+
+# ---------------------------------------------------------------------
+# The 3-D frame carries its own degeneracy guard
+# ---------------------------------------------------------------------
+
+@pytest.mark.parametrize("rect", [
+    pytest.param([(139.77, 35.65)] * 4, id="zero-area"),
+    pytest.param([(139.77, 35.65), (139.77, 35.66),
+                  (139.77, 35.67), (139.77, 35.68)], id="collinear"),
+])
+def test_compute_grid_params_3d_rejects_degenerate(rect):
+    """Must not rely on the 2-D guard having run first.
+
+    Without this, theta = atan2(0, 0) = 0.0 and the caller silently gets a
+    1-cell grid instead of a ValueError.
+    """
+    from voxcitygml.voxelizer3d import _compute_grid_params_3d
+    from voxcitygml.models import CityGMLMeshCollection
+
+    with pytest.raises(ValueError, match="[Dd]egenerate"):
+        _compute_grid_params_3d(rect, 139.77, 35.65, 5.0,
+                                CityGMLMeshCollection())

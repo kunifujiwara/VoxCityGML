@@ -90,6 +90,8 @@ class VoxCityGML:
                 "land_cover_source": art.land_cover_source,
                 "canopy_height_source": art.canopy_height_source,
                 "citygml_collection": art.collection,
+                "voxel_min_z": art.voxel_min_z,
+                "mesh_vegetation_mask": art.mesh_vegetation_mask,
             },
         )
 
@@ -141,6 +143,18 @@ class PipelineArtifacts:
     canopy_top: np.ndarray
     canopy_bottom: np.ndarray
     voxel_grid: np.ndarray
+
+    # -- Facts about the 3-D grid needed to overlay revised layers onto it
+    #    later (e.g. an nDSM-refined canopy) without rebuilding it.
+    #    Defaulted so existing constructor call sites keep working.
+
+    # Elevation (m) of the bottom face of the z=0 voxel layer, i.e. the
+    # grid's vertical datum.  None when the legacy voxcity ``Voxelizer``
+    # path was used, which exposes no such datum.
+    voxel_min_z: Optional[float] = None
+    # (n_rows, n_cols) bool: columns whose TREE_CODE voxels came from
+    # CityGML vegetation meshes rather than from the canopy overlay.
+    mesh_vegetation_mask: Optional[np.ndarray] = None
 
 
 def run_core(cfg: VoxelizerConfig) -> PipelineArtifacts:
@@ -274,6 +288,7 @@ def run_core(cfg: VoxelizerConfig) -> PipelineArtifacts:
 
     # -- Voxelize -----------------------------------------------------
     print("\nVoxelising all components...")
+    vox_info: dict = {}
     if cfg.use_3d_voxelizer:
         voxel_grid = voxelize_citygml_meshes(
             collection, rectangle, center_lon, center_lat, cfg.meshsize,
@@ -287,6 +302,7 @@ def run_core(cfg: VoxelizerConfig) -> PipelineArtifacts:
             occupancy_threshold=cfg.occupancy_threshold,
             occupancy_subdivisions=cfg.occupancy_subdivisions,
             underground_depth=cfg.terrain_underground_depth,
+            info_out=vox_info,
         )
     else:
         from voxcity.generator.voxelizer import Voxelizer
@@ -304,6 +320,15 @@ def run_core(cfg: VoxelizerConfig) -> PipelineArtifacts:
             tree_grid_ori=canopy_top,
             canopy_bottom_height_grid_ori=canopy_bottom,
         )
+        # The legacy voxcity Voxelizer builds no Grid3DParams and voxelizes
+        # no vegetation meshes: no z datum, and no mesh-derived tree columns.
+
+    voxel_min_z = vox_info.get("voxel_min_z")
+    if voxel_min_z is not None:
+        voxel_min_z = float(voxel_min_z)
+    mesh_vegetation_mask = vox_info.get("mesh_vegetation_mask")
+    if mesh_vegetation_mask is None:
+        mesh_vegetation_mask = np.zeros(voxel_grid.shape[:2], dtype=bool)
 
     return PipelineArtifacts(
         collection=collection,
@@ -322,6 +347,8 @@ def run_core(cfg: VoxelizerConfig) -> PipelineArtifacts:
         canopy_top=canopy_top,
         canopy_bottom=canopy_bottom,
         voxel_grid=voxel_grid,
+        voxel_min_z=voxel_min_z,
+        mesh_vegetation_mask=mesh_vegetation_mask,
     )
 
 

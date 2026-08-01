@@ -133,6 +133,8 @@ def voxelize_citygml_meshes(
     occupancy_threshold: float = 0.0,
     occupancy_subdivisions: int = 3,
     underground_depth: float = 0.0,
+    *,
+    info_out: Optional[dict] = None,
 ) -> np.ndarray:
     """Voxelize CityGML meshes on a shared 3D grid.
 
@@ -151,6 +153,18 @@ def voxelize_citygml_meshes(
             a voxel must be at least 50 % filled by geometry.
         occupancy_subdivisions: Number of sub-divisions per axis when
             estimating the volume fraction (default 3 → 27 sub-samples).
+        info_out: Optional dict filled with facts about the voxel grid that
+            the return value cannot carry, for callers that need to overlay
+            revised layers onto the finished grid later:
+
+            ``voxel_min_z``
+                float — elevation (m) of the bottom face of the z=0 voxel
+                layer, i.e. the grid's vertical datum.
+            ``mesh_vegetation_mask``
+                (n_rows, n_cols) bool array — columns whose TREE_CODE voxels
+                came from CityGML vegetation meshes rather than from the
+                canopy-height overlay.  Captured before any canopy voxel is
+                written; see ``_apply_canopy``.
     """
     gp, transformer = _compute_grid_params_3d(
         rectangle_vertices,
@@ -231,6 +245,7 @@ def voxelize_citygml_meshes(
         _apply_land_cover(voxel_grid, gp, land_cover_grid, dem_grid, land_cover_source)
 
     # Canopy overlay
+    canopy_info: dict = {}
     if canopy_top is not None and dem_grid is not None:
         canopy_top = _resize_float_grid(canopy_top, gp.n_rows, gp.n_cols)
         canopy_bottom = _resize_float_grid(canopy_bottom, gp.n_rows, gp.n_cols) if canopy_bottom is not None else None
@@ -241,7 +256,17 @@ def voxelize_citygml_meshes(
             canopy_top,
             canopy_bottom,
             trunk_height_ratio=trunk_height_ratio,
+            mesh_tree_mask_out=canopy_info if info_out is not None else None,
         )
+
+    if info_out is not None:
+        mesh_veg_mask = canopy_info.get("mesh_tree_mask")
+        if mesh_veg_mask is None:
+            # No canopy overlay ran, so nothing has written TREE_CODE since
+            # the vegetation meshes did — this is still the mesh-only mask.
+            mesh_veg_mask = np.any(voxel_grid == TREE_CODE, axis=2)
+        info_out["voxel_min_z"] = float(gp.min_z)
+        info_out["mesh_vegetation_mask"] = mesh_veg_mask
 
     return voxel_grid
 
@@ -1401,12 +1426,31 @@ def _apply_canopy(
     canopy_top: np.ndarray,
     canopy_bottom: Optional[np.ndarray],
     trunk_height_ratio: Optional[float],
+    *,
+    mesh_tree_mask_out: Optional[dict] = None,
 ) -> None:
     if trunk_height_ratio is None:
         trunk_height_ratio = 11.76 / 19.98
 
     top_arr = canopy_top.astype(np.float64)
     has_tree = top_arr > 0
+
+    # Grid cells that already contain 3-D mesh-voxelized tree voxels
+    # (TREE_CODE).  Those cells already have the correct crown shape from
+    # CityGML vegetation meshes; overwriting with a rectangular column would
+    # destroy the spheroid/ellipsoid form, so the column fill skips them.
+    #
+    # Computed *here* — before a single canopy voxel is written, and before
+    # the "no canopy anywhere" early return below — deliberately: at this
+    # point in `voxelize_citygml_meshes` the only TREE_CODE voxels present
+    # are mesh-derived (vegetation meshes are voxelized before canopy), so
+    # this is exactly the mesh-vegetation column mask.  Recomputing it later
+    # — e.g. during a canopy re-apply onto an already-populated grid — would
+    # also pick up canopy voxels and silently invert the fill-the-gaps rule.
+    already_has_tree = np.any(voxel_grid == TREE_CODE, axis=2)
+    if mesh_tree_mask_out is not None:
+        mesh_tree_mask_out["mesh_tree_mask"] = already_has_tree.copy()
+
     if not np.any(has_tree):
         _log.info("  [canopy] No cells with canopy_top > 0 – skipping.")
         return
@@ -1422,12 +1466,6 @@ def _apply_canopy(
     ground_levels = np.rint((dem_grid - gp.min_z) / gp.voxel_size).astype(np.intp)
     z_starts = np.clip(ground_levels + np.rint(base_arr / gp.voxel_size).astype(np.intp), 0, gp.n_z)
     z_ends = np.clip(ground_levels + np.rint(top_arr / gp.voxel_size).astype(np.intp), 0, gp.n_z)
-
-    # Skip column fill for grid cells that already contain 3-D mesh-
-    # voxelized tree voxels (TREE_CODE).  Those cells already have the
-    # correct crown shape from CityGML vegetation meshes; overwriting
-    # with a rectangular column would destroy the spheroid/ellipsoid form.
-    already_has_tree = np.any(voxel_grid == TREE_CODE, axis=2)
 
     valid = has_tree & (z_ends > z_starts) & ~already_has_tree
     n_skipped_mesh = int(np.count_nonzero(has_tree & (z_ends > z_starts) & already_has_tree))

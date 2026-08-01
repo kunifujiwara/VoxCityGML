@@ -3,8 +3,14 @@ Land-cover grid acquisition.
 
 Uses ``voxcity.generator.grids.get_land_cover_grid`` to download a
 land-cover classification grid matching the target rectangle and
-resolution, then returns it in *north-up* orientation ready for
-voxelisation.
+resolution, or -- for ``land_cover_source='CityGML'`` -- rasterizes the
+dataset's own ``luse:LandUse`` features.
+
+Whatever the source, the grid is returned in the voxcity land-cover row
+order: **row-reversed** relative to the north-up DEM / building grids
+(row 0 = the southern edge for an unrotated rectangle).  Consumers
+(``voxelizer3d._apply_land_cover``, ``export_obj``) apply ``np.flipud``
+before use.
 
 The land cover grid is used to set semantic labels on the topmost
 terrain voxels (the ground surface layer) in the final VoxCity model.

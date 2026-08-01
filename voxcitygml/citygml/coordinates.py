@@ -3,6 +3,7 @@ Coordinate handling and transformations.
 """
 
 import logging
+import math
 import re
 from typing import List, Tuple, Optional, Union
 import numpy as np
@@ -213,12 +214,101 @@ def transform_to_local_meters(vertices: np.ndarray,
 
 
 def create_local_transformer(center_lon: float, center_lat: float) -> Transformer:
-    """Create a reusable transformer for WGS84 → local metres."""
+    """Create a reusable transformer for WGS84 → local metres.
+
+    **Not rotation-aware.**  The axes are east/north, so a rotated target
+    rectangle is *not* axis-aligned in this frame and any bbox or row/col
+    arithmetic derived from it will be inflated and mis-oriented.  When
+    placing geometry on a target rectangle's grid, use
+    :func:`create_rectangle_frame_transformer` instead.
+    """
     proj_string = (
         f"+proj=tmerc +lat_0={center_lat} +lon_0={center_lon} "
         "+k=0.9999 +x_0=0 +y_0=0 +ellps=GRS80 +units=m +no_defs"
     )
     return Transformer.from_crs("EPSG:4326", proj_string, always_xy=True)
+
+
+class _RectangleFrameTransformer:
+    """Wraps the local tmerc transformer with a rotation by −θ so the
+    target rectangle is axis-aligned in the working frame.
+
+    Only the forward ``transform(lons, lats)`` is provided — nothing in
+    the package uses the inverse direction.
+
+    Interface note: this duck-types ``pyproj.Transformer.transform`` but
+    **always returns ndarrays**, whereas pyproj mirrors its input type
+    (list in → list out).  Every consumer feeds the result straight into
+    ``np.column_stack`` or ``min``/``max``, so the divergence is benign;
+    matching pyproj per-input-type would add complexity for no benefit.
+    """
+
+    __slots__ = ("_base", "_cos", "_sin")
+
+    def __init__(self, base: Transformer, cos_t: float, sin_t: float):
+        self._base = base
+        self._cos = cos_t
+        self._sin = sin_t
+
+    def transform(self, lons, lats):
+        x, y = self._base.transform(lons, lats)
+        x = np.asarray(x, dtype=np.float64)
+        y = np.asarray(y, dtype=np.float64)
+        return (self._cos * x + self._sin * y,
+                -self._sin * x + self._cos * y)
+
+
+def create_rectangle_frame_transformer(center_lon: float, center_lat: float,
+                                       rectangle_vertices):
+    """Local metric transformer aligned to the rectangle's own axes.
+
+    θ is the bearing of the **NW→NE** side in the tmerc frame; the returned
+    transformer rotates by −θ, so a rotated rectangle becomes axis-aligned
+    and every downstream bbox / row-col computation is valid unchanged.  For
+    an axis-aligned rectangle θ ≈ 0 and this degenerates to (numerically) the
+    plain local transformer.
+
+    **NW→NE, not SW→SE, deliberately.**  The 2-D ``GridParams`` frame is
+    anchored on NW with ``e_col`` along NW→NE and ``e_row`` along NW→SW.
+    Sharing the vertex pair makes the 2-D and 3-D frames exact on the same
+    side by construction, rather than by numerical coincidence.
+
+    Measured, the choice is second-order — and for the rectangles this code
+    actually receives it is second-order *by construction*, not by luck.
+    ``/api/rectangle-from-dimensions`` (and the test helper mirroring it)
+    places all four corners with ``Geod.fwd`` from the same centre, at
+    offsets that are diametrically opposite in pairs: SW = −NE and SE = −NW
+    in the local offset plane.  A transverse-Mercator projection centred on
+    that same point preserves that antisymmetry, so the projected corners
+    satisfy ``SW ≈ −NE`` and ``SE ≈ −NW`` (measured residual 5e-9 m, 9e-12
+    relative).  Hence ``SE − SW = NE − NW``: the two sides are *parallel*,
+    and the two candidate θ values agree to typically ~1e-13 rad (worst
+    5e-12 measured over 4 sites × 900–4000 m × all rotations).  Deriving θ
+    from SW→SE instead moves the 2-D/3-D agreement by well under 1e-5 cells.
+
+    Do not confuse that with the ~1e-5 rad figure sometimes quoted: that is
+    a *different and much larger* quantity — the raw **ellipsoidal** initial
+    azimuth from ``Geod.inv``, evaluated independently at NW and at SW
+    (measured 2e-6 to 6e-4 rad over the same sweep).  Geodesic initial
+    azimuths on parallel chords genuinely differ by that much; the tmerc
+    bearings θ is built from do not.  It is the bound that would apply to a
+    hypothetical quadrilateral *not* built center-symmetrically.
+
+    The NW→NE choice is therefore about having one defensible rule that
+    matches the 2-D frame, not about a measurable error reduction — do not
+    expect a test to distinguish them by more than floating-point noise
+    (``test_nw_vertex_lands_on_3d_grid_origin`` does, at ~8000 ulp).
+
+    Parameters
+    ----------
+    rectangle_vertices : sequence of 4 (lon, lat[, ...]) in [SW, NW, NE, SE]
+        order — the package-wide convention (see ``create_rectangle``).
+    """
+    base = create_local_transformer(center_lon, center_lat)
+    _sw, nw, ne, _se = [tuple(v[:2]) for v in rectangle_vertices]
+    xs, ys = base.transform([nw[0], ne[0]], [nw[1], ne[1]])
+    theta = math.atan2(ys[1] - ys[0], xs[1] - xs[0])
+    return _RectangleFrameTransformer(base, math.cos(theta), math.sin(theta))
 
 
 def transform_geographic_to_local_simple(vertices: np.ndarray,

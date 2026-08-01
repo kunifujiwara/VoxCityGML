@@ -12,7 +12,7 @@ Pipeline:
     5. Integrate all components → VoxCity model
 
 Usage:
-    from voxcitygml import VoxCityGML, VoxelizerConfig
+    from voxcitygml import generate_voxcity, VoxelizerConfig
 
     config = VoxelizerConfig(
         citygml_path="path/to/plateau_dataset",
@@ -21,16 +21,39 @@ Usage:
         size_meters=500,
         meshsize=1.0,
     )
-    city = VoxCityGML(config).run()
+    city = generate_voxcity(config)
+
+    # Overlay a revised canopy onto the finished grid, in place, without
+    # rebuilding it -- so mesh-voxelized LOD2 geometry survives.  The canopy
+    # must be south-up like every grid on the assembled model; see
+    # ``reapply_canopy``.
+    from voxcitygml import reapply_canopy
+    reapply_canopy(city, refined_canopy_top, refined_canopy_bottom)
+
+Model extras:
+    Models built with ``use_3d_voxelizer=True`` carry two keys in
+    ``city.extras`` that ``reapply_canopy`` needs and that cannot be recovered
+    from a finished grid:
+
+    ``voxel_min_z``
+        float -- elevation (m) of the bottom face of the z=0 voxel layer, the
+        grid's vertical datum.  ``None`` on the legacy voxelizer path.
+    ``mesh_vegetation_mask``
+        (n_rows, n_cols) bool, south-up like ``voxels.classes`` -- columns
+        whose tree voxels came from CityGML vegetation meshes rather than from
+        the canopy overlay.
 """
 
 from .models import VoxelizerConfig
-from .pipeline import VoxCityGML
+from .pipeline import VoxCityGML, generate_voxcity
+from .reapply import reapply_canopy
 
-__version__ = "0.1.0"
+__version__ = "0.3.0"
 __author__ = "Kunihiko Fujiwara"
 
 __all__ = [
     "VoxCityGML",
     "VoxelizerConfig",
+    "generate_voxcity",
+    "reapply_canopy",
 ]

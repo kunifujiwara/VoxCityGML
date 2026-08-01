@@ -16,7 +16,11 @@ from numba import njit, prange
 from scipy.ndimage import binary_fill_holes, zoom
 
 from .models import Mesh3D, CityGMLMeshCollection
-from .citygml.coordinates import swap_coordinates_3d, create_local_transformer
+from .citygml.coordinates import (
+    swap_coordinates_3d,
+    create_rectangle_frame_transformer,
+)
+from .grid_utils import check_non_degenerate
 from .watertight import make_watertight_mesh
 from .terrain_solid import build_terrain_solid
 
@@ -129,6 +133,8 @@ def voxelize_citygml_meshes(
     occupancy_threshold: float = 0.0,
     occupancy_subdivisions: int = 3,
     underground_depth: float = 0.0,
+    *,
+    info_out: Optional[dict] = None,
 ) -> np.ndarray:
     """Voxelize CityGML meshes on a shared 3D grid.
 
@@ -147,6 +153,33 @@ def voxelize_citygml_meshes(
             a voxel must be at least 50 % filled by geometry.
         occupancy_subdivisions: Number of sub-divisions per axis when
             estimating the volume fraction (default 3 → 27 sub-samples).
+        info_out: Optional dict filled with facts about the voxel grid that
+            the return value cannot carry, for callers that need to overlay
+            revised layers onto the finished grid later:
+
+            ``voxel_min_z``
+                float — elevation (m) of the bottom face of the z=0 voxel
+                layer, i.e. the grid's vertical datum.
+            ``mesh_vegetation_mask``
+                (n_rows, n_cols) bool array — columns whose TREE_CODE voxels
+                came from CityGML vegetation meshes rather than from the
+                canopy-height overlay.  Captured before any canopy voxel is
+                written; see ``_apply_canopy``.  Row orientation matches the
+                returned voxel grid — row 0 is the **north** edge — so it
+                indexes as ``mask[r, c]`` against ``voxel_grid[r, c, :]``; do
+                not ``flipud`` it before pairing it with the voxel grid.
+                ``land_cover_grid`` is the lone south-up array in this
+                function's signature (``landcover/processor`` returns voxcity's
+                row order and ``_apply_land_cover`` flips it on the way in);
+                ``dem_grid``, the building grids and ``canopy_top`` /
+                ``canopy_bottom`` are all north-up like the voxel grid.
+
+                All of the above describes what this function **returns**.
+                ``pipeline.run()`` converts the mask along with the voxel grid
+                at assembly (``pipeline._to_south_up``), so consumers of the
+                assembled ``VoxCity`` see both of them south-up.  Both
+                statements are true at once: a reader who acts on only one of
+                them writes a mirror bug.
     """
     gp, transformer = _compute_grid_params_3d(
         rectangle_vertices,
@@ -227,7 +260,9 @@ def voxelize_citygml_meshes(
         _apply_land_cover(voxel_grid, gp, land_cover_grid, dem_grid, land_cover_source)
 
     # Canopy overlay
-    if canopy_top is not None and dem_grid is not None:
+    canopy_info: dict = {}
+    canopy_applied = canopy_top is not None and dem_grid is not None
+    if canopy_applied:
         canopy_top = _resize_float_grid(canopy_top, gp.n_rows, gp.n_cols)
         canopy_bottom = _resize_float_grid(canopy_bottom, gp.n_rows, gp.n_cols) if canopy_bottom is not None else None
         _apply_canopy(
@@ -237,7 +272,25 @@ def voxelize_citygml_meshes(
             canopy_top,
             canopy_bottom,
             trunk_height_ratio=trunk_height_ratio,
+            mesh_tree_mask_out=canopy_info,
         )
+
+    if info_out is not None:
+        if canopy_applied:
+            # `_apply_canopy` records the mask before it writes anything, on
+            # every path including its early return.  Subscript, not .get():
+            # falling back to a grid scan *here* would run it after the
+            # canopy write, marking every canopy column as mesh vegetation
+            # and silently inverting the fill-the-gaps rule for the caller.
+            # A KeyError is the honest outcome if that contract ever breaks.
+            mesh_veg_mask = canopy_info["mesh_tree_mask"]
+        else:
+            # No canopy overlay ran, so nothing has written TREE_CODE since
+            # the vegetation meshes did — a scan now is still the mesh-only
+            # mask.
+            mesh_veg_mask = np.any(voxel_grid == TREE_CODE, axis=2)
+        info_out["voxel_min_z"] = float(gp.min_z)
+        info_out["mesh_vegetation_mask"] = mesh_veg_mask
 
     return voxel_grid
 
@@ -250,7 +303,18 @@ def _compute_grid_params_3d(
     collection: CityGMLMeshCollection,
     underground_depth: float = 0.0,
 ) -> Tuple[Grid3DParams, object]:
-    transformer = create_local_transformer(center_lon, center_lat)
+    # Degenerate input would make theta = atan2(0, 0) = 0.0 and silently
+    # produce a 1-cell garbage grid.  The 2-D `compute_grid_params` applies
+    # the same guard, and today's pipeline always runs it first -- but this
+    # function is module-level and takes raw vertices, so the guard travels
+    # with it rather than relying on the current call order.
+    _sw, _nw, _ne, _se = [tuple(v[:2]) for v in rectangle_vertices]
+    check_non_degenerate(_sw, _nw, _ne)
+
+    # Rotated local frame: the rectangle is axis-aligned in this frame, so
+    # the bbox below is tight even for a rotated target rectangle.
+    transformer = create_rectangle_frame_transformer(
+        center_lon, center_lat, rectangle_vertices)
 
     rect_lon = [v[0] for v in rectangle_vertices]
     rect_lat = [v[1] for v in rectangle_vertices]
@@ -1379,6 +1443,34 @@ def _apply_land_cover(
     voxel_grid[rows, cols, ground_levels[rows, cols]] = land_cover[rows, cols]
 
 
+#: Crown base as a fraction of crown top when no canopy_bottom is supplied.
+_DEFAULT_TRUNK_HEIGHT_RATIO = 11.76 / 19.98
+
+
+def _canopy_base_heights(
+    canopy_top: np.ndarray,
+    canopy_bottom: Optional[np.ndarray],
+    trunk_height_ratio: Optional[float],
+) -> np.ndarray:
+    """Crown-base height above ground (m) for every grid cell.
+
+    The single definition of "what does the bottom of the crown end up being"
+    — including the default trunk ratio and the clamp that stops a supplied
+    base from rising above its own top.  ``_apply_canopy`` voxelizes this;
+    ``reapply_canopy`` also stores it on ``city.tree_canopy.bottom`` so the
+    2.5-D component grid describes the crowns that are actually in the voxel
+    grid.  Two callers, one rule.
+    """
+    # asarray, not astype: both branches below build a new array anyway, so
+    # there is nothing to alias and nothing to gain from an extra full copy.
+    top_arr = np.asarray(canopy_top, dtype=np.float64)
+    if canopy_bottom is not None:
+        return np.minimum(np.asarray(canopy_bottom, dtype=np.float64), top_arr)
+    if trunk_height_ratio is None:
+        trunk_height_ratio = _DEFAULT_TRUNK_HEIGHT_RATIO
+    return top_arr * trunk_height_ratio
+
+
 def _apply_canopy(
     voxel_grid: np.ndarray,
     gp: Grid3DParams,
@@ -1386,33 +1478,62 @@ def _apply_canopy(
     canopy_top: np.ndarray,
     canopy_bottom: Optional[np.ndarray],
     trunk_height_ratio: Optional[float],
+    *,
+    mesh_tree_mask: Optional[np.ndarray] = None,
+    mesh_tree_mask_out: Optional[dict] = None,
 ) -> None:
-    if trunk_height_ratio is None:
-        trunk_height_ratio = 11.76 / 19.98
+    """Write canopy columns into the AIR cells of an existing voxel grid.
 
+    Args:
+        mesh_tree_mask: (n_rows, n_cols) bool — columns whose TREE_CODE voxels
+            are mesh-derived and must be left alone.  Omit it during a fresh
+            voxelization, where scanning the grid *is* that mask (nothing has
+            written TREE_CODE yet except the vegetation meshes).  A caller
+            re-applying canopy onto an already-populated grid must pass the
+            mask captured back then: a scan would then also catch the previous
+            canopy overlay and invert the fill-the-gaps rule.
+        mesh_tree_mask_out: optional dict; receives a copy of the mask under
+            the key ``"mesh_tree_mask"`` — whichever mask was used, scanned or
+            injected — on every path, including the "no canopy anywhere" early
+            return.  ``voxelize_citygml_meshes`` re-exports it to its own
+            callers as ``mesh_vegetation_mask``.
+    """
     top_arr = canopy_top.astype(np.float64)
     has_tree = top_arr > 0
+
+    # Grid cells that already contain 3-D mesh-voxelized tree voxels
+    # (TREE_CODE).  Those cells already have the correct crown shape from
+    # CityGML vegetation meshes; overwriting with a rectangular column would
+    # destroy the spheroid/ellipsoid form, so the column fill skips them.
+    #
+    # When no mask is injected it is scanned *here* — before a single canopy
+    # voxel is written, and before the "no canopy anywhere" early return below
+    # — deliberately: at this point in `voxelize_citygml_meshes` the only
+    # TREE_CODE voxels present are mesh-derived (vegetation meshes are
+    # voxelized before canopy), so the scan is exactly the mesh-vegetation
+    # column mask.  Scanning any later — e.g. during a canopy re-apply onto an
+    # already-populated grid — would also pick up canopy voxels and silently
+    # invert the fill-the-gaps rule; that is what `mesh_tree_mask` is for.
+    #
+    # Naming: "tree" here is the voxel class (TREE_CODE); the caller
+    # re-exports this same array as ``mesh_vegetation_mask`` after the CityGML
+    # feature class it derives from.  Same array, two vocabularies.
+    already_has_tree = (np.any(voxel_grid == TREE_CODE, axis=2)
+                        if mesh_tree_mask is None else mesh_tree_mask)
+    if mesh_tree_mask_out is not None:
+        mesh_tree_mask_out["mesh_tree_mask"] = already_has_tree.copy()
+
     if not np.any(has_tree):
         _log.info("  [canopy] No cells with canopy_top > 0 – skipping.")
         return
 
     n_tree_cells = int(np.count_nonzero(has_tree))
 
-    if canopy_bottom is not None:
-        base_arr = canopy_bottom.astype(np.float64)
-        base_arr = np.minimum(base_arr, top_arr)
-    else:
-        base_arr = top_arr * trunk_height_ratio
+    base_arr = _canopy_base_heights(top_arr, canopy_bottom, trunk_height_ratio)
 
     ground_levels = np.rint((dem_grid - gp.min_z) / gp.voxel_size).astype(np.intp)
     z_starts = np.clip(ground_levels + np.rint(base_arr / gp.voxel_size).astype(np.intp), 0, gp.n_z)
     z_ends = np.clip(ground_levels + np.rint(top_arr / gp.voxel_size).astype(np.intp), 0, gp.n_z)
-
-    # Skip column fill for grid cells that already contain 3-D mesh-
-    # voxelized tree voxels (TREE_CODE).  Those cells already have the
-    # correct crown shape from CityGML vegetation meshes; overwriting
-    # with a rectangular column would destroy the spheroid/ellipsoid form.
-    already_has_tree = np.any(voxel_grid == TREE_CODE, axis=2)
 
     valid = has_tree & (z_ends > z_starts) & ~already_has_tree
     n_skipped_mesh = int(np.count_nonzero(has_tree & (z_ends > z_starts) & already_has_tree))

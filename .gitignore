@@ -7,6 +7,10 @@ output/
 cache/
 reference/
 
+# Parse cache written beside CityGML datasets (flat layouts put it inside the
+# GML directory, so it can land in repo-embedded sample data)
+.voxcitygml_cache/
+
 # Python
 __pycache__/
 *.py[cod]

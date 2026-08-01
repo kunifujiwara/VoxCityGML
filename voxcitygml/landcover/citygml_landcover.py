@@ -5,6 +5,12 @@ Parses ``luse:LandUse`` features from CityGML (PLATEAU) datasets,
 maps their class codes to the internal VoxCity 1-based land cover
 indices, and rasterizes the polygons onto a regular grid matching the
 target rectangle and resolution.
+
+Rasterisation runs in the shared affine :class:`~voxcitygml.grid_utils.GridParams`
+frame (NW origin, basis vectors along the rectangle's own sides), so the
+grid follows a **rotated** rectangle rather than the axis-aligned bounding
+box of its corners.  See :func:`get_citygml_land_cover_grid` for the row
+ordering of the returned array.
 """
 
 import logging
@@ -13,8 +19,10 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Union
 
 import numpy as np
-from shapely.geometry import Polygon as ShapelyPolygon, box, Point
+from shapely.geometry import Polygon as ShapelyPolygon, Point
 from shapely.prepared import prep as shapely_prep
+
+from ..grid_utils import GridParams, compute_grid_params
 
 try:
     import lxml.etree as ET
@@ -196,6 +204,48 @@ def _find_luse_files(citygml_path: Union[str, List[str]]) -> List[Path]:
     return []
 
 
+def _cell_window(
+    gp: GridParams,
+    bounds: Tuple[float, ...],
+) -> Optional[Tuple[int, int, int, int]]:
+    """Candidate ``(r_start, r_end, c_start, c_end)`` for a lon/lat bbox.
+
+    Maps the bbox's four corners through the affine frame and takes the
+    min/max of the resulting (row, col) pairs.  Because the frame is
+    affine, the image of the bbox is a parallelogram whose row/col extent
+    is exactly the extent of its corner images — so the returned window is
+    a guaranteed superset of the cells whose centres lie in the bbox
+    (and therefore of those inside any polygon it bounds), for a rotated
+    rectangle as well as an axis-aligned one.
+
+    Returns ``None`` when the bbox misses the grid entirely, or is not a
+    usable box.  ``buffer(0)`` on a self-intersecting or zero-area ring
+    can collapse a polygon to nothing, and on shapely 2.x an empty
+    geometry's ``bounds`` is ``(nan, nan, nan, nan)`` — four values, so a
+    length check alone does not catch it.  Left unguarded that reaches
+    ``int(np.floor(nan))`` and raises ``ValueError: cannot convert float
+    NaN to integer``, which aborts the whole land-cover build from a
+    single bad ring (the call site sits outside the per-feature
+    ``try/except``).
+    """
+    if len(bounds) != 4 or not np.all(np.isfinite(bounds)):
+        return None
+    bmin_lon, bmin_lat, bmax_lon, bmax_lat = bounds
+    corner_lons = np.array([bmin_lon, bmin_lon, bmax_lon, bmax_lon])
+    corner_lats = np.array([bmin_lat, bmax_lat, bmin_lat, bmax_lat])
+    rows, cols = gp.lonlat_to_rowcol(corner_lons, corner_lats)
+
+    # +/- 1 cell of slack absorbs floating-point noise at the boundary.
+    r_start = max(0, int(np.floor(rows.min())) - 1)
+    r_end = min(gp.n_rows, int(np.ceil(rows.max())) + 2)
+    c_start = max(0, int(np.floor(cols.min())) - 1)
+    c_end = min(gp.n_cols, int(np.ceil(cols.max())) + 2)
+
+    if r_start >= r_end or c_start >= c_end:
+        return None
+    return r_start, r_end, c_start, c_end
+
+
 def get_citygml_land_cover_grid(
     citygml_path: Union[str, List[str]],
     rectangle_vertices: List[Tuple[float, float]],
@@ -216,9 +266,20 @@ def get_citygml_land_cover_grid(
     Returns
     -------
     np.ndarray
-        2-D int32 grid of 1-based VoxCity land-cover codes.
+        2-D int32 grid of 1-based VoxCity land-cover codes, shape
+        ``(gp.n_rows, gp.n_cols)`` for ``gp = compute_grid_params(...)``.
         Values are already in the final internal format
         (no further conversion needed by ``_convert_land_cover``).
+
+        **Row order is reversed relative to the** :class:`GridParams`
+        **frame** (row 0 = the *last* grid row, i.e. the southern edge for
+        an unrotated rectangle).  That is the voxcity land-cover
+        convention: every consumer — ``voxelizer3d._apply_land_cover`` and
+        ``export_obj`` — applies ``np.flipud`` before use, exactly as it
+        does for the OpenStreetMap / ESA WorldCover grids.  Rasterisation
+        happens in the canonical north-up frame and the array is flipped
+        once, at the end, so this function stays interchangeable with the
+        other land-cover sources.
     """
     luse_files = _find_luse_files(citygml_path)
     if not luse_files:
@@ -229,30 +290,24 @@ def get_citygml_land_cover_grid(
     print(f"  Found {len(luse_files)} CityGML land use file(s)")
 
     # ── Build the target grid ────────────────────────────────────────
-    # rectangle_vertices is [(lon,lat), ...] in [SW, NW, NE, SE] order
+    # The affine frame is shared with the DEM / building / canopy
+    # rasterizers, so the land-cover grid follows the rectangle's own
+    # sides (correct under rotation) and its shape is guaranteed to match
+    # the DEM grid — no lossy nearest-neighbour resize downstream.
+    gp = compute_grid_params(rectangle_vertices, meshsize)
+    n_rows, n_cols = gp.n_rows, gp.n_cols
+
+    # The bounding box is still what the file/feature pre-filters use: it
+    # contains the rectangle under any rotation, so it never discards a
+    # feature that could contribute a cell.
     lons = [v[0] for v in rectangle_vertices]
     lats = [v[1] for v in rectangle_vertices]
     min_lon, max_lon = min(lons), max(lons)
     min_lat, max_lat = min(lats), max(lats)
 
-    # Estimate grid dimensions from metre size via simple degree approx
-    lat_mid = (min_lat + max_lat) / 2
-    deg_per_m_lat = 1.0 / 111320.0
-    deg_per_m_lon = 1.0 / (111320.0 * np.cos(np.radians(lat_mid)))
-
-    n_rows = max(1, int(round((max_lat - min_lat) / (meshsize * deg_per_m_lat))))
-    n_cols = max(1, int(round((max_lon - min_lon) / (meshsize * deg_per_m_lon))))
-
-    # Cell edges in lat/lon  (south-up: row 0 = min_lat, to match
-    # upstream voxcity convention where _apply_land_cover does flipud)
-    lat_edges = np.linspace(min_lat, max_lat, n_rows + 1)  # south-up
-    lon_edges = np.linspace(min_lon, max_lon, n_cols + 1)
-
-    # Cell centre coordinates (precomputed for rasterisation)
-    row_centres = 0.5 * (lat_edges[:-1] + lat_edges[1:])
-    col_centres = 0.5 * (lon_edges[:-1] + lon_edges[1:])
-
-    # Initialise grid with No Data (14)
+    # Initialise grid with No Data (14).  Rasterised north-up (row 0 =
+    # the NW-anchored first row of the affine frame); flipped to the
+    # voxcity land-cover row order just before returning.
     grid = np.full((n_rows, n_cols), 14, dtype=np.int32)
 
     # ── Parse and rasterize each file ────────────────────────────────
@@ -294,28 +349,20 @@ def get_citygml_land_cover_grid(
                 continue
 
             # Rasterize: find grid cells whose centres fall inside polygon
-            pmin_lon, pmin_lat, pmax_lon, pmax_lat = poly_lonlat.bounds
-
-            # Row/col range (south-up: row 0 = min_lat)
-            r_start = max(0, int(np.floor(
-                (pmin_lat - min_lat) / (meshsize * deg_per_m_lat))))
-            r_end = min(n_rows, int(np.ceil(
-                (pmax_lat - min_lat) / (meshsize * deg_per_m_lat))))
-            c_start = max(0, int(np.floor(
-                (pmin_lon - min_lon) / (meshsize * deg_per_m_lon))))
-            c_end = min(n_cols, int(np.ceil(
-                (pmax_lon - min_lon) / (meshsize * deg_per_m_lon))))
-
-            if r_start >= r_end or c_start >= c_end:
+            window = _cell_window(gp, poly_lonlat.bounds)
+            if window is None:
                 continue
+            r_start, r_end, c_start, c_end = window
 
-            sub_lats = row_centres[r_start:r_end]
-            sub_lons = col_centres[c_start:c_end]
+            rows = np.arange(r_start, r_end)
+            cols = np.arange(c_start, c_end)
+            sub_lons, sub_lats = gp.cell_centres(rows=rows, cols=cols)
 
             prep_poly = shapely_prep(poly_lonlat)
-            for ri, lat_c in enumerate(sub_lats):
-                for ci, lon_c in enumerate(sub_lons):
-                    if prep_poly.contains(Point(lon_c, lat_c)):
+            for ri in range(r_end - r_start):
+                for ci in range(c_end - c_start):
+                    if prep_poly.contains(Point(sub_lons[ri, ci],
+                                                sub_lats[ri, ci])):
                         existing = grid[r_start + ri, c_start + ci]
                         # Only overwrite if the new code has higher
                         # priority (road = lowest).
@@ -328,7 +375,10 @@ def get_citygml_land_cover_grid(
     print(f"  CityGML land use: {total_features} features parsed, "
           f"{total_rasterized} rasterized onto {n_rows}×{n_cols} grid")
 
-    return grid
+    # Flip to the voxcity land-cover row order (see the docstring): every
+    # consumer applies np.flipud, so this hands back the same orientation
+    # the OpenStreetMap / ESA WorldCover sources do.
+    return np.flipud(grid).copy()
 
 
 # -----------------------------------------------------------------------
@@ -344,6 +394,11 @@ def get_citygml_land_cover_polygons(
     Unlike :func:`get_citygml_land_cover_grid`, this function returns the
     **raw vector geometry** (as Shapely polygons in *lon, lat* WGS 84) so
     that exporters can write true polygon meshes rather than grid quads.
+
+    Clipping is to the rectangle polygon, so the result respects rotation
+    — matching the rectangle-aligned frame that
+    ``export_obj._export_landcover_polygon_obj`` (the sole caller) draws
+    it in.
 
     Parameters
     ----------
@@ -368,7 +423,16 @@ def get_citygml_land_cover_polygons(
     min_lon, max_lon = min(lons), max(lons)
     min_lat, max_lat = min(lats), max(lats)
 
-    clip_box = box(min_lon, min_lat, max_lon, max_lat)
+    # Clip to the rectangle **itself**, not to its bounding box.  The two
+    # coincide only for an unrotated rectangle; at 30 deg the bbox is ~1.9x
+    # the area, and the extra was exported as land-cover mesh overhanging
+    # the tile (this feeds ``export_obj._export_landcover_polygon_obj``,
+    # which is selected for exactly ``land_cover_source == 'CityGML'``).
+    # The bbox is still what the file/feature pre-filters below use: it
+    # contains the rectangle at any rotation, so it never drops a feature.
+    clip_poly = ShapelyPolygon([(v[0], v[1]) for v in rectangle_vertices])
+    if not clip_poly.is_valid:
+        clip_poly = clip_poly.buffer(0)
 
     result: List[Tuple[int, ShapelyPolygon]] = []
 
@@ -401,7 +465,7 @@ def get_citygml_land_cover_polygons(
                 continue
 
             # Clip to target rectangle
-            clipped = poly_lonlat.intersection(clip_box)
+            clipped = poly_lonlat.intersection(clip_poly)
             if clipped.is_empty:
                 continue
 

@@ -50,6 +50,147 @@ def _stub_pipeline(monkeypatch, tmp_path, *, use_3d=True):
     monkeypatch.setattr(pl, 'resolve_citygml_paths', lambda p: [str(tmp_path)])
 
 
+# ---------------------------------------------------------------------
+# The real producer: voxelize_citygml_meshes' info_out contract.
+# These run the actual voxelizer on a tiny synthetic collection (30x30x6,
+# ~1.5 s, no network, no dataset) rather than a stub, so a wrong value
+# written into info_out is caught rather than threaded through unexamined.
+# ---------------------------------------------------------------------
+
+_LON, _LAT, _SIZE, _MS = 139.7671, 35.6812, 60.0, 2.0
+
+
+def _vegetation_box():
+    """An ~8 m cube of vegetation near the target centre, in (lat, lon, z)."""
+    dlat = 4.0 / 111320.0
+    dlon = 4.0 / (111320.0 * np.cos(np.radians(_LAT)))
+    lat0, lat1 = _LAT - dlat, _LAT + dlat
+    lon0, lon1 = _LON - dlon, _LON + dlon
+    verts = []
+    for z in (0.0, 8.0):
+        verts += [[lat0, lon0, z], [lat0, lon1, z],
+                  [lat1, lon1, z], [lat1, lon0, z]]
+    faces = np.array([
+        [0, 1, 2], [0, 2, 3],          # bottom
+        [4, 6, 5], [4, 7, 6],          # top
+        [0, 4, 5], [0, 5, 1],
+        [1, 5, 6], [1, 6, 2],
+        [2, 6, 7], [2, 7, 3],
+        [3, 7, 4], [3, 4, 0],
+    ], dtype=np.int32)
+    return Mesh3D(vertices=np.array(verts, dtype=np.float64), faces=faces,
+                  feature_type='vegetation', feature_id='v1')
+
+
+@pytest.fixture(scope="module")
+def veg_scene():
+    """A tiny real voxelization with one vegetation mesh under full canopy."""
+    from voxcitygml.citygml.coordinates import create_rectangle
+    from voxcitygml.voxelizer3d import _compute_grid_params_3d
+
+    rect = create_rectangle(_LON, _LAT, _SIZE)
+    collection = CityGMLMeshCollection(vegetation=[_vegetation_box()])
+    gp, _ = _compute_grid_params_3d(rect, _LON, _LAT, _MS, collection)
+    return rect, collection, gp
+
+
+def test_info_out_voxel_min_z_is_the_grid_datum(veg_scene):
+    """voxel_min_z must be the grid's own min_z, not some other z bound."""
+    from voxcitygml.voxelizer3d import voxelize_citygml_meshes, _compute_grid_params_3d
+
+    rect, collection, gp = veg_scene
+    dem = np.zeros((gp.n_rows, gp.n_cols))
+    info = {}
+    voxelize_citygml_meshes(
+        collection, rect, _LON, _LAT, _MS, dem_grid=dem,
+        canopy_top=np.full((gp.n_rows, gp.n_cols), 10.0), info_out=info)
+
+    # Cross-checked against the grid params the voxelizer derives internally,
+    # not a hardcoded number, so this cannot drift as the grid sizing changes.
+    assert isinstance(info["voxel_min_z"], float)
+    assert info["voxel_min_z"] == gp.min_z
+    # Pin the distinction from the other z bounds a typo could reach for.
+    assert gp.min_z != gp.max_z
+    assert info["voxel_min_z"] != gp.max_z
+
+
+def test_info_out_mask_marks_only_mesh_vegetation_columns(veg_scene):
+    """The mask must be the mesh-vegetation columns, not the canopy ones."""
+    from voxcitygml.voxelizer3d import voxelize_citygml_meshes, TREE_CODE
+
+    rect, collection, gp = veg_scene
+    dem = np.zeros((gp.n_rows, gp.n_cols))
+    info = {}
+    grid = voxelize_citygml_meshes(
+        collection, rect, _LON, _LAT, _MS, dem_grid=dem,
+        canopy_top=np.full((gp.n_rows, gp.n_cols), 10.0), info_out=info)
+
+    mask = info["mesh_vegetation_mask"]
+    assert isinstance(mask, np.ndarray) and mask.dtype == bool
+    assert mask.shape == grid.shape[:2]
+
+    after = np.any(grid == TREE_CODE, axis=2)
+    # The canopy overlay covered the whole grid, so *many* more columns hold
+    # TREE_CODE afterwards than the vegetation mesh alone produced.  A mask
+    # computed after the canopy write would equal `after`; a strict subset is
+    # the proof it was captured before.
+    assert mask.any(), "the vegetation mesh produced no tree columns"
+    assert np.all(after[mask]), "mesh columns must still be tree columns"
+    assert mask.sum() < after.sum(), \
+        "mask must exclude canopy-only columns, not equal the post-canopy set"
+    assert not np.array_equal(mask, after)
+    assert mask is not after
+
+
+def test_info_out_mask_without_canopy_matches_the_captured_one(veg_scene):
+    """The no-canopy fallback scan must agree with the captured mask."""
+    from voxcitygml.voxelizer3d import voxelize_citygml_meshes
+
+    rect, collection, gp = veg_scene
+    dem = np.zeros((gp.n_rows, gp.n_cols))
+
+    with_canopy = {}
+    voxelize_citygml_meshes(
+        collection, rect, _LON, _LAT, _MS, dem_grid=dem,
+        canopy_top=np.full((gp.n_rows, gp.n_cols), 10.0), info_out=with_canopy)
+
+    # No canopy at all -> _apply_canopy never runs -> the fallback scan path.
+    no_canopy = {}
+    voxelize_citygml_meshes(
+        collection, rect, _LON, _LAT, _MS, dem_grid=dem,
+        canopy_top=None, info_out=no_canopy)
+
+    # All-zero canopy -> _apply_canopy runs but takes its early return.
+    zero_canopy = {}
+    voxelize_citygml_meshes(
+        collection, rect, _LON, _LAT, _MS, dem_grid=dem,
+        canopy_top=np.zeros((gp.n_rows, gp.n_cols)), info_out=zero_canopy)
+
+    ref = with_canopy["mesh_vegetation_mask"]
+    assert np.array_equal(no_canopy["mesh_vegetation_mask"], ref)
+    assert np.array_equal(zero_canopy["mesh_vegetation_mask"], ref)
+    assert no_canopy["voxel_min_z"] == with_canopy["voxel_min_z"]
+
+
+def test_voxelize_without_info_out_is_unchanged(veg_scene):
+    """info_out is additive: omitting it must not alter the returned grid."""
+    from voxcitygml.voxelizer3d import voxelize_citygml_meshes
+
+    rect, collection, gp = veg_scene
+    dem = np.zeros((gp.n_rows, gp.n_cols))
+    canopy = np.full((gp.n_rows, gp.n_cols), 10.0)
+
+    info = {}
+    with_info = voxelize_citygml_meshes(
+        collection, rect, _LON, _LAT, _MS, dem_grid=dem,
+        canopy_top=canopy, info_out=info)
+    without_info = voxelize_citygml_meshes(
+        collection, rect, _LON, _LAT, _MS, dem_grid=dem, canopy_top=canopy)
+
+    assert isinstance(without_info, np.ndarray)
+    assert np.array_equal(with_info, without_info)
+
+
 def test_apply_canopy_reports_mesh_tree_mask():
     """_apply_canopy must surface the already_has_tree array it computes."""
     from voxcitygml.voxelizer3d import _apply_canopy, Grid3DParams, TREE_CODE

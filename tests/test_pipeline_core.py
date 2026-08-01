@@ -38,8 +38,13 @@ def stub_pipeline(monkeypatch, tmp_path):
                                          np.zeros((10, 10))))
 
     def fake_voxelize(collection, rectangle, center_lon, center_lat,
-                      meshsize, **kwargs):
+                      meshsize, *, info_out=None, **kwargs):
         calls['voxelize_kwargs'] = kwargs
+        # Honour the info_out contract: run_core subscripts these keys, so a
+        # stub that omitted them would diverge from the real function.
+        if info_out is not None:
+            info_out['voxel_min_z'] = -2.0
+            info_out['mesh_vegetation_mask'] = np.zeros((10, 10), dtype=bool)
         return np.zeros((10, 10, 5), dtype=np.int16)
 
     monkeypatch.setattr(pl, 'voxelize_citygml_meshes', fake_voxelize)

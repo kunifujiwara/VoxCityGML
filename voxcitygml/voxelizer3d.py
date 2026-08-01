@@ -164,7 +164,12 @@ def voxelize_citygml_meshes(
                 (n_rows, n_cols) bool array — columns whose TREE_CODE voxels
                 came from CityGML vegetation meshes rather than from the
                 canopy-height overlay.  Captured before any canopy voxel is
-                written; see ``_apply_canopy``.
+                written; see ``_apply_canopy``.  Row orientation matches the
+                returned voxel grid — row 0 is the **north** edge — so it
+                indexes as ``mask[r, c]`` against ``voxel_grid[r, c, :]``.
+                Note this is the opposite of ``land_cover_grid`` / the other
+                2-D component grids, which are south-up; do not ``flipud``
+                it before pairing it with the voxel grid.
     """
     gp, transformer = _compute_grid_params_3d(
         rectangle_vertices,
@@ -246,7 +251,8 @@ def voxelize_citygml_meshes(
 
     # Canopy overlay
     canopy_info: dict = {}
-    if canopy_top is not None and dem_grid is not None:
+    canopy_applied = canopy_top is not None and dem_grid is not None
+    if canopy_applied:
         canopy_top = _resize_float_grid(canopy_top, gp.n_rows, gp.n_cols)
         canopy_bottom = _resize_float_grid(canopy_bottom, gp.n_rows, gp.n_cols) if canopy_bottom is not None else None
         _apply_canopy(
@@ -256,14 +262,22 @@ def voxelize_citygml_meshes(
             canopy_top,
             canopy_bottom,
             trunk_height_ratio=trunk_height_ratio,
-            mesh_tree_mask_out=canopy_info if info_out is not None else None,
+            mesh_tree_mask_out=canopy_info,
         )
 
     if info_out is not None:
-        mesh_veg_mask = canopy_info.get("mesh_tree_mask")
-        if mesh_veg_mask is None:
+        if canopy_applied:
+            # `_apply_canopy` records the mask before it writes anything, on
+            # every path including its early return.  Subscript, not .get():
+            # falling back to a grid scan *here* would run it after the
+            # canopy write, marking every canopy column as mesh vegetation
+            # and silently inverting the fill-the-gaps rule for the caller.
+            # A KeyError is the honest outcome if that contract ever breaks.
+            mesh_veg_mask = canopy_info["mesh_tree_mask"]
+        else:
             # No canopy overlay ran, so nothing has written TREE_CODE since
-            # the vegetation meshes did — this is still the mesh-only mask.
+            # the vegetation meshes did — a scan now is still the mesh-only
+            # mask.
             mesh_veg_mask = np.any(voxel_grid == TREE_CODE, axis=2)
         info_out["voxel_min_z"] = float(gp.min_z)
         info_out["mesh_vegetation_mask"] = mesh_veg_mask
@@ -1447,6 +1461,10 @@ def _apply_canopy(
     # this is exactly the mesh-vegetation column mask.  Recomputing it later
     # — e.g. during a canopy re-apply onto an already-populated grid — would
     # also pick up canopy voxels and silently invert the fill-the-gaps rule.
+    #
+    # Naming: "tree" here is the voxel class (TREE_CODE); the caller
+    # re-exports this same array as ``mesh_vegetation_mask`` after the CityGML
+    # feature class it derives from.  Same array, two vocabularies.
     already_has_tree = np.any(voxel_grid == TREE_CODE, axis=2)
     if mesh_tree_mask_out is not None:
         mesh_tree_mask_out["mesh_tree_mask"] = already_has_tree.copy()

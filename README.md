@@ -61,6 +61,40 @@ voxcitygml \
 Run `voxcitygml --help` for the full list of options including LOD selection,
 output directory, land-cover source, canopy settings, and more.
 
+## Re-applying a Revised Canopy
+
+`reapply_canopy` overlays a new canopy onto a model's **existing** voxel grid,
+in place — for example after refining canopy heights against an nDSM:
+
+```python
+from voxcitygml import generate_voxcity, reapply_canopy
+
+city = generate_voxcity(config)
+reapply_canopy(city, refined_canopy_top, refined_canopy_bottom)
+```
+
+Unlike `voxcity.generator.update.regenerate_voxels`, it does **not** rebuild
+the grid from the 2.5-D component grids, so mesh-voxelized LOD2 roof and wall
+geometry survives. Buildings, bridges, terrain and land cover are never
+touched. Columns holding CityGML vegetation keep their crown geometry; canopy
+fills the gaps around them. Either the whole update lands or none of it does.
+
+**Orientation matters and is not checkable.** `canopy_top` / `canopy_bottom`
+must be **north-up** (row 0 = north), matching `voxels.classes`,
+`dem.elevation` and `tree_canopy.top`. `land_cover.classes` is south-up — a
+canopy built in that frame must be `np.flipud`-ed first, or the result is
+mirrored north-to-south and still looks plausible.
+
+### Model extras
+
+Models built with `use_3d_voxelizer=True` (the default) carry two extra keys
+in `city.extras` that `reapply_canopy` depends on:
+
+| Key | Meaning |
+|-----|---------|
+| `voxel_min_z` | `float` — elevation (m) of the bottom face of the `z=0` voxel layer, i.e. the grid's vertical datum. `None` on the legacy `use_3d_voxelizer=False` path, which exposes no datum; `reapply_canopy` raises without it. |
+| `mesh_vegetation_mask` | `(n_rows, n_cols)` bool, north-up — columns whose tree voxels came from CityGML vegetation meshes rather than from the canopy overlay. Captured before any canopy voxel is written, so it cannot be recovered from a finished grid. |
+
 ## Examples
 
 The [`examples/`](examples/) directory contains runnable scripts demonstrating

@@ -505,12 +505,12 @@ def test_reapply_canopy_rejects_bad_input():
 
     city = _make_city(_seeded_grid())
     with pytest.raises(ValueError) as exc:
-        reapply_canopy(city, np.zeros((5, 5)))
-    assert "(5, 5)" in str(exc.value) and "(4, 4)" in str(exc.value)
-
-    with pytest.raises(ValueError) as exc:
         reapply_canopy(city, np.zeros((4, 4)), np.zeros((3, 4)))
     assert "canopy_bottom" in str(exc.value)
+    assert "(3, 4)" in str(exc.value) and "(4, 4)" in str(exc.value)
+
+    with pytest.raises(ValueError, match="2-D"):
+        reapply_canopy(city, np.zeros((4, 4, 4)))
 
     none_z = _make_city(_seeded_grid(), min_z=None)
     with pytest.raises(ValueError, match="voxel_min_z"):
@@ -649,6 +649,80 @@ def test_reapply_canopy_resamples_a_coarser_dem():
     assert not np.any(grid[:, :, 5:] == TREE_CODE)
     # The model's own DEM must not have been resized under the caller.
     assert city.dem.elevation.shape == (2, 2)
+
+
+def test_reapply_canopy_resamples_a_coarser_canopy():
+    """A canopy at component-grid resolution is resampled, not rejected.
+
+    ``voxelize_citygml_meshes`` resizes canopy_top/canopy_bottom onto the
+    voxel grid at build time; rejecting the same input here would make the
+    re-apply path stricter than the path that produced the model.  The stored
+    component grid keeps the caller's resolution, again as the build path
+    does -- ``run_core`` hands ``assemble_voxcity`` the pre-resize arrays.
+    """
+    from voxcitygml import reapply_canopy
+    from voxcitygml.voxelizer3d import TREE_CODE
+
+    grid = np.zeros((4, 4, _NZ), dtype=np.int16)
+    city = _make_city(grid)
+    # Flat, so the bilinear resample has an unambiguous answer.
+    reapply_canopy(city, np.full((2, 2), 6.0), np.zeros((2, 2)))
+
+    assert np.all(grid[:, :, 0:3] == TREE_CODE)
+    assert not np.any(grid[:, :, 3:] == TREE_CODE)
+    # Stored at the caller's resolution, matching the other component grids.
+    assert city.tree_canopy.top.shape == (2, 2)
+    assert city.tree_canopy.bottom.shape == (2, 2)
+    assert city.extras["canopy_top"].shape == (2, 2)
+
+
+def test_reapply_canopy_restores_everything_when_the_overlay_raises():
+    """An exception inside the fill must leave the model exactly as it was.
+
+    The clear and the component-grid write both happen before the fill, so
+    without a rollback a failure there leaves a canopy-stripped grid and a
+    tree_canopy describing crowns that are no longer in it.
+    """
+    import voxcitygml.reapply as rp
+    from voxcitygml import reapply_canopy
+    from voxcitygml.voxelizer3d import TREE_CODE
+
+    grid = _seeded_grid()
+    grid[2, 2, 1:6] = TREE_CODE          # canopy from a previous run
+    grid[1, 1, 6:8] = TREE_CODE          # a CityGML crown
+    mask = np.zeros((4, 4), dtype=bool)
+    mask[1, 1] = True
+    city = _make_city(grid, mask=mask,
+                      canopy_top=np.full((4, 4), 10.0),
+                      canopy_bottom=np.full((4, 4), 3.0))
+    before_grid = grid.copy()
+    before_top = city.tree_canopy.top
+    before_bottom = city.tree_canopy.bottom
+    before_top_values = before_top.copy()
+
+    real_apply = rp._apply_canopy
+
+    def partial_then_raise(voxel_grid, gp, dem, top, bottom, ratio, **kwargs):
+        # Write some canopy first, so the rollback has a partial fill to undo
+        # and not merely a clear to reverse.
+        voxel_grid[0, 3, 1:4] = TREE_CODE
+        raise RuntimeError("overlay exploded")
+
+    try:
+        rp._apply_canopy = partial_then_raise
+        with pytest.raises(RuntimeError, match="overlay exploded"):
+            reapply_canopy(city, np.full((4, 4), 4.0), np.zeros((4, 4)))
+    finally:
+        rp._apply_canopy = real_apply
+
+    assert np.array_equal(grid, before_grid), \
+        "the voxel grid was left partially updated"
+    assert city.tree_canopy.top is before_top
+    assert city.tree_canopy.bottom is before_bottom
+    assert np.allclose(city.tree_canopy.top, before_top_values)
+    assert np.allclose(city.tree_canopy.bottom, 3.0)
+    assert city.extras["canopy_top"] is before_top
+    assert city.extras["canopy_bottom"] is before_bottom
 
 
 def test_reapply_canopy_does_not_mutate_the_stored_mask():

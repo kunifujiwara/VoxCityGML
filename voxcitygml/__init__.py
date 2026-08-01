@@ -22,6 +22,24 @@ Usage:
         meshsize=1.0,
     )
     city = generate_voxcity(config)
+
+    # Overlay a revised canopy onto the finished grid, in place, without
+    # rebuilding it -- so mesh-voxelized LOD2 geometry survives.  The canopy
+    # must be north-up like ``city.voxels.classes``; see ``reapply_canopy``.
+    from voxcitygml import reapply_canopy
+    reapply_canopy(city, refined_canopy_top, refined_canopy_bottom)
+
+Model extras:
+    Models built with ``use_3d_voxelizer=True`` carry two keys in
+    ``city.extras`` that ``reapply_canopy`` needs and that cannot be recovered
+    from a finished grid:
+
+    ``voxel_min_z``
+        float -- elevation (m) of the bottom face of the z=0 voxel layer, the
+        grid's vertical datum.  ``None`` on the legacy voxelizer path.
+    ``mesh_vegetation_mask``
+        (n_rows, n_cols) bool, north-up -- columns whose tree voxels came from
+        CityGML vegetation meshes rather than from the canopy overlay.
 """
 
 from .models import VoxelizerConfig

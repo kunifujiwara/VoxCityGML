@@ -236,7 +236,14 @@ def test_apply_canopy_reports_mask_even_when_no_canopy():
 
 
 def test_extras_carry_voxel_min_z_and_mask(monkeypatch, tmp_path):
-    """run() must expose the z datum and mask so canopy can be re-applied."""
+    """run() must expose the z datum and mask, the mask in the model's frame.
+
+    ``voxel_min_z`` is a scalar and frame-independent, so it crosses the
+    assembly seam untouched.  The mask indexes ``voxels.classes`` 1:1, so it
+    must cross it the same way the voxel grid does -- north-up inside
+    ``run_core``, south-up on the assembled ``VoxCity`` (see
+    ``pipeline._to_south_up``).
+    """
     import voxcitygml.pipeline as pl
 
     _stub_pipeline(monkeypatch, tmp_path)
@@ -247,7 +254,14 @@ def test_extras_carry_voxel_min_z_and_mask(monkeypatch, tmp_path):
     mask = city.extras["mesh_vegetation_mask"]
     assert isinstance(mask, np.ndarray) and mask.dtype == bool
     assert mask.shape == city.voxels.classes.shape[:2]
-    assert mask[2, 3]
+    # ``fake_voxelize`` marks column (2, 3) of a 10-row grid in the north-up
+    # frame, so the south-up model must carry it at row 10 - 1 - 2 = 7.  The
+    # whole mask is pinned rather than that one cell: this way a conversion
+    # that skipped the flip (mark left at row 2) or applied it twice fails
+    # here, and so does one that smeared the mark across extra columns.
+    expected = np.zeros((10, 10), dtype=bool)
+    expected[7, 3] = True
+    np.testing.assert_array_equal(mask, expected)
 
 
 def test_extras_sane_without_3d_voxelizer(monkeypatch, tmp_path):

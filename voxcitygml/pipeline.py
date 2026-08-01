@@ -43,6 +43,22 @@ from .canopy.processor import get_canopy_grids
 from .voxelizer3d import voxelize_citygml_meshes
 
 
+def _to_south_up(arr):
+    """voxcitygml is north-up internally; the VoxCity contract is south-up.
+
+    ``voxcity.utils.orientation`` defines row 0 as the southern origin edge for
+    every 2-D grid and for the 3-D voxel array, and ``save_voxcity`` stamps
+    ``axes = "north,east,up"`` to declare it. Converting here -- the one point
+    where our artifacts become a voxcity object -- keeps the voxelizer, the OBJ
+    exporter and ``pipeline_export`` north-up and untouched.
+
+    ``np.flipud`` returns a non-contiguous view; the copy is deliberate,
+    because the voxel grid feeds numba and taichi paths that degrade silently
+    on non-contiguous input (see ``orientation.to_rasterio_layout``).
+    """
+    return None if arr is None else np.ascontiguousarray(np.flipud(arr))
+
+
 class VoxCityGML:
     """End-to-end CityGML → VoxCity pipeline.
 
@@ -76,14 +92,16 @@ class VoxCityGML:
             rectangle_vertices=art.rectangle,
         )
         city = pipeline.assemble_voxcity(
-            voxcity_grid=art.voxel_grid,
-            building_height_grid=art.building_height_grid,
-            building_min_height_grid=art.building_min_height_grid,
-            building_id_grid=art.building_id_grid,
+            voxcity_grid=_to_south_up(art.voxel_grid),
+            building_height_grid=_to_south_up(art.building_height_grid),
+            building_min_height_grid=_to_south_up(art.building_min_height_grid),
+            building_id_grid=_to_south_up(art.building_id_grid),
+            # Already south-up: it comes from voxcity's own downloader, and the
+            # voxelizer flipud()s it on the way in rather than storing it flipped.
             land_cover_grid=art.land_cover_grid,
-            dem_grid=art.dem_grid,
-            canopy_height_top=art.canopy_top,
-            canopy_height_bottom=art.canopy_bottom,
+            dem_grid=_to_south_up(art.dem_grid),
+            canopy_height_top=_to_south_up(art.canopy_top),
+            canopy_height_bottom=_to_south_up(art.canopy_bottom),
             extras={
                 "citygml_path": cfg.citygml_path,
                 "citygml_paths": art.citygml_paths,
@@ -91,7 +109,8 @@ class VoxCityGML:
                 "canopy_height_source": art.canopy_height_source,
                 "citygml_collection": art.collection,
                 "voxel_min_z": art.voxel_min_z,
-                "mesh_vegetation_mask": art.mesh_vegetation_mask,
+                # Pairs with voxels.classes, so it converts with it.
+                "mesh_vegetation_mask": _to_south_up(art.mesh_vegetation_mask),
             },
         )
 

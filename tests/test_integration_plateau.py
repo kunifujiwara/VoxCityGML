@@ -173,6 +173,117 @@ def test_lod2_generate_voxcity_end_to_end(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# End-to-end on a ROTATED rectangle
+#
+# The axis-aligned test above cannot see a rotation-frame bug: at theta ~ 0
+# the rectangle-frame transformer degenerates to the plain local transformer,
+# so every frame choice gives the same grid. This is the headline test for
+# rotated-rectangle support.
+# ---------------------------------------------------------------------------
+
+@requires_dataset
+@pytest.mark.slow
+def test_rotated_rectangle_end_to_end(tmp_path):
+    """A 30 deg rotated rectangle produces a valid LOD2 model with true roofs.
+
+    Uses ``_geodesic_rect`` -- the *production* construction, byte-for-byte the
+    arithmetic of the app's ``/api/rectangle-from-dimensions`` -- so the input
+    is exactly the shape the app sends. (Note the sign: the endpoint applies
+    ``-radians(rotation_deg)`` to the local-frame corner offsets, so a naive
+    ``+radians`` helper builds the mirror-image rectangle.)
+    """
+    from voxcitygml import generate_voxcity, VoxelizerConfig
+
+    from .test_grid_rotation import _geodesic_rect
+
+    # 200 m wide (NW->NE, the column axis) x 150 m tall (NW->SW, the row axis),
+    # turned 30 deg. Non-square on purpose: a row/col transpose in the rotated
+    # frame -- the exact failure the old unrotated frame produced at 90 deg --
+    # changes the shape, so the assertion below catches it.
+    rect = _geodesic_rect(139.7725, 35.6481, 200.0, 150.0, 30.0)
+    cfg = VoxelizerConfig(
+        citygml_path=DATASET,
+        rectangle_vertices=rect,
+        meshsize=2.0,
+        building_lod=2,
+        land_cover_source="OpenStreetMap",
+        canopy_height_source="Static",
+        output_dir=str(tmp_path),
+        save_output=False,
+        use_parse_cache=False,   # keep this test exercising the parser
+    )
+    city = generate_voxcity(cfg)
+    classes = city.voxels.classes
+
+    n_building = int(np.count_nonzero(classes == BUILDING_CODE))
+    slope = roof_slope_fraction(classes)
+    ground = (classes != 0).any(axis=2)
+    n_empty = int((~ground).sum())
+    print(f"\nrotated 30 deg: grid shape {classes.shape}, "
+          f"building voxels {n_building}, roof slope {slope:.3f}, "
+          f"empty columns {n_empty}")
+
+    # NOTE on what each assertion below actually catches. Reverting
+    # ``_compute_grid_params_3d`` to the unrotated ``create_local_transformer``
+    # was measured to give shape (115, 124, 37) -- caught by the shape
+    # assertion -- while roof slope (0.150) and empty columns (0) were
+    # *unaffected*. Those two are LOD2-quality and coverage guards, not
+    # frame guards. The frame guard with teeth beyond shape is the 2-D/3-D
+    # footprint IoU below.
+
+    # Grid dims follow the rectangle's own sides, not the bbox of its corners
+    # in an unrotated frame -- which at 30 deg spans 200*cos30 + 150*sin30 =
+    # 248 m by 200*sin30 + 150*cos30 = 230 m, i.e. (115, 124) cells instead of
+    # (75, 100). That is what the pre-fix code produced, and it is far outside
+    # the +-2 tolerance below.
+    assert abs(classes.shape[0] - 75) <= 2, classes.shape
+    assert abs(classes.shape[1] - 100) <= 2, classes.shape
+
+    # Measured 19,872 here vs 17,952 for the same rectangle at rotation 0 --
+    # the 10% spread is different ground being covered, not a frame error.
+    # The bound is deliberately loose: it only has to reject "the rotated
+    # frame landed the buildings outside the grid".
+    assert n_building > 1000, f"too few building voxels: {n_building}"
+
+    # The two frames agree on real geometry, not just on grid dimensions.
+    # ``buildings.heights`` is rasterized in the 2-D affine GridParams frame;
+    # the voxel grid is built in the 3-D rotated-tmerc frame. If the two
+    # disagreed in orientation the same buildings would land in different
+    # cells. Measured: IoU 0.85 (the 2-D footprint is a strict subset of the
+    # 3-D one -- 909 of 1068 cells; LOD2 mesh voxelization also catches
+    # overhangs and sloped faces the 2.5-D raster has no cell for).
+    #
+    # This is what makes the test discriminating beyond grid shape. A
+    # mis-oriented 3-D frame scores 0.04-0.12 on the same data (measured by
+    # flipping the 3-D footprint up/down, left/right, and 180 deg), so 0.6
+    # sits with 1.4x of margin below the real value and 5x above the best
+    # mis-orientation.
+    foot_2d = city.buildings.heights > 0
+    foot_3d = (classes == BUILDING_CODE).any(axis=2)
+    assert foot_2d.shape == foot_3d.shape, (foot_2d.shape, foot_3d.shape)
+    iou = float((foot_2d & foot_3d).sum()) / float((foot_2d | foot_3d).sum())
+    assert iou > 0.6, (
+        f"2-D/3-D building footprint IoU {iou:.3f} -- the rasterized grids "
+        f"and the voxel grid disagree about where the buildings are")
+
+    # True LOD2 roofs survive rotation. Measured on this exact rectangle:
+    #   rotation 30, LOD2 -> 0.145   (this test)
+    #   rotation  0, LOD2 -> 0.161   (rotation costs ~10%, not the metric)
+    #   rotation 30, LOD1 -> 0.032   (flat extrusion, as expected)
+    # so the 0.08 threshold still sits between the two with 1.8x / 2.5x of
+    # margin either side after rotation.
+    assert slope > MIN_ROOF_SLOPE_FRACTION, (
+        f"roof slope {slope:.4f} <= {MIN_ROOF_SLOPE_FRACTION} -- LOD2 geometry "
+        f"missing, or the rotated frame mis-binned the roof columns")
+
+    # Terrain reached every column. An empty vertical stripe is the signature
+    # of a 2-D/3-D frame mismatch: the DEM is rasterized in the 2-D affine
+    # frame and written into the 3-D voxel frame, so if the two disagree in
+    # orientation the DEM covers only part of the voxel grid.
+    assert ground.all(), f"{n_empty} empty columns -- frame mismatch?"
+
+
+# ---------------------------------------------------------------------------
 # Parse cache
 # ---------------------------------------------------------------------------
 

@@ -27,7 +27,7 @@ Usage:
 from .models import VoxelizerConfig
 from .pipeline import VoxCityGML, generate_voxcity
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 __author__ = "Kunihiko Fujiwara"
 
 __all__ = [

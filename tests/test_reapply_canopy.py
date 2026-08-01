@@ -1,4 +1,4 @@
-"""nDSM re-apply support: extras carry the z datum and the mesh-vegetation mask."""
+"""nDSM canopy re-apply: the extras contract and the ``reapply_canopy`` overlay."""
 import numpy as np
 import pytest
 
@@ -273,3 +273,274 @@ def test_extras_sane_without_3d_voxelizer(monkeypatch, tmp_path):
     assert art.mesh_vegetation_mask.dtype == bool
     assert art.mesh_vegetation_mask.shape == (10, 10)
     assert not art.mesh_vegetation_mask.any()
+
+
+# =====================================================================
+# reapply_canopy — overlaying a revised canopy onto an existing grid
+# =====================================================================
+#
+# Every fixture below uses voxel_size 2.0 m, min_z 0.0 and a flat DEM at
+# 0.0 m, so the z arithmetic of ``_apply_canopy`` reduces to
+# ``z = rint(height / 2)`` over the half-open interval [z_start, z_end):
+#
+#   canopy_bottom=0.0, canopy_top=6.0  ->  z 0,1,2   (z_end = 3, excluded)
+#   canopy_bottom=0.0, canopy_top=18.0 ->  z 0..8    (z_end = 9, excluded)
+#   canopy_bottom=0.0, canopy_top=4.0  ->  z 0,1     (z_end = 2, excluded)
+#
+# canopy_bottom is passed explicitly throughout so the crowns do not depend
+# on the trunk-height-ratio default.
+
+_VS, _MIN_Z, _NZ = 2.0, 0.0, 12
+
+
+def _make_city(voxel_grid, *, mask=None, min_z=_MIN_Z, meshsize=_VS,
+               dem=None, canopy_top=None, canopy_bottom=None,
+               drop_extras=()):
+    """A minimal but structurally real ``VoxCity`` around ``voxel_grid``.
+
+    Field names/types are taken from ``voxcity.models`` rather than guessed;
+    ``extras`` mirrors what ``VoxCityPipeline.assemble_voxcity`` writes
+    (including its ``canopy_top`` / ``canopy_bottom`` aliases) so the
+    component-grid bookkeeping is exercised the way the app sees it.
+    """
+    from voxcity.models import (VoxCity, VoxelGrid, BuildingGrid,
+                                LandCoverGrid, DemGrid, CanopyGrid,
+                                GridMetadata)
+
+    n_rows, n_cols = voxel_grid.shape[:2]
+    meta = GridMetadata(crs="EPSG:4326", bounds=(0.0, 0.0, 1.0, 1.0),
+                        meshsize=meshsize)
+    top = np.zeros((n_rows, n_cols)) if canopy_top is None else canopy_top
+    bottom = canopy_bottom
+    canopy = CanopyGrid(top=top, bottom=bottom, meta=meta)
+    extras = {
+        "canopy_top": canopy.top,
+        "canopy_bottom": canopy.bottom,
+        "voxel_min_z": min_z,
+        "mesh_vegetation_mask": (np.zeros((n_rows, n_cols), dtype=bool)
+                                 if mask is None else mask),
+    }
+    for key in drop_extras:
+        extras.pop(key, None)
+    return VoxCity(
+        voxels=VoxelGrid(classes=voxel_grid, meta=meta),
+        buildings=BuildingGrid(heights=np.zeros((n_rows, n_cols)),
+                               min_heights=np.empty((n_rows, n_cols),
+                                                    dtype=object),
+                               ids=np.zeros((n_rows, n_cols)), meta=meta),
+        land_cover=LandCoverGrid(classes=np.zeros((n_rows, n_cols),
+                                                  dtype=np.int32), meta=meta),
+        dem=DemGrid(elevation=(np.zeros((n_rows, n_cols)) if dem is None
+                               else dem), meta=meta),
+        tree_canopy=canopy,
+        extras=extras,
+    )
+
+
+def _seeded_grid(n_rows=4, n_cols=4, n_z=_NZ):
+    """Ground everywhere, a building column, and one land-cover voxel."""
+    from voxcitygml.voxelizer3d import GROUND_CODE, BUILDING_CODE
+
+    grid = np.zeros((n_rows, n_cols, n_z), dtype=np.int16)
+    grid[:, :, 0] = GROUND_CODE
+    grid[0, 0, 1:5] = BUILDING_CODE
+    grid[3, 3, 1] = 6            # a land-cover class code
+    return grid
+
+
+def test_reapply_canopy_adds_trees_without_touching_other_classes():
+    """Buildings, terrain and land cover must survive the overlay bit-exactly."""
+    from voxcitygml import reapply_canopy
+    from voxcitygml.voxelizer3d import GROUND_CODE, BUILDING_CODE, TREE_CODE
+
+    grid = _seeded_grid()
+    city = _make_city(grid)
+    before_ground = (grid == GROUND_CODE).copy()
+    before_building = (grid == BUILDING_CODE).copy()
+    before_lc = (grid == 6).copy()
+
+    reapply_canopy(city, np.full((4, 4), 6.0), np.zeros((4, 4)))
+
+    assert np.array_equal(grid == GROUND_CODE, before_ground)
+    assert np.array_equal(grid == BUILDING_CODE, before_building)
+    assert np.array_equal(grid == 6, before_lc)
+    assert np.any(grid == TREE_CODE), "no canopy was written at all"
+    # z 0,1,2 -- z 0 is ground, so an ordinary column keeps 1 and 2 only.
+    assert grid[2, 2, 0] == GROUND_CODE
+    assert list(grid[2, 2, 1:4]) == [TREE_CODE, TREE_CODE, 0]
+    # The building column is occupied at z 1..4: canopy is AIR-only, so it
+    # must not have displaced a single building voxel.
+    assert list(grid[0, 0, 1:5]) == [BUILDING_CODE] * 4
+    # Mutation is in place: the caller's array object is the one updated.
+    assert city.voxels.classes is grid
+
+
+def test_reapply_canopy_preserves_mesh_vegetation_columns():
+    """Masked columns keep their CityGML crown; unmasked ones get canopy."""
+    from voxcitygml import reapply_canopy
+    from voxcitygml.voxelizer3d import TREE_CODE
+
+    grid = _seeded_grid()
+    # An odd-shaped (non-contiguous, off-the-ground) mesh crown, the kind a
+    # rectangular canopy column would flatten.
+    grid[1, 1, 4] = TREE_CODE
+    grid[1, 1, 6:8] = TREE_CODE
+    mask = np.zeros((4, 4), dtype=bool)
+    mask[1, 1] = True
+
+    city = _make_city(grid, mask=mask)
+    before_masked_column = grid[1, 1, :].copy()
+
+    reapply_canopy(city, np.full((4, 4), 6.0), np.zeros((4, 4)))
+
+    assert np.array_equal(grid[1, 1, :], before_masked_column), \
+        "the mesh-vegetation column was modified"
+    # ... and the fill still happened elsewhere.
+    assert list(grid[2, 2, 1:3]) == [TREE_CODE, TREE_CODE]
+
+
+def test_reapply_canopy_clears_stale_canopy_outside_the_mask():
+    """A shorter canopy must shrink the crown, not union with the old one."""
+    from voxcitygml import reapply_canopy
+    from voxcitygml.voxelizer3d import TREE_CODE
+
+    grid = _seeded_grid()
+    city = _make_city(grid)
+
+    reapply_canopy(city, np.full((4, 4), 18.0), np.zeros((4, 4)))
+    assert grid[2, 2, 8] == TREE_CODE, "tall canopy did not reach z=8"
+
+    reapply_canopy(city, np.full((4, 4), 4.0), np.zeros((4, 4)))
+    assert list(grid[2, 2, 1:2]) == [TREE_CODE]
+    assert not np.any(grid[:, :, 2:] == TREE_CODE), \
+        "stale canopy above the new crown was not cleared"
+
+
+def test_reapply_canopy_is_idempotent_and_path_independent():
+    """The result must be a function of the canopy, not of the prior grid.
+
+    Two calls with the same canopy are compared, *and* the same canopy is
+    applied to a grid that already carries a much taller stale crown.  The
+    second half is where the teeth are: re-running an AIR-only fill over an
+    already-populated grid unions old and new canopy, so a missing clear
+    step makes the two grids differ.  (Double-applying an identical canopy
+    on its own would pass even without clearing -- the union of a set with
+    itself is that set.)
+    """
+    from voxcitygml import reapply_canopy
+    from voxcitygml.voxelizer3d import TREE_CODE
+
+    mask = np.zeros((4, 4), dtype=bool)
+    mask[1, 1] = True
+    top, bottom = np.full((4, 4), 6.0), np.zeros((4, 4))
+
+    fresh = _seeded_grid()
+    fresh[1, 1, 6:8] = TREE_CODE          # mesh crown, must be preserved
+    reapply_canopy(_make_city(fresh, mask=mask), top, bottom)
+    once = fresh.copy()
+
+    reapply_canopy(_make_city(fresh, mask=mask), top, bottom)
+    assert np.array_equal(fresh, once), "re-applying the same canopy changed it"
+
+    dirty = _seeded_grid()
+    dirty[1, 1, 6:8] = TREE_CODE
+    dirty[2, 2, 1:9] = TREE_CODE          # a tall stale canopy column
+    dirty[0, 2, 1:6] = TREE_CODE
+    reapply_canopy(_make_city(dirty, mask=mask), top, bottom)
+    assert np.array_equal(dirty, once), \
+        "the outcome depended on the canopy already in the grid"
+
+
+def test_reapply_canopy_updates_the_component_grids():
+    """The 2.5-D canopy grids must track what was written into the voxels."""
+    from voxcitygml import reapply_canopy
+
+    city = _make_city(_seeded_grid(),
+                      canopy_top=np.full((4, 4), 99.0),
+                      canopy_bottom=np.full((4, 4), 1.0))
+    top = np.full((4, 4), 6.0)
+    reapply_canopy(city, top, np.full((4, 4), 2.0))
+
+    assert np.allclose(city.tree_canopy.top, 6.0)
+    assert np.allclose(city.tree_canopy.bottom, 2.0)
+    # assemble_voxcity's extras aliases must not go stale.
+    assert np.allclose(city.extras["canopy_top"], 6.0)
+    assert np.allclose(city.extras["canopy_bottom"], 2.0)
+    # The caller's array must not be aliased into the model.
+    top[:] = 42.0
+    assert np.allclose(city.tree_canopy.top, 6.0)
+
+
+def test_reapply_canopy_derives_bottom_from_the_trunk_ratio():
+    """Omitting canopy_bottom records the crown base actually voxelized."""
+    from voxcitygml import reapply_canopy
+    from voxcitygml.voxelizer3d import TREE_CODE
+
+    city = _make_city(_seeded_grid())
+    reapply_canopy(city, np.full((4, 4), 20.0), trunk_height_ratio=0.5)
+
+    assert np.allclose(city.tree_canopy.bottom, 10.0)
+    # rint(10/2)=5 .. rint(20/2)=10, half-open -> z 5..9.
+    column = city.voxels.classes[2, 2, :]
+    assert not np.any(column[1:5] == TREE_CODE)
+    assert np.all(column[5:10] == TREE_CODE)
+    assert column[10] == 0
+
+
+def test_reapply_canopy_without_mask_warns_and_still_applies():
+    """Older models degrade to 'no vegetation to preserve', not to a crash."""
+    from voxcitygml import reapply_canopy
+    from voxcitygml.voxelizer3d import TREE_CODE
+
+    grid = _seeded_grid()
+    city = _make_city(grid, drop_extras=("mesh_vegetation_mask",))
+    with pytest.warns(UserWarning, match="mesh_vegetation_mask"):
+        reapply_canopy(city, np.full((4, 4), 6.0), np.zeros((4, 4)))
+    assert np.any(grid == TREE_CODE)
+
+
+def test_reapply_canopy_rejects_bad_input():
+    """Shape mismatch and a missing z datum must each raise ValueError."""
+    from voxcitygml import reapply_canopy
+
+    city = _make_city(_seeded_grid())
+    with pytest.raises(ValueError) as exc:
+        reapply_canopy(city, np.zeros((5, 5)))
+    assert "(5, 5)" in str(exc.value) and "(4, 4)" in str(exc.value)
+
+    with pytest.raises(ValueError) as exc:
+        reapply_canopy(city, np.zeros((4, 4)), np.zeros((3, 4)))
+    assert "canopy_bottom" in str(exc.value)
+
+    none_z = _make_city(_seeded_grid(), min_z=None)
+    with pytest.raises(ValueError, match="voxel_min_z"):
+        reapply_canopy(none_z, np.zeros((4, 4)))
+
+    missing_z = _make_city(_seeded_grid(), drop_extras=("voxel_min_z",))
+    with pytest.raises(ValueError, match="voxel_min_z"):
+        reapply_canopy(missing_z, np.zeros((4, 4)))
+
+    bad_mask = _make_city(_seeded_grid(), mask=np.zeros((2, 2), dtype=bool))
+    with pytest.raises(ValueError, match="mesh_vegetation_mask"):
+        reapply_canopy(bad_mask, np.zeros((4, 4)))
+
+
+def test_reapply_canopy_honours_the_z_datum_and_terrain():
+    """Crowns sit on the DEM, offset by the grid's own vertical datum.
+
+    Pins the two-stage rounding of ``_apply_canopy``: the DEM is the only
+    term shifted by ``min_z``; canopy heights are above ground.
+    """
+    from voxcitygml import reapply_canopy
+    from voxcitygml.voxelizer3d import TREE_CODE
+
+    grid = np.zeros((2, 2, 12), dtype=np.int16)
+    dem = np.full((2, 2), 6.0)
+    # ground_levels = rint((6 - (-4)) / 2) = 5; base 0 -> z_start 5;
+    # top 8 -> rint(4) = 4 -> z_end 9.
+    city = _make_city(grid, min_z=-4.0, dem=dem)
+    reapply_canopy(city, np.full((2, 2), 8.0), np.zeros((2, 2)))
+
+    assert not np.any(grid[0, 0, :5] == TREE_CODE)
+    assert np.all(grid[0, 0, 5:9] == TREE_CODE)
+    assert grid[0, 0, 9] == 0

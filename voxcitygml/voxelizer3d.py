@@ -1433,6 +1433,34 @@ def _apply_land_cover(
     voxel_grid[rows, cols, ground_levels[rows, cols]] = land_cover[rows, cols]
 
 
+#: Crown base as a fraction of crown top when no canopy_bottom is supplied.
+_DEFAULT_TRUNK_HEIGHT_RATIO = 11.76 / 19.98
+
+
+def _canopy_base_heights(
+    canopy_top: np.ndarray,
+    canopy_bottom: Optional[np.ndarray],
+    trunk_height_ratio: Optional[float],
+) -> np.ndarray:
+    """Crown-base height above ground (m) for every grid cell.
+
+    The single definition of "what does the bottom of the crown end up being"
+    — including the default trunk ratio and the clamp that stops a supplied
+    base from rising above its own top.  ``_apply_canopy`` voxelizes this;
+    ``reapply_canopy`` also stores it on ``city.tree_canopy.bottom`` so the
+    2.5-D component grid describes the crowns that are actually in the voxel
+    grid.  Two callers, one rule.
+    """
+    # asarray, not astype: both branches below build a new array anyway, so
+    # there is nothing to alias and nothing to gain from an extra full copy.
+    top_arr = np.asarray(canopy_top, dtype=np.float64)
+    if canopy_bottom is not None:
+        return np.minimum(np.asarray(canopy_bottom, dtype=np.float64), top_arr)
+    if trunk_height_ratio is None:
+        trunk_height_ratio = _DEFAULT_TRUNK_HEIGHT_RATIO
+    return top_arr * trunk_height_ratio
+
+
 def _apply_canopy(
     voxel_grid: np.ndarray,
     gp: Grid3DParams,
@@ -1441,11 +1469,20 @@ def _apply_canopy(
     canopy_bottom: Optional[np.ndarray],
     trunk_height_ratio: Optional[float],
     *,
+    mesh_tree_mask: Optional[np.ndarray] = None,
     mesh_tree_mask_out: Optional[dict] = None,
 ) -> None:
-    if trunk_height_ratio is None:
-        trunk_height_ratio = 11.76 / 19.98
+    """Write canopy columns into the AIR cells of an existing voxel grid.
 
+    Args:
+        mesh_tree_mask: (n_rows, n_cols) bool — columns whose TREE_CODE voxels
+            are mesh-derived and must be left alone.  Omit it during a fresh
+            voxelization, where scanning the grid *is* that mask (nothing has
+            written TREE_CODE yet except the vegetation meshes).  A caller
+            re-applying canopy onto an already-populated grid must pass the
+            mask captured back then: a scan would then also catch the previous
+            canopy overlay and invert the fill-the-gaps rule.
+    """
     top_arr = canopy_top.astype(np.float64)
     has_tree = top_arr > 0
 
@@ -1454,7 +1491,7 @@ def _apply_canopy(
     # CityGML vegetation meshes; overwriting with a rectangular column would
     # destroy the spheroid/ellipsoid form, so the column fill skips them.
     #
-    # Computed *here* — before a single canopy voxel is written, and before
+    # Scanned *here* — before a single canopy voxel is written, and before
     # the "no canopy anywhere" early return below — deliberately: at this
     # point in `voxelize_citygml_meshes` the only TREE_CODE voxels present
     # are mesh-derived (vegetation meshes are voxelized before canopy), so
@@ -1465,7 +1502,8 @@ def _apply_canopy(
     # Naming: "tree" here is the voxel class (TREE_CODE); the caller
     # re-exports this same array as ``mesh_vegetation_mask`` after the CityGML
     # feature class it derives from.  Same array, two vocabularies.
-    already_has_tree = np.any(voxel_grid == TREE_CODE, axis=2)
+    already_has_tree = (np.any(voxel_grid == TREE_CODE, axis=2)
+                        if mesh_tree_mask is None else mesh_tree_mask)
     if mesh_tree_mask_out is not None:
         mesh_tree_mask_out["mesh_tree_mask"] = already_has_tree.copy()
 
@@ -1475,11 +1513,7 @@ def _apply_canopy(
 
     n_tree_cells = int(np.count_nonzero(has_tree))
 
-    if canopy_bottom is not None:
-        base_arr = canopy_bottom.astype(np.float64)
-        base_arr = np.minimum(base_arr, top_arr)
-    else:
-        base_arr = top_arr * trunk_height_ratio
+    base_arr = _canopy_base_heights(top_arr, canopy_bottom, trunk_height_ratio)
 
     ground_levels = np.rint((dem_grid - gp.min_z) / gp.voxel_size).astype(np.intp)
     z_starts = np.clip(ground_levels + np.rint(base_arr / gp.voxel_size).astype(np.intp), 0, gp.n_z)

@@ -7,9 +7,12 @@ somewhere other than the default path below -- any PLATEAU dataset
 directory (the one containing ``udx/``) whose coverage includes the
 target rectangle will do.
 
-The end-to-end test is marked ``slow`` and takes roughly 35-125 s, since
-it parses the intersecting CityGML tiles and voxelizes them. It runs by
-default because it is the proof the whole chain works; skip it explicitly
+The dataset-backed tests are marked ``slow`` because they parse the
+intersecting CityGML tiles and voxelize them. The axis-aligned end-to-end
+run takes roughly 35-125 s, most of it waiting on live OpenStreetMap land
+cover; the rotated run (CityGML land cover, fully offline) and the
+parse-cache round trip take a few seconds each. They run by default
+because they are the proof the whole chain works; skip them explicitly
 with ``pytest -m "not slow"``.
 """
 import json
@@ -186,7 +189,7 @@ def test_lod2_generate_voxcity_end_to_end(tmp_path):
 def test_rotated_rectangle_end_to_end(tmp_path):
     """A 30 deg rotated rectangle produces a valid LOD2 model with true roofs.
 
-    Uses ``_geodesic_rect`` -- the *production* construction, byte-for-byte the
+    Uses ``geodesic_rect`` -- the *production* construction, byte-for-byte the
     arithmetic of the app's ``/api/rectangle-from-dimensions`` -- so the input
     is exactly the shape the app sends. (Note the sign: the endpoint applies
     ``-radians(rotation_deg)`` to the local-frame corner offsets, so a naive
@@ -194,19 +197,26 @@ def test_rotated_rectangle_end_to_end(tmp_path):
     """
     from voxcitygml import generate_voxcity, VoxelizerConfig
 
-    from .test_grid_rotation import _geodesic_rect
+    from .geo_helpers import geodesic_rect
 
     # 200 m wide (NW->NE, the column axis) x 150 m tall (NW->SW, the row axis),
     # turned 30 deg. Non-square on purpose: a row/col transpose in the rotated
     # frame -- the exact failure the old unrotated frame produced at 90 deg --
     # changes the shape, so the assertion below catches it.
-    rect = _geodesic_rect(139.7725, 35.6481, 200.0, 150.0, 30.0)
+    rect = geodesic_rect(139.7725, 35.6481, 200.0, 150.0, 30.0)
     cfg = VoxelizerConfig(
         citygml_path=DATASET,
         rectangle_vertices=rect,
         meshsize=2.0,
         building_lod=2,
-        land_cover_source="OpenStreetMap",
+        # Every assertion below is about geometry, and CityGML land cover is
+        # parsed from the dataset itself: fully offline and deterministic,
+        # unlike live Overpass (which rate-limits after a few consecutive
+        # fetches and then stalls indefinitely rather than erroring). It also
+        # makes this an end-to-end exercise of the CityGML land-cover
+        # rasteriser on a rotated rectangle. Switching the source moved none
+        # of the numbers below.
+        land_cover_source="CityGML",
         canopy_height_source="Static",
         output_dir=str(tmp_path),
         save_output=False,

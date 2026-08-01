@@ -79,11 +79,16 @@ geometry survives. Buildings, bridges, terrain and land cover are never
 touched. Columns holding CityGML vegetation keep their crown geometry; canopy
 fills the gaps around them. Either the whole update lands or none of it does.
 
-**Orientation matters and is not checkable.** `canopy_top` / `canopy_bottom`
-must be **north-up** (row 0 = north), matching `voxels.classes`,
-`dem.elevation` and `tree_canopy.top`. `land_cover.classes` is south-up — a
-canopy built in that frame must be `np.flipud`-ed first, or the result is
-mirrored north-to-south and still looks plausible.
+**Orientation matters and is not checkable.** Every grid on an assembled
+`VoxCity` is **south-up** (row 0 = the southern edge): `voxels.classes`,
+`dem.elevation`, `tree_canopy.top`, `land_cover.classes` and
+`extras['mesh_vegetation_mask']` alike. voxcitygml works north-up internally,
+but converts at the assembly seam so the model it hands back honours the axis
+contract `voxcity.utils.orientation` declares. `canopy_top` / `canopy_bottom`
+must be in that same frame — and a canopy built from or indexed against any of
+those grids, land cover included, already is. **Callers need no flip.** Nothing
+validates this, and a canopy passed north-up yields a north-to-south mirrored
+result that still looks plausible.
 
 ### Model extras
 
@@ -93,7 +98,7 @@ in `city.extras` that `reapply_canopy` depends on:
 | Key | Meaning |
 |-----|---------|
 | `voxel_min_z` | `float` — elevation (m) of the bottom face of the `z=0` voxel layer, i.e. the grid's vertical datum. `None` on the legacy `use_3d_voxelizer=False` path, which exposes no datum; `reapply_canopy` raises without it. |
-| `mesh_vegetation_mask` | `(n_rows, n_cols)` bool, north-up — columns whose tree voxels came from CityGML vegetation meshes rather than from the canopy overlay. Captured before any canopy voxel is written, so it cannot be recovered from a finished grid. |
+| `mesh_vegetation_mask` | `(n_rows, n_cols)` bool, south-up like the rest of the assembled model — columns whose tree voxels came from CityGML vegetation meshes rather than from the canopy overlay. Captured before any canopy voxel is written, so it cannot be recovered from a finished grid. |
 
 ## Examples
 

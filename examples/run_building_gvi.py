@@ -132,11 +132,13 @@ def compute_building_gvi(city, **kwargs):
         building_code=defaults.get("building_class_id", -3),
     )
 
-    # WORKAROUND for voxcity.geoprocessor.mesh:
-    # create_voxel_mesh internally uses ensure_orientation on building_id_grid
-    # which flips the grid vertically, mismatching the unflipped 3D array index.
+    # The flipud here used to cancel an ensure_orientation() call inside
+    # voxcity's create_voxel_mesh. voxcity >= 1.3.2 indexes building_id_grid
+    # directly against the 3-D array (geoprocessor/mesh.py: `np.asarray`, no
+    # reorientation), so pre-flipping would now mirror the GVI results
+    # north-to-south -- plausibly, and without any error.
     original_ids = np.copy(city.buildings.ids)
-    city.buildings.ids = np.flipud(filled_ids)
+    city.buildings.ids = filled_ids
     try:
         mesh = get_surface_view_factor(city, mode='green', **defaults)
     finally:

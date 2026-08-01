@@ -37,7 +37,12 @@ dependencies = [
     "seaborn",
     "contextily",
     "tqdm",
-    "voxcity",
+    # The assembly seam (pipeline._to_south_up) asserts voxcity's declared axis
+    # contract: row 0 = the southern origin edge. voxcity reversed that
+    # declaration below 1.3.2 -- 1.1.8's utils/orientation.py states north_up is
+    # canonical, and its geoprocessor/mesh.py flips building_id_grid where 1.3.2
+    # does not. Building against those versions silently mirrors the model.
+    "voxcity>=1.3.2",
 ]
 
 [project.optional-dependencies]

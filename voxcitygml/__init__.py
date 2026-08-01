@@ -25,7 +25,8 @@ Usage:
 
     # Overlay a revised canopy onto the finished grid, in place, without
     # rebuilding it -- so mesh-voxelized LOD2 geometry survives.  The canopy
-    # must be north-up like ``city.voxels.classes``; see ``reapply_canopy``.
+    # must be south-up like every grid on the assembled model; see
+    # ``reapply_canopy``.
     from voxcitygml import reapply_canopy
     reapply_canopy(city, refined_canopy_top, refined_canopy_bottom)
 
@@ -38,8 +39,9 @@ Model extras:
         float -- elevation (m) of the bottom face of the z=0 voxel layer, the
         grid's vertical datum.  ``None`` on the legacy voxelizer path.
     ``mesh_vegetation_mask``
-        (n_rows, n_cols) bool, north-up -- columns whose tree voxels came from
-        CityGML vegetation meshes rather than from the canopy overlay.
+        (n_rows, n_cols) bool, south-up like ``voxels.classes`` -- columns
+        whose tree voxels came from CityGML vegetation meshes rather than from
+        the canopy overlay.
 """
 
 from .models import VoxelizerConfig

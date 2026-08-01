@@ -173,7 +173,10 @@ class PipelineArtifacts:
     voxel_min_z: Optional[float] = None
     # (n_rows, n_cols) bool, north-up like ``voxel_grid``: columns whose
     # TREE_CODE voxels came from CityGML vegetation meshes rather than from
-    # the canopy overlay.  ``Optional`` only because a dataclass field
+    # the canopy overlay.  North-up because these are ``run_core``'s raw
+    # artifacts; ``VoxCityGML.run()`` sends both through ``_to_south_up``, so
+    # the same mask reaches ``extras['mesh_vegetation_mask']`` south-up.
+    # ``Optional`` only because a dataclass field
     # following a defaulted one must itself have a default -- ``run_core``
     # always populates this with a real array (all-False on the legacy path),
     # so consumers of run_core's artifacts need no None branch.

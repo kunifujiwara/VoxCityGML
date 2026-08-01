@@ -166,10 +166,20 @@ def voxelize_citygml_meshes(
                 canopy-height overlay.  Captured before any canopy voxel is
                 written; see ``_apply_canopy``.  Row orientation matches the
                 returned voxel grid — row 0 is the **north** edge — so it
-                indexes as ``mask[r, c]`` against ``voxel_grid[r, c, :]``.
-                Note this is the opposite of ``land_cover_grid`` / the other
-                2-D component grids, which are south-up; do not ``flipud``
-                it before pairing it with the voxel grid.
+                indexes as ``mask[r, c]`` against ``voxel_grid[r, c, :]``; do
+                not ``flipud`` it before pairing it with the voxel grid.
+                ``land_cover_grid`` is the lone south-up array in this
+                function's signature (``landcover/processor`` returns voxcity's
+                row order and ``_apply_land_cover`` flips it on the way in);
+                ``dem_grid``, the building grids and ``canopy_top`` /
+                ``canopy_bottom`` are all north-up like the voxel grid.
+
+                All of the above describes what this function **returns**.
+                ``pipeline.run()`` converts the mask along with the voxel grid
+                at assembly (``pipeline._to_south_up``), so consumers of the
+                assembled ``VoxCity`` see both of them south-up.  Both
+                statements are true at once: a reader who acts on only one of
+                them writes a mirror bug.
     """
     gp, transformer = _compute_grid_params_3d(
         rectangle_vertices,

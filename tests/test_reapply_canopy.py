@@ -309,7 +309,7 @@ _VS, _MIN_Z, _NZ = 2.0, 0.0, 12
 
 def _make_city(voxel_grid, *, mask=None, min_z=_MIN_Z, meshsize=_VS,
                dem=None, canopy_top=None, canopy_bottom=None,
-               drop_extras=()):
+               land_cover=None, drop_extras=()):
     """A minimal but structurally real ``VoxCity`` around ``voxel_grid``.
 
     Field names/types are taken from ``voxcity.models`` rather than guessed;
@@ -342,8 +342,9 @@ def _make_city(voxel_grid, *, mask=None, min_z=_MIN_Z, meshsize=_VS,
                                min_heights=np.empty((n_rows, n_cols),
                                                     dtype=object),
                                ids=np.zeros((n_rows, n_cols)), meta=meta),
-        land_cover=LandCoverGrid(classes=np.zeros((n_rows, n_cols),
-                                                  dtype=np.int32), meta=meta),
+        land_cover=LandCoverGrid(
+            classes=(np.zeros((n_rows, n_cols), dtype=np.int32)
+                     if land_cover is None else land_cover), meta=meta),
         dem=DemGrid(elevation=(np.zeros((n_rows, n_cols)) if dem is None
                                else dem), meta=meta),
         tree_canopy=canopy,
@@ -737,6 +738,64 @@ def test_reapply_canopy_restores_everything_when_the_overlay_raises():
     assert np.allclose(city.tree_canopy.bottom, 3.0)
     assert city.extras["canopy_top"] is before_top
     assert city.extras["canopy_bottom"] is before_bottom
+
+
+def test_reapply_canopy_needs_no_flip_from_the_land_cover_frame():
+    """A canopy derived from ``land_cover.classes`` is passed through as-is.
+
+    This is the contract the *Frames* section of ``reapply_canopy`` states,
+    and it is the one that was inverted before the assembly seam converted to
+    south-up: the old docstring told callers to ``np.flipud`` a canopy built
+    in the land-cover frame, which on today's models mirrors it north-south.
+    Every grid on an assembled ``VoxCity`` now shares one frame, so the
+    round trip land cover -> canopy -> TREE voxels must land on the *same*
+    cells with no flip anywhere.
+
+    ``reapply_canopy``'s arithmetic is frame-agnostic -- it only requires its
+    arrays to agree -- so what this pins is that neither it nor anything it
+    calls sneaks a flip in on the caller's behalf.
+    """
+    from voxcitygml import reapply_canopy
+    from voxcitygml.voxelizer3d import TREE_CODE, GROUND_CODE
+
+    tree_class = 4                      # any land-cover class index
+    n_rows, n_cols, band = 9, 4, 3      # rows 0..2 = the southern third
+
+    lc = np.zeros((n_rows, n_cols), dtype=np.int32)
+    lc[:band, :] = tree_class
+    lc_tree = lc == tree_class
+
+    # The fixture must be asymmetric, or the assertions below are vacuous: a
+    # centred band is flip-invariant, which is exactly how the original
+    # mirroring survived four reviews and a live A/B.
+    assert lc_tree.any(), "no tree cells; the test would compare two empty sets"
+    assert not (lc_tree & np.flipud(lc_tree)).any(), \
+        "the land-cover band overlaps its own mirror; a flip would be undetectable"
+
+    grid = np.zeros((n_rows, n_cols, _NZ), dtype=np.int16)
+    grid[:, :, 0] = GROUND_CODE
+    city = _make_city(grid, land_cover=lc)
+
+    # Derived straight from the model's own land cover -- no flipud.
+    canopy_top = np.where(lc_tree, 6.0, 0.0)
+    reapply_canopy(city, canopy_top, np.zeros((n_rows, n_cols)))
+
+    vox_tree = np.any(city.voxels.classes == TREE_CODE, axis=2)
+    assert vox_tree.any(), "no canopy was written; the IoUs below are vacuous"
+
+    direct = _iou(lc_tree, vox_tree)
+    flipped = _iou(np.flipud(lc_tree), vox_tree)
+    assert direct > flipped, (
+        f"the canopy landed mirrored: direct IoU {direct:.4f} <= flipud "
+        f"{flipped:.4f}; a caller-side flip is being applied somewhere")
+    assert direct > 0.5, \
+        f"weak alignment ({direct:.4f}); the canopy did not follow land cover"
+
+
+def _iou(a, b):
+    a, b = np.asarray(a, bool), np.asarray(b, bool)
+    union = (a | b).sum()
+    return float((a & b).sum() / union) if union else float("nan")
 
 
 def test_reapply_canopy_does_not_mutate_the_stored_mask():

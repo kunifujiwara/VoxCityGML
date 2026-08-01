@@ -46,16 +46,23 @@ def reapply_canopy(
     ships vegetation geometry for very few areas, so that mask is usually
     all-``False`` and every column is canopy's to write.
 
-    **Frames.**  ``canopy_top`` / ``canopy_bottom`` must be **north-up**: row 0
-    is the north edge, matching ``city.voxels.classes``, ``city.dem.elevation``,
-    ``city.tree_canopy.top`` and ``extras['mesh_vegetation_mask']``.
-    ``city.land_cover.classes`` is the odd one out — it is south-up, and the
-    voxelizer ``np.flipud``\\ s it before use (``_apply_land_cover``), as does
-    ``canopy/processor.py`` for downloaded canopy rasters.  A canopy built in
-    the land-cover frame, or indexed against it, must therefore be flipped
-    before it is passed here.  **Nothing checks this** — orientation is not
-    recoverable from an array — and a south-up canopy yields a north-south
-    mirrored result that looks entirely plausible.
+    **Frames.**  Every grid on an *assembled* ``VoxCity`` is **south-up**: row
+    0 is the southern edge.  That is true of ``city.voxels.classes``,
+    ``city.dem.elevation``, ``city.tree_canopy.top``,
+    ``city.land_cover.classes`` and ``extras['mesh_vegetation_mask']`` alike —
+    voxcitygml works north-up internally, but ``pipeline._to_south_up``
+    converts at the assembly seam, so the model handed to this function
+    already honours the axis contract ``voxcity.utils.orientation`` declares.
+    ``canopy_top`` / ``canopy_bottom`` must be in that same frame, and a
+    canopy built from or indexed against any of those grids — land cover very
+    much included — already is: callers need **no** flip.  **Nothing checks
+    this** — orientation is not recoverable from an array — and a canopy
+    passed north-up yields a north-south mirrored result that looks entirely
+    plausible.
+
+    (The overlay arithmetic itself is frame-agnostic: it requires only that
+    the voxel grid, the DEM, the mask and the canopy agree.  The frame is a
+    contract about *which* agreement, and only the caller can honour it.)
 
     **Atomicity.**  Either the whole update lands or none of it does: if the
     overlay raises, the cleared canopy voxels and the previous component grids
@@ -73,7 +80,7 @@ def reapply_canopy(
             ``use_3d_voxelizer=True``.  ``city.voxels.classes``,
             ``city.tree_canopy`` and the ``canopy_top`` / ``canopy_bottom``
             aliases in ``city.extras`` are all updated in place.
-        canopy_top: 2-D crown-top height **above ground** (m), north-up like
+        canopy_top: 2-D crown-top height **above ground** (m), south-up like
             ``city.voxels.classes`` (see *Frames*).  Cells ``<= 0`` get no
             canopy.  Resampled onto the voxel grid if it is a different shape.
         canopy_bottom: matching crown-base heights above ground (m).  Derived

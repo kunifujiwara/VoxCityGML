@@ -8,11 +8,12 @@ directory (the one containing ``udx/``) whose coverage includes the
 target rectangle will do.
 
 The dataset-backed tests are marked ``slow`` because they parse the
-intersecting CityGML tiles and voxelize them. They all take CityGML land
-cover, so they are fully offline and deterministic, and each runs in
-roughly ten to thirty seconds. They run by default because they are the
-proof the whole chain works; skip them explicitly with
-``pytest -m "not slow"``.
+intersecting CityGML tiles and voxelize them; each runs in roughly ten to
+thirty seconds. **None of them touch the network** -- the ones that build a
+model take CityGML land cover rather than OpenStreetMap, and the parse-cache
+test never builds one -- so they are fully offline and deterministic. They
+run by default because they are the proof the whole chain works; skip them
+explicitly with ``pytest -m "not slow"``.
 
 One test here is additionally marked ``network`` and is *deselected* by
 default (see ``[tool.pytest.ini_options]`` in ``pyproject.toml``): it is
@@ -398,6 +399,13 @@ def _lod2_config(rect, tmp_path):
         canopy_height_source="Static",
         output_dir=str(tmp_path),
         save_output=False,
+        # Parse the XML for real every run, as the tests above do. Turning
+        # this on would cut ~13 s off the vegetation test -- 53393690's veg
+        # tile is 12 MB -- which is exactly the tempting trade to refuse: the
+        # cache is written *into the user's real dataset directory*, so the
+        # price of those 13 s is tens of megabytes deposited beside their
+        # data, and it stops exercising the parser after the first run. The
+        # whole suite is ~41 s; this is not a budget worth optimising.
         use_parse_cache=False,
     )
 
@@ -415,8 +423,8 @@ def _sparse_canopy(shape):
     return canopy
 
 
-@pytest.mark.slow
 @requires_dataset
+@pytest.mark.slow
 def test_reapply_canopy_preserves_lod2_roofs(tmp_path):
     """Re-applying canopy must not flatten LOD2 geometry.
 
@@ -431,10 +439,14 @@ def test_reapply_canopy_preserves_lod2_roofs(tmp_path):
     Note that 0.0965 is still *above* ``MIN_ROOF_SLOPE_FRACTION`` (0.08): the
     rebuild extrudes from ``buildings.heights``, which on a LOD2 model was
     rasterized per cell from the mesh and so retains a coarse staircase --
-    it is nowhere near as flat as a true LOD1 run (0.035). A threshold-style
-    assertion would therefore miss this regression entirely, which is why
-    every quantity below is pinned to *exact* equality with the pre-call
-    value instead.
+    it is nowhere near as flat as a true LOD1 run (0.035).
+
+    So ``assert slope > MIN_ROOF_SLOPE_FRACTION`` -- the exact assertion form
+    used by ``test_lod2_generate_voxcity_end_to_end`` and
+    ``test_rotated_rectangle_end_to_end`` above in this same file -- **passes
+    on the rebuild**. Copying the neighbouring tests' idiom here is the wrong
+    instinct, which is why every quantity below is instead pinned to *exact*
+    equality with its pre-call value. Do not relax these into thresholds.
     """
     from voxcitygml import generate_voxcity, reapply_canopy
     from voxcitygml.voxelizer3d import TREE_CODE as PIPELINE_TREE_CODE
@@ -444,24 +456,32 @@ def test_reapply_canopy_preserves_lod2_roofs(tmp_path):
 
     rect = create_rectangle(*LOD2_CENTRE, 200)
     city = generate_voxcity(_lod2_config(rect, tmp_path))
-    before = city.voxels.classes
+
+    # A *copy*, not the live array. Everything below the re-apply must compare
+    # against a genuine pre-call snapshot; holding the live reference is the
+    # false negative described in the comment further down, and naming a live
+    # reference `before` is how someone reintroduces it. Keeping this
+    # structural rather than positional costs one 370 KB copy.
+    before = city.voxels.classes.copy()
 
     slope_before = roof_slope_fraction(before)
     n_bldg_before = int((before == BUILDING_CODE).sum())
-    buildings_before = (before == BUILDING_CODE).copy()
-    tree_before = (before == TREE_CODE).copy()
+    buildings_before = before == BUILDING_CODE
+    tree_before = before == TREE_CODE
     n_tree_before = int(tree_before.sum())
 
     new_canopy = _sparse_canopy(before.shape[:2])
     reapply_canopy(city, new_canopy)
 
-    # Re-read rather than reusing the array captured above. ``reapply_canopy``
-    # edits in place, but ``regenerate_voxels(inplace=True)`` -- the regression
-    # this test exists to catch -- *rebinds* ``city.voxels`` to a freshly built
-    # grid and leaves the old array untouched. Holding the old reference would
-    # therefore make every assertion below pass on exactly that regression.
-    # Everything compared against is a copy or a scalar, so this is correct
-    # whichever way the call behaves.
+    # Re-read off ``city`` rather than reusing any array captured above.
+    # ``reapply_canopy`` edits in place, but ``regenerate_voxels(inplace=True)``
+    # -- the regression this test exists to catch -- *rebinds* ``city.voxels``
+    # to a freshly built grid and leaves the old array untouched. Measured: a
+    # version of this test that asserted on the array it grabbed before the
+    # call passed the slope check, the building count, the bitwise footprint
+    # comparison *and* the shape guard under a real rebuild. Everything
+    # compared against above is a snapshot, so this is correct whichever way
+    # the call behaves.
     classes = city.voxels.classes
 
     # Measured and printed before any assertion, so a failing run reports the
@@ -495,12 +515,16 @@ def test_reapply_canopy_preserves_lod2_roofs(tmp_path):
     assert slope_after == pytest.approx(slope_before, abs=1e-9), (
         f"LOD2 roof geometry changed ({slope_before:.4f} -> {slope_after:.4f})"
         f" -- was the grid rebuilt?")
-    assert n_bldg_after == n_bldg_before
-    np.testing.assert_array_equal(classes == BUILDING_CODE, buildings_before)
+    assert n_bldg_after == n_bldg_before, (
+        f"building voxel count changed {n_bldg_before} -> {n_bldg_after} -- "
+        f"the canopy overlay must never touch building geometry")
+    np.testing.assert_array_equal(
+        classes == BUILDING_CODE, buildings_before,
+        err_msg="building voxels moved during the canopy re-apply")
 
 
-@pytest.mark.slow
 @requires_dataset
+@pytest.mark.slow
 def test_reapply_canopy_preserves_citygml_vegetation(tmp_path):
     """CityGML vegetation crowns survive a canopy re-apply (fill-the-gaps).
 
@@ -540,7 +564,11 @@ def test_reapply_canopy_preserves_citygml_vegetation(tmp_path):
     # The buildings matter too: this has to be a working LOD2 model, not just
     # a patch of trees.
     assert (classes == BUILDING_CODE).any(), "no buildings in the vegetation tile"
-    assert roof_slope_fraction(classes) > MIN_ROOF_SLOPE_FRACTION
+    slope = roof_slope_fraction(classes)
+    assert slope > MIN_ROOF_SLOPE_FRACTION, (
+        f"roof slope {slope:.4f} <= {MIN_ROOF_SLOPE_FRACTION} -- the "
+        f"vegetation tile did not produce real LOD2 geometry, so this is not "
+        f"the LOD2-plus-vegetation model the test needs")
 
     before = classes.copy()
     tree_before = before == TREE_CODE
@@ -549,9 +577,12 @@ def test_reapply_canopy_preserves_citygml_vegetation(tmp_path):
     reapply_canopy(city, new_canopy)
 
     # Re-read: see the note in the LOD2 test above -- a rebuild rebinds
-    # ``city.voxels`` rather than editing the array in place.
+    # ``city.voxels`` rather than editing the array in place, so asserting on
+    # the pre-call reference would pass on exactly that regression.
     classes = city.voxels.classes
-    assert classes.shape == before.shape
+    assert classes.shape == before.shape, (
+        f"grid was reshaped {before.shape} -> {classes.shape} -- rebuilt? "
+        f"reapply_canopy must overlay the existing grid, not rebuild it")
 
     # 1. Masked columns are bitwise untouched -- whole column, every class.
     np.testing.assert_array_equal(

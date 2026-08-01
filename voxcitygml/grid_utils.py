@@ -35,6 +35,7 @@ not be used for coordinate mapping.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -47,7 +48,7 @@ from voxcity.geoprocessor.raster.core import compute_grid_geometry
 # Data container
 # -----------------------------------------------------------------------
 
-@dataclass
+@dataclass(frozen=True)
 class GridParams:
     """Affine frame mapping (lon, lat) ↔ grid (row, col).
 
@@ -62,6 +63,20 @@ class GridParams:
     exactly to the historical bbox arithmetic.  The min/max/pixel fields
     are retained as metadata (bounding box of the rectangle) but are no
     longer used for mapping.
+
+    Note that the frame is defined by **three** vertices (NW, NE, SW);
+    SE is implied to be ``NW + n_cols·e_col + n_rows·e_row``.  A
+    geodesically-constructed rectangle is not an exact parallelogram in
+    degree space, so its true SE corner sits slightly off that point
+    (measured: ~0.02 cells for a 900 m box, ~0.36 cells for a 4 km box
+    at 5 m resolution).  That is the inherent cost of modelling a
+    geodesic quadrilateral with an affine frame, not a defect of the
+    inversion.
+
+    All fields are required and the dataclass is frozen: the six affine
+    values are meaningless unless assigned together and consistently, so
+    partial or mutated construction is rejected rather than silently
+    producing a singular frame.
     """
     n_rows: int                  # number of rows (along SW→NW side)
     n_cols: int                  # number of columns (along SW→SE side)
@@ -71,12 +86,12 @@ class GridParams:
     max_lat: float               # bbox: northern extent
     pixel_width: float           # bbox width / n_cols  (metadata)
     pixel_height: float          # bbox height / n_rows (metadata)
-    origin_lon: float = 0.0      # NW vertex
-    origin_lat: float = 0.0
-    e_col_lon: float = 0.0       # lon/lat step per column (NW→NE / n_cols)
-    e_col_lat: float = 0.0
-    e_row_lon: float = 0.0       # lon/lat step per row    (NW→SW / n_rows)
-    e_row_lat: float = 0.0
+    origin_lon: float            # NW vertex
+    origin_lat: float
+    e_col_lon: float             # lon/lat step per column (NW→NE / n_cols)
+    e_col_lat: float
+    e_row_lon: float             # lon/lat step per row    (NW→SW / n_rows)
+    e_row_lat: float
 
     @property
     def shape(self) -> Tuple[int, int]:
@@ -152,6 +167,52 @@ class GridParams:
 # Constructor
 # -----------------------------------------------------------------------
 
+# |sin θ| between the two side directions must exceed this.  The check is
+# a *ratio*, so it is scale-free (independent of rectangle size, meshsize
+# and latitude).  For reference, real geodesically-built rectangles measure
+# |sin θ| ≥ 0.979 even at 45° rotation, so this leaves ~9 orders of
+# magnitude of headroom and only fires on genuinely collinear input.
+_MIN_SIDE_SIN = 1e-9
+
+
+def _check_non_degenerate(sw, nw, ne) -> None:
+    """Reject rectangles whose affine frame would be singular.
+
+    The mapping inverts the 2×2 basis built from the side vectors NW→NE
+    and NW→SW.  If either side has zero length, or the two sides are
+    collinear, that basis is singular and every subsequent lon/lat ↔
+    row/col conversion silently yields ``inf``/``nan`` — which then
+    propagates into the DEM, building and canopy rasterizers.  Nothing
+    upstream rejects such input (``resolve_rectangles`` only validates
+    vertex count/shape, and voxcity's ``compute_grid_geometry`` floors
+    its dimensions with ``max(1, …)``), so it is caught here, at
+    construction, rather than as a downstream NaN.
+    """
+    col_lon, col_lat = ne[0] - nw[0], ne[1] - nw[1]   # NW→NE
+    row_lon, row_lat = sw[0] - nw[0], sw[1] - nw[1]   # NW→SW
+
+    len_col = math.hypot(col_lon, col_lat)
+    len_row = math.hypot(row_lon, row_lat)
+    if len_col == 0.0 or len_row == 0.0:
+        raise ValueError(
+            "Degenerate rectangle: zero-length side "
+            f"(|NW→NE| = {len_col}, |NW→SW| = {len_row}). "
+            "The rectangle has zero area — check that the four vertices "
+            "are distinct and in [SW, NW, NE, SE] order."
+        )
+
+    cross = col_lon * row_lat - col_lat * row_lon
+    sin_theta = abs(cross) / (len_col * len_row)
+    if sin_theta <= _MIN_SIDE_SIN:
+        raise ValueError(
+            "Degenerate rectangle: adjacent sides are collinear "
+            f"(|sin θ| = {sin_theta:.3e} ≤ {_MIN_SIDE_SIN:.0e}), so the "
+            "grid frame is singular and would map every point to NaN. "
+            "Check that the four vertices form a real quadrilateral in "
+            "[SW, NW, NE, SE] order."
+        )
+
+
 def compute_grid_params(
     rectangle_vertices: List[Tuple[float, float]],
     meshsize: float,
@@ -176,6 +237,11 @@ def compute_grid_params(
     -------
     GridParams
     """
+    # SE is not used: the affine frame is defined by NW (origin) plus the
+    # two side vectors NW→NE and NW→SW.  See the GridParams docstring.
+    sw, nw, ne, _se = [tuple(v[:2]) for v in rectangle_vertices]
+    _check_non_degenerate(sw, nw, ne)
+
     geom = compute_grid_geometry(rectangle_vertices, meshsize)
     if geom is None:
         raise ValueError(
@@ -193,8 +259,6 @@ def compute_grid_params(
 
     pixel_width  = (max_lon - min_lon) / n_cols
     pixel_height = (max_lat - min_lat) / n_rows
-
-    sw, nw, ne, se = [tuple(v[:2]) for v in rectangle_vertices]
 
     return GridParams(
         n_rows=n_rows,

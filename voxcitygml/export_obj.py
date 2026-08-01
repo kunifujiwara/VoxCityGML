@@ -37,7 +37,6 @@ from shapely.prepared import prep as shapely_prep
 from .models import Mesh3D, CityGMLMeshCollection
 from .citygml.coordinates import (
     swap_coordinates_3d,
-    create_local_transformer,
     create_rectangle_frame_transformer,
 )
 from .voxelizer3d import (
@@ -741,7 +740,8 @@ def export_meshes_obj(
     basename: str = "meshes",
     watertight: bool = True,
     voxel_size: float = 1.0,
-    rectangle_vertices=None,
+    *,
+    rectangle_vertices,
 ) -> str:
     """Export CityGML meshes as OBJ + MTL.
 
@@ -752,19 +752,24 @@ def export_meshes_obj(
     ----------
     gp : Grid3DParams
         Grid params (needed for the coordinate transform).
-    rectangle_vertices : sequence of 4 (lon, lat), optional
-        Target rectangle.  When given, meshes are placed in the same
-        rectangle-aligned frame as ``gp`` (required for rotated
-        rectangles, a no-op for axis-aligned ones).  Omitting it falls
-        back to the unrotated local frame.
+    rectangle_vertices : sequence of 4 (lon, lat), keyword-only, required
+        Target rectangle, in VoxCity order ``[SW, NW, NE, SE]``.  Meshes
+        are placed in the same rectangle-aligned frame as ``gp``.
+
+        This is **required**, not optional.  ``gp`` can only come from
+        ``_compute_grid_params_3d``, which always works in the rectangle
+        frame, and ``gp.min_x/max_x/min_y/max_y`` set both the OBJ origin
+        and the clip box below.  Placing meshes in any other frame would
+        rotate them relative to the voxel OBJ and clip them against the
+        wrong region — with no exception to reveal it.  There is no
+        run-time way to detect the mismatch, so the frame is pinned at the
+        call site instead.  It is keyword-only so that an old positional
+        call cannot silently bind something else to it.
     """
     os.makedirs(output_dir, exist_ok=True)
 
-    if rectangle_vertices is not None:
-        transformer = create_rectangle_frame_transformer(
-            center_lon, center_lat, rectangle_vertices)
-    else:
-        transformer = create_local_transformer(center_lon, center_lat)
+    transformer = create_rectangle_frame_transformer(
+        center_lon, center_lat, rectangle_vertices)
 
     def _to_local(mesh: Mesh3D) -> Tuple[np.ndarray, np.ndarray]:
         verts_ll = swap_coordinates_3d(mesh.vertices)

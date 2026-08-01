@@ -519,3 +519,137 @@ def test_compute_grid_params_3d_rejects_degenerate(rect):
     with pytest.raises(ValueError, match="[Dd]egenerate"):
         _compute_grid_params_3d(rect, 139.77, 35.65, 5.0,
                                 CityGMLMeshCollection())
+
+
+# ---------------------------------------------------------------------
+# Mesh export shares the voxel grid's frame
+#
+# ``export_meshes_obj`` places meshes with a transformer of its own but
+# uses ``gp`` (always built by ``_compute_grid_params_3d``, i.e. always
+# rotated) for the OBJ origin *and* the clip box.  The two must be the
+# same frame; there is no way to detect a mismatch at run time, so the
+# rectangle is a required argument rather than an optional one.
+# ---------------------------------------------------------------------
+
+_EXPORT_CLON, _EXPORT_CLAT = 139.77, 35.65
+_EXPORT_ROTATION = 30.0
+
+
+def _corner_box_mesh(lon, lat, half_deg=4.5e-5, z0=0.0, z1=10.0):
+    """A small axis-aligned box around (lon, lat), in CityGML (lat, lon, z)."""
+    from voxcitygml.models import Mesh3D
+
+    corners = [(lat - half_deg, lon - half_deg), (lat - half_deg, lon + half_deg),
+               (lat + half_deg, lon + half_deg), (lat + half_deg, lon - half_deg)]
+    verts = np.array([[a, b, z0] for a, b in corners] +
+                     [[a, b, z1] for a, b in corners], dtype=np.float64)
+    faces = np.array([
+        [0, 1, 2], [0, 2, 3],          # bottom
+        [4, 6, 5], [4, 7, 6],          # top
+        [0, 4, 5], [0, 5, 1],
+        [1, 5, 6], [1, 6, 2],
+        [2, 6, 7], [2, 7, 3],
+        [3, 7, 4], [3, 4, 0],
+    ], dtype=np.int32)
+    return Mesh3D(vertices=verts, faces=faces, feature_type="building",
+                  feature_id="probe")
+
+
+def _export_probe_fixture():
+    """A rotated rectangle plus a building near its NE corner.
+
+    The probe sits where the two candidate frames disagree by more than the
+    grid half-extent, so a wrong frame does not merely shift the mesh -- it
+    pushes it outside the clip box entirely and the mesh is dropped.
+    """
+    from voxcitygml.models import CityGMLMeshCollection
+    from voxcitygml.voxelizer3d import _compute_grid_params_3d
+
+    rect = _geodesic_rect(_EXPORT_CLON, _EXPORT_CLAT, 400.0, 300.0,
+                          _EXPORT_ROTATION)
+    gp2 = compute_grid_params(rect, 5.0)
+    # Near the NE corner: ~15 m in from the north and east edges.
+    lon, lat = gp2.rowcol_to_lonlat(np.array([2.5]),
+                                    np.array([gp2.n_cols - 3.5]))
+    lon, lat = float(lon[0]), float(lat[0])
+    collection = CityGMLMeshCollection(buildings=[_corner_box_mesh(lon, lat)])
+    gp3, _ = _compute_grid_params_3d(rect, _EXPORT_CLON, _EXPORT_CLAT, 5.0,
+                                     collection)
+    return rect, collection, gp3, lon, lat
+
+
+def test_export_probe_distinguishes_the_two_frames():
+    """Guard for the export test below: the probe must actually discriminate.
+
+    In the rectangle frame it is inside ``gp``'s bounds; under the plain
+    local frame the same point lands outside them.  Without this the export
+    test could pass on a frame-blind implementation.
+    """
+    from voxcitygml.citygml.coordinates import (
+        create_local_transformer, create_rectangle_frame_transformer)
+
+    rect, _collection, gp3, lon, lat = _export_probe_fixture()
+    lons, lats = np.array([lon, lon]), np.array([lat, lat])
+
+    xr, yr = create_rectangle_frame_transformer(
+        _EXPORT_CLON, _EXPORT_CLAT, rect).transform(lons, lats)
+    assert gp3.min_x <= xr[0] <= gp3.max_x
+    assert gp3.min_y <= yr[0] <= gp3.max_y
+
+    xb, yb = create_local_transformer(
+        _EXPORT_CLON, _EXPORT_CLAT).transform(lons, lats)
+    # Outside by more than the probe box's own half-extent (~5 m), so the
+    # whole mesh -- not just part of it -- falls outside the clip box.
+    outside_by = max(gp3.min_x - xb[0], xb[0] - gp3.max_x,
+                     gp3.min_y - yb[0], yb[0] - gp3.max_y)
+    assert outside_by > 10.0, (
+        f"probe at ({xb[0]:.1f}, {yb[0]:.1f}) is not clearly outside "
+        f"[{gp3.min_x:.1f}, {gp3.max_x:.1f}] x [{gp3.min_y:.1f}, "
+        f"{gp3.max_y:.1f}] in the unrotated frame -- it cannot discriminate "
+        f"(margin {outside_by:.1f} m)")
+
+
+def test_export_meshes_obj_uses_the_rectangle_frame(tmp_path):
+    """Meshes land inside ``gp``'s bounds, so the clip box keeps them."""
+    from voxcitygml.export_obj import export_meshes_obj
+
+    rect, collection, gp3, _lon, _lat = _export_probe_fixture()
+    _obj_path, groups = export_meshes_obj(
+        collection,
+        center_lon=_EXPORT_CLON,
+        center_lat=_EXPORT_CLAT,
+        output_dir=str(tmp_path),
+        gp=gp3,
+        watertight=False,
+        voxel_size=5.0,
+        rectangle_vertices=rect,
+    )
+    assert len(groups["building"]) == 1, "the probe building was clipped away"
+    verts = groups["building"][0][0]
+    assert verts[:, 0].min() >= gp3.min_x - 1e-6
+    assert verts[:, 0].max() <= gp3.max_x + 1e-6
+    assert verts[:, 1].min() >= gp3.min_y - 1e-6
+    assert verts[:, 1].max() <= gp3.max_y + 1e-6
+
+
+def test_export_meshes_obj_requires_rectangle_vertices(tmp_path):
+    """Omitting the rectangle must fail loudly, not fall back to a frame that
+    disagrees with ``gp``.
+
+    ``gp`` is always in the rectangle frame, so an unrotated fallback would
+    place the meshes rotated relative to the voxel OBJ and clip them against
+    the wrong region -- silently, with no exception.
+    """
+    from voxcitygml.export_obj import export_meshes_obj
+
+    _rect, collection, gp3, _lon, _lat = _export_probe_fixture()
+    with pytest.raises(TypeError, match="rectangle_vertices"):
+        export_meshes_obj(
+            collection,
+            center_lon=_EXPORT_CLON,
+            center_lat=_EXPORT_CLAT,
+            output_dir=str(tmp_path),
+            gp=gp3,
+            watertight=False,
+            voxel_size=5.0,
+        )

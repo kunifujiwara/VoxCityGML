@@ -8,12 +8,15 @@ directory (the one containing ``udx/``) whose coverage includes the
 target rectangle will do.
 
 The dataset-backed tests are marked ``slow`` because they parse the
-intersecting CityGML tiles and voxelize them. The axis-aligned end-to-end
-run takes roughly 35-125 s, most of it waiting on live OpenStreetMap land
-cover; the rotated run (CityGML land cover, fully offline) and the
-parse-cache round trip take a few seconds each. They run by default
-because they are the proof the whole chain works; skip them explicitly
-with ``pytest -m "not slow"``.
+intersecting CityGML tiles and voxelize them. All three take CityGML land
+cover, so they are fully offline and deterministic and each runs in about
+ten seconds. They run by default because they are the proof the whole
+chain works; skip them explicitly with ``pytest -m "not slow"``.
+
+One test here is additionally marked ``network`` and is *deselected* by
+default (see ``[tool.pytest.ini_options]`` in ``pyproject.toml``): it is
+the remaining coverage of the live OpenStreetMap land-cover integration.
+Run it with ``pytest -m network``.
 """
 import json
 import os
@@ -38,8 +41,16 @@ requires_dataset = pytest.mark.skipif(
 
 # Measured on the reference rectangle below (Chuo-ku, 200 m, 2 m voxels):
 # LOD2 scores 0.151, LOD1 scores 0.035. 0.08 sits between the two, more than
-# 2x above the LOD1 figure and about half the LOD2 figure, so it tolerates the
-# run-to-run variation from live OpenStreetMap land cover without going soft.
+# 2x above the LOD1 figure and about half the LOD2 figure.
+#
+# The margin used to be justified as absorbing run-to-run variation from live
+# OpenStreetMap land cover. Both dataset tests now take land cover from the
+# CityGML dataset itself, so there is no run-to-run variation left to absorb --
+# but the threshold is unchanged, because the switch moved no geometry at all
+# (26,088 building voxels, shape (100, 100, 37), slope 0.151 both ways). Land
+# cover only labels the topmost terrain voxels; it never touches building
+# geometry, which is what this metric measures. The margin now buys headroom
+# against dataset and voxelizer changes instead.
 MIN_ROOF_SLOPE_FRACTION = 0.08
 
 
@@ -142,7 +153,15 @@ def test_lod2_generate_voxcity_end_to_end(tmp_path):
         rectangle_vertices=rect,
         meshsize=2.0,
         building_lod=2,
-        land_cover_source="OpenStreetMap",   # no GEE dependency
+        # Parsed from the dataset itself: fully offline and deterministic.
+        # This used to be "OpenStreetMap", which made the default suite depend
+        # on live Overpass -- and Overpass rate-limits after a few consecutive
+        # fetches and then stalls *indefinitely* rather than erroring, so with
+        # no timeout plugin installed this test could hang the whole run. The
+        # OSM path keeps its own coverage in the opt-in `network` test below.
+        # Switching the source moved none of the numbers this test asserts on
+        # (see the comment on the roof-slope assertion).
+        land_cover_source="CityGML",
         canopy_height_source="Static",
         output_dir=str(tmp_path),
         save_output=False,
@@ -173,6 +192,49 @@ def test_lod2_generate_voxcity_end_to_end(tmp_path):
     assert slope > MIN_ROOF_SLOPE_FRACTION, (
         f"roof slope fraction {slope:.3f} <= {MIN_ROOF_SLOPE_FRACTION}: the "
         f"voxel grid looks like a flat LOD1 extrusion, not LOD2 roof geometry")
+
+
+# ---------------------------------------------------------------------------
+# Live OpenStreetMap land cover (opt-in)
+#
+# The end-to-end tests above used to be the only thing exercising the
+# voxcity/OSM land-cover integration, and paid for it by hanging whenever
+# Overpass rate-limited. This keeps the coverage without the hazard: marked
+# ``network`` (deselected by default) and reduced to the one call that is
+# actually OSM-specific, so a single Overpass fetch covers it.
+#
+# Marked ``slow`` as well so the documented ``-m "not slow"`` override, which
+# replaces the default ``-m "not network"``, cannot re-select it by accident.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.network
+@pytest.mark.slow
+def test_openstreetmap_land_cover_grid_matches_target_grid(tmp_path):
+    """Live OSM land cover comes back on the pipeline's own grid.
+
+    Shape is the contract that matters: ``run_core`` silently
+    ``_resize_int_grid``s any land-cover grid that disagrees with the DEM
+    grid, so a source that returned the wrong shape would be resampled
+    rather than rejected and the mislabelled ground would only show up by
+    eye. Needs no PLATEAU dataset -- only Overpass.
+    """
+    from voxcitygml.grid_utils import compute_grid_params
+    from voxcitygml.landcover.processor import get_land_cover_grid
+    from voxcitygml.citygml.coordinates import create_rectangle
+
+    rect = create_rectangle(139.7725, 35.6481, 200)
+    meshsize = 2.0
+
+    grid = get_land_cover_grid(rect, meshsize, "OpenStreetMap", str(tmp_path))
+
+    expected = compute_grid_params(rect, meshsize).shape
+    assert grid.shape == expected, (
+        f"OSM land cover is {grid.shape}, target grid is {expected} -- "
+        f"run_core would silently resample it")
+    # Central Tokyo is not one uniform class; an all-one-value grid means the
+    # fetch degraded to a fill rather than failing.
+    assert len(np.unique(grid)) > 1, (
+        f"OSM land cover is uniformly {np.unique(grid)} -- no real data")
 
 
 # ---------------------------------------------------------------------------

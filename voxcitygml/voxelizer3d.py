@@ -16,7 +16,10 @@ from numba import njit, prange
 from scipy.ndimage import binary_fill_holes, zoom
 
 from .models import Mesh3D, CityGMLMeshCollection
-from .citygml.coordinates import swap_coordinates_3d, create_local_transformer
+from .citygml.coordinates import (
+    swap_coordinates_3d,
+    create_rectangle_frame_transformer,
+)
 from .watertight import make_watertight_mesh
 from .terrain_solid import build_terrain_solid
 
@@ -250,7 +253,10 @@ def _compute_grid_params_3d(
     collection: CityGMLMeshCollection,
     underground_depth: float = 0.0,
 ) -> Tuple[Grid3DParams, object]:
-    transformer = create_local_transformer(center_lon, center_lat)
+    # Rotated local frame: the rectangle is axis-aligned in this frame, so
+    # the bbox below is tight even for a rotated target rectangle.
+    transformer = create_rectangle_frame_transformer(
+        center_lon, center_lat, rectangle_vertices)
 
     rect_lon = [v[0] for v in rectangle_vertices]
     rect_lat = [v[1] for v in rectangle_vertices]

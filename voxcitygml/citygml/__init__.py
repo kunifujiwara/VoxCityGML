@@ -31,6 +31,7 @@ from .coordinates import (
     file_intersects_rectangle,
     transform_to_local_meters,
     create_local_transformer,
+    create_rectangle_frame_transformer,
 )
 from .extractors import (
     extract_terrain_from_root,
@@ -63,6 +64,7 @@ __all__ = [
     "file_intersects_rectangle",
     "transform_to_local_meters",
     "create_local_transformer",
+    "create_rectangle_frame_transformer",
     "extract_terrain_from_root",
     "filter_terrain_by_rectangle_vectorized",
     "extract_buildings_from_root",

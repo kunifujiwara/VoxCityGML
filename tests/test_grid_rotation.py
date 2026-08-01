@@ -314,3 +314,94 @@ def test_meshes_to_building_grids_non_square_orientation():
     assert nz[:, 1].max() <= target_col + 2
     assert height_grid[target_row, target_col] == pytest.approx(25.0)
     assert id_grid[target_row, target_col] == 1
+
+
+# ---------------------------------------------------------------------
+# 3-D voxelizer: the local metric frame follows the rectangle's own axes
+#
+# ``_compute_grid_params_3d`` takes the axis-aligned bbox of the projected
+# corners.  That is only tight if the rectangle is axis-aligned *in the
+# working frame*, so the frame is rotated by -theta (theta = bearing of
+# NW->NE, matching GridParams' e_col).
+# ---------------------------------------------------------------------
+
+def test_rectangle_frame_axis_aligned_theta_is_zero():
+    """theta ~ 0 for a due-north rectangle: degenerates to the plain frame."""
+    from voxcitygml.citygml.coordinates import (
+        create_rectangle_frame_transformer, create_local_transformer)
+    rect = create_rectangle(139.77, 35.65, 400)
+    rot = create_rectangle_frame_transformer(139.77, 35.65, rect)
+    base = create_local_transformer(139.77, 35.65)
+    lons = np.array([139.7695, 139.7712])
+    lats = np.array([35.6489, 35.6478])
+    xr, yr = rot.transform(lons, lats)
+    xb, yb = base.transform(lons, lats)
+    # sub-millimetre agreement
+    np.testing.assert_allclose(xr, xb, atol=1e-3)
+    np.testing.assert_allclose(yr, yb, atol=1e-3)
+
+
+def test_rectangle_frame_makes_rotated_rect_axis_aligned():
+    """A geodesically-built rotated rectangle becomes an upright, axis-aligned
+    rectangle in the frame transformer's output."""
+    from voxcitygml.citygml.coordinates import create_rectangle_frame_transformer
+    width, height, = 1500.0, 600.0
+    rect = _geodesic_rect(139.77, 35.65, width, height, 30.0)
+    rot = create_rectangle_frame_transformer(139.77, 35.65, rect)
+    lons = np.array([v[0] for v in rect])
+    lats = np.array([v[1] for v in rect])
+    x, y = rot.transform(lons, lats)
+    sw, nw, ne, se = range(4)
+
+    # NW->NE is the +x axis: y_NE == y_NW exactly (by construction of theta)
+    assert abs(y[ne] - y[nw]) < 1e-9
+    # ...and points east, not west
+    assert x[ne] > x[nw]
+    # The rectangle is upright: the north side is at larger y
+    assert y[nw] > y[sw]
+    # The other three sides are axis-aligned too, to within the geodesic-vs-
+    # planar residual (tmerc k=0.9999 + ellipsoid; measured well under 0.1 m).
+    assert abs(y[se] - y[sw]) < 0.1
+    assert abs(x[sw] - x[nw]) < 0.1
+    assert abs(x[se] - x[ne]) < 0.1
+    # Side lengths come out as the requested metres (k=0.9999 shrinks by ~1e-4)
+    assert abs((x[ne] - x[nw]) - width) < 0.5
+    assert abs((y[nw] - y[sw]) - height) < 0.5
+
+
+def test_rectangle_frame_is_not_the_plain_frame_when_rotated():
+    """Guard: the rotated tests above must actually exercise the rotation."""
+    from voxcitygml.citygml.coordinates import (
+        create_rectangle_frame_transformer, create_local_transformer)
+    rect = _geodesic_rect(139.77, 35.65, 1500.0, 600.0, 30.0)
+    rot = create_rectangle_frame_transformer(139.77, 35.65, rect)
+    base = create_local_transformer(139.77, 35.65)
+    lons = np.array([v[0] for v in rect])
+    lats = np.array([v[1] for v in rect])
+    xr, _ = rot.transform(lons, lats)
+    xb, _ = base.transform(lons, lats)
+    assert np.max(np.abs(xr - xb)) > 100.0     # metres
+
+
+@pytest.mark.parametrize("rotation", [0.0, 15.0, 30.0, 45.0, 90.0, 137.0])
+def test_voxelizer_grid_tight_for_rotated_rect(rotation):
+    """3-D grid dims follow the rectangle sides, not the lon/lat bbox.
+
+    Also pins 2-D/3-D consistency: the voxel grid must have the same
+    (n_rows, n_cols) as the rasterized DEM / building / land-cover grids.
+    """
+    from voxcity.geoprocessor.raster.core import compute_grid_geometry
+    from voxcitygml.voxelizer3d import _compute_grid_params_3d
+    from voxcitygml.models import CityGMLMeshCollection
+
+    rect = _geodesic_rect(139.77, 35.65, 1500.0, 600.0, rotation)
+    gp3, _ = _compute_grid_params_3d(rect, 139.77, 35.65, 5.0,
+                                     CityGMLMeshCollection())
+    # A 45-degree bbox would inflate rows+cols by ~40%+.
+    n_rows_v, n_cols_v = compute_grid_geometry(rect, 5.0)["grid_size"]
+    assert abs(gp3.n_rows - n_rows_v) <= 2
+    assert abs(gp3.n_cols - n_cols_v) <= 2
+    # and against the 2-D affine frame used by the rasterizers
+    gp2 = compute_grid_params(rect, 5.0)
+    assert abs(gp3.n_rows - gp2.n_rows) <= 2
+    assert abs(gp3.n_cols - gp2.n_cols) <= 2

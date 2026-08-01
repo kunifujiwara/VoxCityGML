@@ -35,7 +35,11 @@ from shapely.geometry import Polygon as ShapelyPolygon
 from shapely.prepared import prep as shapely_prep
 
 from .models import Mesh3D, CityGMLMeshCollection
-from .citygml.coordinates import swap_coordinates_3d, create_local_transformer
+from .citygml.coordinates import (
+    swap_coordinates_3d,
+    create_local_transformer,
+    create_rectangle_frame_transformer,
+)
 from .voxelizer3d import (
     Grid3DParams,
     _compute_grid_params_3d,
@@ -737,6 +741,7 @@ def export_meshes_obj(
     basename: str = "meshes",
     watertight: bool = True,
     voxel_size: float = 1.0,
+    rectangle_vertices=None,
 ) -> str:
     """Export CityGML meshes as OBJ + MTL.
 
@@ -747,10 +752,19 @@ def export_meshes_obj(
     ----------
     gp : Grid3DParams
         Grid params (needed for the coordinate transform).
+    rectangle_vertices : sequence of 4 (lon, lat), optional
+        Target rectangle.  When given, meshes are placed in the same
+        rectangle-aligned frame as ``gp`` (required for rotated
+        rectangles, a no-op for axis-aligned ones).  Omitting it falls
+        back to the unrotated local frame.
     """
     os.makedirs(output_dir, exist_ok=True)
 
-    transformer = create_local_transformer(center_lon, center_lat)
+    if rectangle_vertices is not None:
+        transformer = create_rectangle_frame_transformer(
+            center_lon, center_lat, rectangle_vertices)
+    else:
+        transformer = create_local_transformer(center_lon, center_lat)
 
     def _to_local(mesh: Mesh3D) -> Tuple[np.ndarray, np.ndarray]:
         verts_ll = swap_coordinates_3d(mesh.vertices)
@@ -1247,8 +1261,11 @@ def _export_landcover_polygon_obj(
         print("  [lc-export] WARNING: no land use polygons found")
         return obj_path
 
-    # Coordinate transform: WGS 84 (lon, lat) → local metres → OBJ
-    transformer = create_local_transformer(center_lon, center_lat)
+    # Coordinate transform: WGS 84 (lon, lat) → local metres → OBJ.
+    # Same rectangle-aligned frame as the voxel / mesh exports, so the
+    # land-cover layer overlays them for rotated rectangles too.
+    transformer = create_rectangle_frame_transformer(
+        center_lon, center_lat, rectangle_vertices)
 
     # ── Collect materials that actually appear ────────────────────────
     codes_present = set(code for code, _ in polys)

@@ -80,6 +80,7 @@ def run_and_export(
         basename=mesh_basename,
         watertight=watertight_meshes,
         voxel_size=cfg.meshsize,
+        rectangle_vertices=rectangle,
     )
 
     # ── Export 3: Per-category voxelized mesh OBJ ────────────────────

@@ -3,6 +3,7 @@ Coordinate handling and transformations.
 """
 
 import logging
+import math
 import re
 from typing import List, Tuple, Optional, Union
 import numpy as np
@@ -219,6 +220,59 @@ def create_local_transformer(center_lon: float, center_lat: float) -> Transforme
         "+k=0.9999 +x_0=0 +y_0=0 +ellps=GRS80 +units=m +no_defs"
     )
     return Transformer.from_crs("EPSG:4326", proj_string, always_xy=True)
+
+
+class _RectangleFrameTransformer:
+    """Wraps the local tmerc transformer with a rotation by −θ so the
+    target rectangle is axis-aligned in the working frame.
+
+    Only the forward ``transform(lons, lats)`` is provided — nothing in
+    the package uses the inverse direction.
+    """
+
+    __slots__ = ("_base", "_cos", "_sin")
+
+    def __init__(self, base: Transformer, cos_t: float, sin_t: float):
+        self._base = base
+        self._cos = cos_t
+        self._sin = sin_t
+
+    def transform(self, lons, lats):
+        x, y = self._base.transform(lons, lats)
+        x = np.asarray(x, dtype=np.float64)
+        y = np.asarray(y, dtype=np.float64)
+        return (self._cos * x + self._sin * y,
+                -self._sin * x + self._cos * y)
+
+
+def create_rectangle_frame_transformer(center_lon: float, center_lat: float,
+                                       rectangle_vertices):
+    """Local metric transformer aligned to the rectangle's own axes.
+
+    θ is the bearing of the **NW→NE** side in the tmerc frame; the returned
+    transformer rotates by −θ, so a rotated rectangle becomes axis-aligned
+    and every downstream bbox / row-col computation is valid unchanged.  For
+    an axis-aligned rectangle θ ≈ 0 and this degenerates to (numerically) the
+    plain local transformer.
+
+    **NW→NE, not SW→SE, deliberately.**  The 2-D ``GridParams`` frame is
+    anchored on NW with ``e_col`` along NW→NE and ``e_row`` along NW→SW.  A
+    geodesic quadrilateral is not a true parallelogram, so NW→NE and SW→SE
+    are not parallel — deriving θ from the other pair would make the 2-D and
+    3-D frames exact on different corners and leave a sub-cell seam between
+    the rasterized DEM / building grids and the voxel grid.  Sharing the
+    vertex pair keeps them consistent by construction.
+
+    Parameters
+    ----------
+    rectangle_vertices : sequence of 4 (lon, lat[, ...]) in [SW, NW, NE, SE]
+        order — the package-wide convention (see ``create_rectangle``).
+    """
+    base = create_local_transformer(center_lon, center_lat)
+    _sw, nw, ne, _se = [tuple(v[:2]) for v in rectangle_vertices]
+    xs, ys = base.transform([nw[0], ne[0]], [nw[1], ne[1]])
+    theta = math.atan2(ys[1] - ys[0], xs[1] - xs[0])
+    return _RectangleFrameTransformer(base, math.cos(theta), math.sin(theta))
 
 
 def transform_geographic_to_local_simple(vertices: np.ndarray,

@@ -494,11 +494,26 @@ def test_nw_vertex_lands_on_3d_grid_origin(rotation):
     # Transform NW and NE together (pyproj deprecates 1-element arrays).
     x, y = transformer.transform(np.array([nw[0], ne[0]]),
                                  np.array([nw[1], ne[1]]))
-    # theta pins NW/NE to be exactly level.  This is the *only* assertion
-    # in the suite that distinguishes the NW->NE choice from SW->SE: the
-    # row/col agreement above is insensitive to it (measured <1e-5 cells).
-    # Production lands at ~1e-14; deriving theta from SW->SE gives ~1.4e-9.
-    assert abs(y[0] - y[1]) < 1e-11
+    # theta pins NW/NE to be exactly level.  This is the assertion that
+    # distinguishes the NW->NE choice from SW->SE with real margin: the
+    # row/col agreement above is insensitive to it (measured <1e-5 cells),
+    # and ``test_rectangle_frame_makes_rotated_rect_axis_aligned`` catches
+    # the same fault by only 1.4x.
+    #
+    # The residual is pure floating-point rounding in the rotation, so it
+    # scales with the magnitude of the projected coordinates -- an absolute
+    # threshold silently tightens as the rectangle grows.  A 200 km x 5 km
+    # AOI reaches 1.5e-11 m here with nothing wrong, over the 1e-11 this
+    # assertion used to use.  Measured *relative* to |NW|:
+    #   production, swept over 7 sites x 7 sizes (200 m .. 200 km) x 120
+    #     rotations:                            worst 7.3e-16  (3.3 ulp)
+    #   theta taken from SW->SE instead, at the three *rotated* cases
+    #     parametrized above:                    min  1.9e-12  (8400 ulp)
+    #     (at rotation 0 the two choices coincide bit-for-bit, so that
+    #      parameter cannot distinguish them at any tolerance)
+    # 3e-14 sits near the geometric mean: 41x of headroom over production
+    # noise, and the fault is still caught by 62x.
+    assert abs(y[0] - y[1]) < 3e-14 * max(abs(x[0]), abs(y[0]))
     assert abs(y[0] - gp3.max_y) < 1e-6                  # exact by construction
     assert abs(x[0] - gp3.min_x) < 0.05 * gp3.voxel_size  # sub-cell
 

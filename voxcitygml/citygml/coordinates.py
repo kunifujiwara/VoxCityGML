@@ -273,13 +273,31 @@ def create_rectangle_frame_transformer(center_lon: float, center_lat: float,
     Sharing the vertex pair makes the 2-D and 3-D frames exact on the same
     side by construction, rather than by numerical coincidence.
 
-    Measured, the choice is second-order: a geodesic quadrilateral is very
-    nearly a parallelogram (NW→NE and SW→SE differ by ~1e-5 rad), so
-    deriving θ from SW→SE instead moves the 2-D/3-D agreement by less than
-    1e-5 cells.  Both pairs sit far below the *inherent* geodesic-vs-affine
-    residual of 0.02–0.28 cells (see ``test_frames_agree_on_rowcol``).  The
-    NW→NE choice is therefore about having one defensible rule, not about a
-    measurable error reduction — do not expect a test to distinguish them.
+    Measured, the choice is second-order — and for the rectangles this code
+    actually receives it is second-order *by construction*, not by luck.
+    ``/api/rectangle-from-dimensions`` (and the test helper mirroring it)
+    places all four corners with ``Geod.fwd`` from the same centre, at
+    offsets that are diametrically opposite in pairs: SW = −NE and SE = −NW
+    in the local offset plane.  A transverse-Mercator projection centred on
+    that same point preserves that antisymmetry, so the projected corners
+    satisfy ``SW ≈ −NE`` and ``SE ≈ −NW`` (measured residual 5e-9 m, 9e-12
+    relative).  Hence ``SE − SW = NE − NW``: the two sides are *parallel*,
+    and the two candidate θ values agree to typically ~1e-13 rad (worst
+    5e-12 measured over 4 sites × 900–4000 m × all rotations).  Deriving θ
+    from SW→SE instead moves the 2-D/3-D agreement by well under 1e-5 cells.
+
+    Do not confuse that with the ~1e-5 rad figure sometimes quoted: that is
+    a *different and much larger* quantity — the raw **ellipsoidal** initial
+    azimuth from ``Geod.inv``, evaluated independently at NW and at SW
+    (measured 2e-6 to 6e-4 rad over the same sweep).  Geodesic initial
+    azimuths on parallel chords genuinely differ by that much; the tmerc
+    bearings θ is built from do not.  It is the bound that would apply to a
+    hypothetical quadrilateral *not* built center-symmetrically.
+
+    The NW→NE choice is therefore about having one defensible rule that
+    matches the 2-D frame, not about a measurable error reduction — do not
+    expect a test to distinguish them by more than floating-point noise
+    (``test_nw_vertex_lands_on_3d_grid_origin`` does, at ~8000 ulp).
 
     Parameters
     ----------

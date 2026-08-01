@@ -59,13 +59,8 @@ def terrain_meshes_to_dem_grid(
     # Merge all terrain mesh vertices (lat, lon, z) → (lon, lat, z)
     all_pts = _collect_terrain_points(terrain_meshes)  # (N, 3) lon, lat, z
 
-    # Build query grid using voxcity-compatible cell centres
-    col_indices = np.arange(gp.n_cols)
-    row_indices = np.arange(gp.n_rows)
-    col_lons = gp.min_lon + (col_indices + 0.5) * gp.pixel_width
-    row_lats = gp.max_lat - (row_indices + 0.5) * gp.pixel_height
-
-    grid_lon, grid_lat = np.meshgrid(col_lons, row_lats)
+    # Build query grid using affine cell centres (rotation-aware)
+    grid_lon, grid_lat = gp.cell_centres()
     query_pts = np.column_stack([grid_lon.ravel(), grid_lat.ravel()])
 
     # Interpolate elevation on the TIN

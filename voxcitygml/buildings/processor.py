@@ -39,7 +39,7 @@ def _rasterise_triangle_to_cells(
     """Rasterise one triangle and return per-cell z ranges.
 
     Triangle vertices are (lon, lat, z).  Grid mapping uses the same
-    pixel_width / pixel_height as the DEM / land-cover grids.
+    affine GridParams frame as the DEM / land-cover grids.
 
     Parameters
     ----------
@@ -51,13 +51,11 @@ def _rasterise_triangle_to_cells(
     dict  { (row, col): (z_min, z_max) }
     """
     n_rows, n_cols = gp.n_rows, gp.n_cols
-    pw, ph = gp.pixel_width, gp.pixel_height
 
     # Triangle vertices in continuous grid coordinates
     tri_lon = np.array([v0[0], v1[0], v2[0]])
     tri_lat = np.array([v0[1], v1[1], v2[1]])
-    gx = (tri_lon - gp.min_lon) / pw - 0.5
-    gy = (gp.max_lat - tri_lat) / ph - 0.5
+    gy, gx = gp.lonlat_to_rowcol(tri_lon, tri_lat)
 
     # Bounding box in grid-index space
     min_gc = int(max(0, np.floor(gx.min())))
@@ -95,9 +93,7 @@ def _rasterise_triangle_to_cells(
     # Build arrays of cell-centre (lon, lat) for the bounding box
     cols = np.arange(min_gc, max_gc + 1)
     rows = np.arange(min_gr, max_gr + 1)
-    cx_lon = gp.min_lon + (cols + 0.5) * pw
-    cy_lat = gp.max_lat - (rows + 0.5) * ph
-    PX, PY = np.meshgrid(cx_lon, cy_lat)          # lon, lat grids
+    PX, PY = gp.cell_centres(rows=rows, cols=cols)   # lon, lat grids
 
     # Vectorised barycentric coordinates
     W0 = ((v1[1] - v2[1]) * (PX - v2[0]) +

@@ -8,22 +8,35 @@ codebases can never drift apart. That function computes:
 1.  Geodesic distances (WGS-84 ellipsoid) along N-S and E-W sides.
 2.  ``int(distance / meshsize + 0.5)`` rounding for cell count.
 
-On top of the delegated ``n_rows``/``n_cols``, this module adds the
-voxcitygml-specific bbox/pixel conveniences:
+On top of the delegated ``n_rows``/``n_cols``, this module builds an
+**affine frame** that maps (lon, lat) ↔ (row, col).  The frame is
+anchored at the NW vertex and its basis vectors run along the
+rectangle's own sides::
 
-    ``pixel_width = (max_lon − min_lon) / n_cols``
-    ``pixel_height = (max_lat − min_lat) / n_rows``
-    so cells tile the rectangle exactly.
+    e_col = (NE − NW) / n_cols      # one column step
+    e_row = (SW − NW) / n_rows      # one row step
 
-Cell centres (north-up, row 0 = north):
+    lon(row, col) = NW.lon + (col + 0.5) * e_col.lon + (row + 0.5) * e_row.lon
+    lat(row, col) = NW.lat + (col + 0.5) * e_col.lat + (row + 0.5) * e_row.lat
+
+This works for **rotated** rectangles.  For an axis-aligned rectangle it
+reduces algebraically to the historical bbox arithmetic, because then
+``e_col = (pixel_width, 0)``, ``e_row = (0, −pixel_height)`` and
+``NW = (min_lon, max_lat)``::
+
     lon(col) = min_lon + (col + 0.5) * pixel_width
-    lat(row) = max_lat - (row + 0.5) * pixel_height
+    lat(row) = max_lat − (row + 0.5) * pixel_height
+
+The bbox / pixel fields are still populated (``pixel_width =
+(max_lon − min_lon) / n_cols`` etc.) but they are **metadata only** —
+they describe the axis-aligned bounding box of the rectangle and must
+not be used for coordinate mapping.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 
@@ -36,35 +49,91 @@ from voxcity.geoprocessor.raster.core import compute_grid_geometry
 
 @dataclass
 class GridParams:
-    """Everything needed to map between (lon, lat) and grid (row, col)."""
-    n_rows: int                  # number of rows  (N-S direction)
-    n_cols: int                  # number of columns (E-W direction)
-    min_lon: float               # western edge of rectangle
-    max_lon: float               # eastern edge
-    min_lat: float               # southern edge
-    max_lat: float               # northern edge
-    pixel_width: float           # degrees per column
-    pixel_height: float          # degrees per row
+    """Affine frame mapping (lon, lat) ↔ grid (row, col).
 
-    # ------ derived convenience ------
-    def cell_centre(self, row: int, col: int) -> Tuple[float, float]:
-        """Return (lon, lat) of a cell centre."""
-        lon = self.min_lon + (col + 0.5) * self.pixel_width
-        lat = self.max_lat - (row + 0.5) * self.pixel_height
-        return lon, lat
+    The frame is anchored at the NW vertex (the (row 0, col 0) *corner*
+    under the north-up convention) with basis vectors along the
+    rectangle's sides::
+
+        e_col = (NE − NW) / n_cols      e_row = (SW − NW) / n_rows
+
+    Rows therefore run NW→SW and columns run NW→NE, whatever the
+    rectangle's rotation.  For an axis-aligned rectangle this reduces
+    exactly to the historical bbox arithmetic.  The min/max/pixel fields
+    are retained as metadata (bounding box of the rectangle) but are no
+    longer used for mapping.
+    """
+    n_rows: int                  # number of rows (along SW→NW side)
+    n_cols: int                  # number of columns (along SW→SE side)
+    min_lon: float               # bbox: western extent
+    max_lon: float               # bbox: eastern extent
+    min_lat: float               # bbox: southern extent
+    max_lat: float               # bbox: northern extent
+    pixel_width: float           # bbox width / n_cols  (metadata)
+    pixel_height: float          # bbox height / n_rows (metadata)
+    origin_lon: float = 0.0      # NW vertex
+    origin_lat: float = 0.0
+    e_col_lon: float = 0.0       # lon/lat step per column (NW→NE / n_cols)
+    e_col_lat: float = 0.0
+    e_row_lon: float = 0.0       # lon/lat step per row    (NW→SW / n_rows)
+    e_row_lat: float = 0.0
 
     @property
     def shape(self) -> Tuple[int, int]:
         return (self.n_rows, self.n_cols)
 
+    # ------ forward mapping: (row, col) → (lon, lat) ------
+    def rowcol_to_lonlat(self, row, col):
+        """Vectorized cell-centre (lon, lat) for float (row, col)."""
+        row = np.asarray(row, dtype=np.float64)
+        col = np.asarray(col, dtype=np.float64)
+        lon = (self.origin_lon + (col + 0.5) * self.e_col_lon
+               + (row + 0.5) * self.e_row_lon)
+        lat = (self.origin_lat + (col + 0.5) * self.e_col_lat
+               + (row + 0.5) * self.e_row_lat)
+        return lon, lat
+
+    def cell_centre(self, row: int, col: int) -> Tuple[float, float]:
+        """Return (lon, lat) of a single cell centre."""
+        lon, lat = self.rowcol_to_lonlat(row, col)
+        return float(lon), float(lat)
+
+    def cell_centres(
+        self,
+        rows: Optional[np.ndarray] = None,
+        cols: Optional[np.ndarray] = None,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """(PX, PY) lon/lat arrays of cell centres.
+
+        Covers the full grid by default, or the meshgrid of the given
+        row/col index arrays.  Result shape is ``(len(rows), len(cols))``.
+        """
+        if rows is None:
+            rows = np.arange(self.n_rows)
+        if cols is None:
+            cols = np.arange(self.n_cols)
+        rr = (np.asarray(rows, dtype=np.float64) + 0.5)[:, None]
+        cc = (np.asarray(cols, dtype=np.float64) + 0.5)[None, :]
+        PX = self.origin_lon + cc * self.e_col_lon + rr * self.e_row_lon
+        PY = self.origin_lat + cc * self.e_col_lat + rr * self.e_row_lat
+        return PX, PY
+
+    # ------ inverse mapping: (lon, lat) → (row, col) ------
     def lonlat_to_rowcol(
         self,
         lon: np.ndarray,
         lat: np.ndarray,
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """Map arrays of (lon, lat) to floating-point (row, col)."""
-        col = (lon - self.min_lon) / self.pixel_width - 0.5
-        row = (self.max_lat - lat) / self.pixel_height - 0.5
+        """Map (lon, lat) to floating-point (row, col).
+
+        Inverts the affine frame with Cramer's rule on the 2×2 basis
+        ``[e_col, e_row]``.
+        """
+        det = self.e_col_lon * self.e_row_lat - self.e_col_lat * self.e_row_lon
+        dx = np.asarray(lon, dtype=np.float64) - self.origin_lon
+        dy = np.asarray(lat, dtype=np.float64) - self.origin_lat
+        col = (dx * self.e_row_lat - dy * self.e_row_lon) / det - 0.5
+        row = (-dx * self.e_col_lat + dy * self.e_col_lon) / det - 0.5
         return row, col
 
     def lonlat_to_rowcol_int(
@@ -93,6 +162,9 @@ def compute_grid_params(
     ``voxcity.geoprocessor.raster.core.compute_grid_geometry`` so this
     module can never drift from voxcity's own grid sizing.
 
+    The returned frame is affine (NW origin + side-vector basis), so
+    rotated rectangles are handled correctly.
+
     Parameters
     ----------
     rectangle_vertices : [(lon, lat), …]
@@ -110,8 +182,8 @@ def compute_grid_params(
             "compute_grid_geometry returned None for the given "
             "rectangle_vertices/meshsize (insufficient inputs)"
         )
-    # grid_size[0] is along side_1 (SW→NW, N-S → rows),
-    # grid_size[1] is along side_2 (SW→SE, E-W → cols).
+    # grid_size[0] is along side_1 (SW→NW → rows),
+    # grid_size[1] is along side_2 (SW→SE → cols).
     n_rows, n_cols = geom["grid_size"]
 
     lons = [v[0] for v in rectangle_vertices]
@@ -122,6 +194,8 @@ def compute_grid_params(
     pixel_width  = (max_lon - min_lon) / n_cols
     pixel_height = (max_lat - min_lat) / n_rows
 
+    sw, nw, ne, se = [tuple(v[:2]) for v in rectangle_vertices]
+
     return GridParams(
         n_rows=n_rows,
         n_cols=n_cols,
@@ -131,4 +205,10 @@ def compute_grid_params(
         max_lat=max_lat,
         pixel_width=pixel_width,
         pixel_height=pixel_height,
+        origin_lon=nw[0],
+        origin_lat=nw[1],
+        e_col_lon=(ne[0] - nw[0]) / n_cols,
+        e_col_lat=(ne[1] - nw[1]) / n_cols,
+        e_row_lon=(sw[0] - nw[0]) / n_rows,
+        e_row_lat=(sw[1] - nw[1]) / n_rows,
     )

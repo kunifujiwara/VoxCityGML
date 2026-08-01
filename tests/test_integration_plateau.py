@@ -8,10 +8,11 @@ directory (the one containing ``udx/``) whose coverage includes the
 target rectangle will do.
 
 The dataset-backed tests are marked ``slow`` because they parse the
-intersecting CityGML tiles and voxelize them. All three take CityGML land
-cover, so they are fully offline and deterministic and each runs in about
-ten seconds. They run by default because they are the proof the whole
-chain works; skip them explicitly with ``pytest -m "not slow"``.
+intersecting CityGML tiles and voxelize them. They all take CityGML land
+cover, so they are fully offline and deterministic, and each runs in
+roughly ten to thirty seconds. They run by default because they are the
+proof the whole chain works; skip them explicitly with
+``pytest -m "not slow"``.
 
 One test here is additionally marked ``network`` and is *deselected* by
 default (see ``[tool.pytest.ini_options]`` in ``pyproject.toml``): it is
@@ -28,6 +29,7 @@ import numpy as np
 import pytest
 
 BUILDING_CODE = -3
+TREE_CODE = -2
 
 DATASET = os.environ.get(
     "VOXCITYGML_PLATEAU_TEST_DATA",
@@ -44,7 +46,7 @@ requires_dataset = pytest.mark.skipif(
 # 2x above the LOD1 figure and about half the LOD2 figure.
 #
 # The margin used to be justified as absorbing run-to-run variation from live
-# OpenStreetMap land cover. Both dataset tests now take land cover from the
+# OpenStreetMap land cover. Every dataset test now takes land cover from the
 # CityGML dataset itself, so there is no run-to-run variation left to absorb --
 # but the threshold is unchanged, because the switch moved no geometry at all
 # (26,088 building voxels, shape (100, 100, 37), slope 0.151 both ways). Land
@@ -353,6 +355,218 @@ def test_rotated_rectangle_end_to_end(tmp_path):
     # frame and written into the 3-D voxel frame, so if the two disagree in
     # orientation the DEM covers only part of the voxel grid.
     assert ground.all(), f"{n_empty} empty columns -- frame mismatch?"
+
+
+# ---------------------------------------------------------------------------
+# Canopy re-apply on real LOD2 data
+#
+# ``reapply_canopy`` exists because the app's nDSM canopy refinement used to
+# end in ``regenerate_voxels(..., inplace=True)``, which rebuilds the whole
+# voxel grid from the 2.5-D component grids -- i.e. re-runs the LOD1
+# footprint-extrusion algorithm and destroys LOD2's mesh-voxelized roofs. The
+# two tests below are the real-data proof that the replacement does not.
+# ---------------------------------------------------------------------------
+
+# Centre of the Chuo-ku reference rectangle (PLATEAU tile 53393671), shared by
+# the end-to-end tests above. Measured: this tile carries *zero* CityGML
+# vegetation, so the mesh-vegetation mask here is all-False and every column is
+# the canopy overlay's to write -- which is what makes it the right place to
+# test LOD2 preservation and the wrong place to test vegetation preservation.
+LOD2_CENTRE = (139.7725, 35.6481)
+
+# PLATEAU ships vegetation geometry for very few areas; in this dataset the only
+# ``udx/veg`` tiles are 53393690, 53394600 and 53394611, all north of lat
+# 35.658. 53393690 spans lat 35.658-35.667 / lon 139.750-139.7625; this point is
+# the measured centroid of its vegetation meshes. A 200 m rectangle here was
+# measured to capture 118 vegetation meshes *and* 199 buildings -- both are
+# needed, since the test wants a working LOD2 model with vegetation in it.
+VEG_CENTRE = (139.75336, 35.66510)
+
+
+def _lod2_config(rect, tmp_path):
+    """The shared LOD2 config: offline, deterministic, parser exercised."""
+    from voxcitygml import VoxelizerConfig
+    return VoxelizerConfig(
+        citygml_path=DATASET,
+        rectangle_vertices=rect,
+        meshsize=2.0,
+        building_lod=2,
+        # Not "OpenStreetMap": live Overpass rate-limits after a few
+        # consecutive fetches and then stalls *indefinitely* rather than
+        # erroring, which would hang the suite. See the note above.
+        land_cover_source="CityGML",
+        canopy_height_source="Static",
+        output_dir=str(tmp_path),
+        save_output=False,
+        use_parse_cache=False,
+    )
+
+
+def _sparse_canopy(shape):
+    """A visibly different canopy: 12 m crowns on every third cell.
+
+    Deliberately not a solid field. Scattered columns land on open ground as
+    well as on buildings, so some of them can actually receive voxels (canopy
+    is only written into cells that are AIR), and the pattern is nothing like
+    the Static 10 m canopy it replaces.
+    """
+    canopy = np.zeros(shape, dtype=np.float64)
+    canopy[::3, ::3] = 12.0
+    return canopy
+
+
+@pytest.mark.slow
+@requires_dataset
+def test_reapply_canopy_preserves_lod2_roofs(tmp_path):
+    """Re-applying canopy must not flatten LOD2 geometry.
+
+    This is the guard against anyone reintroducing ``regenerate_voxels`` on
+    the LOD2 path. Measured by temporarily rewiring ``reapply_canopy`` to that
+    rebuild, on this exact rectangle:
+
+        roof slope     0.1512 -> 0.0965
+        building voxels 26,088 -> 21,623
+        grid shape (100, 100, 37) -> (100, 100, 43)
+
+    Note that 0.0965 is still *above* ``MIN_ROOF_SLOPE_FRACTION`` (0.08): the
+    rebuild extrudes from ``buildings.heights``, which on a LOD2 model was
+    rasterized per cell from the mesh and so retains a coarse staircase --
+    it is nowhere near as flat as a true LOD1 run (0.035). A threshold-style
+    assertion would therefore miss this regression entirely, which is why
+    every quantity below is pinned to *exact* equality with the pre-call
+    value instead.
+    """
+    from voxcitygml import generate_voxcity, reapply_canopy
+    from voxcitygml.voxelizer3d import TREE_CODE as PIPELINE_TREE_CODE
+    from voxcitygml.citygml.coordinates import create_rectangle
+
+    assert PIPELINE_TREE_CODE == TREE_CODE == -2
+
+    rect = create_rectangle(*LOD2_CENTRE, 200)
+    city = generate_voxcity(_lod2_config(rect, tmp_path))
+    before = city.voxels.classes
+
+    slope_before = roof_slope_fraction(before)
+    n_bldg_before = int((before == BUILDING_CODE).sum())
+    buildings_before = (before == BUILDING_CODE).copy()
+    tree_before = (before == TREE_CODE).copy()
+    n_tree_before = int(tree_before.sum())
+
+    new_canopy = _sparse_canopy(before.shape[:2])
+    reapply_canopy(city, new_canopy)
+
+    # Re-read rather than reusing the array captured above. ``reapply_canopy``
+    # edits in place, but ``regenerate_voxels(inplace=True)`` -- the regression
+    # this test exists to catch -- *rebinds* ``city.voxels`` to a freshly built
+    # grid and leaves the old array untouched. Holding the old reference would
+    # therefore make every assertion below pass on exactly that regression.
+    # Everything compared against is a copy or a scalar, so this is correct
+    # whichever way the call behaves.
+    classes = city.voxels.classes
+
+    # Measured and printed before any assertion, so a failing run reports the
+    # collapsed roof-slope number rather than stopping at the shape mismatch
+    # a rebuild also produces.
+    slope_after = roof_slope_fraction(classes)
+    n_tree_after = int((classes == TREE_CODE).sum())
+    n_bldg_after = int((classes == BUILDING_CODE).sum())
+    print(f"\nLOD2 preservation: roof slope {slope_before:.4f} -> "
+          f"{slope_after:.4f}, building voxels {n_bldg_before} -> "
+          f"{n_bldg_after}, tree voxels {n_tree_before} -> {n_tree_after}, "
+          f"grid {before.shape} -> {classes.shape}")
+
+    assert classes.shape == before.shape, (
+        f"grid was reshaped {before.shape} -> {classes.shape} -- rebuilt?")
+
+    # -- the re-apply must actually have done something ---------------------
+    # Without this the assertions below would all pass on a no-op
+    # ``reapply_canopy``, and the test would prove nothing at all.
+    assert n_tree_after != n_tree_before, (
+        f"tree voxel count unchanged at {n_tree_before} -- reapply_canopy "
+        f"did nothing, so the preservation assertions below are vacuous")
+    gained = (classes == TREE_CODE) & ~tree_before
+    assert gained.any(), "no new tree voxels anywhere -- reapply_canopy did nothing"
+    # The new crowns follow the *new* canopy, not the old one.
+    rows, cols = np.nonzero(gained.any(axis=2))
+    assert np.all(new_canopy[rows, cols] > 0), (
+        "canopy voxels appeared in columns the new canopy leaves empty")
+
+    # -- and the LOD2 geometry must be untouched ----------------------------
+    assert slope_after == pytest.approx(slope_before, abs=1e-9), (
+        f"LOD2 roof geometry changed ({slope_before:.4f} -> {slope_after:.4f})"
+        f" -- was the grid rebuilt?")
+    assert n_bldg_after == n_bldg_before
+    np.testing.assert_array_equal(classes == BUILDING_CODE, buildings_before)
+
+
+@pytest.mark.slow
+@requires_dataset
+def test_reapply_canopy_preserves_citygml_vegetation(tmp_path):
+    """CityGML vegetation crowns survive a canopy re-apply (fill-the-gaps).
+
+    CityGML vegetation is voxelized as ``TREE_CODE`` -- the same class the
+    canopy overlay writes -- so without ``extras['mesh_vegetation_mask']`` the
+    overlay's "clear the stale canopy" step would delete real mesh geometry.
+    Canopy must be written only where CityGML left nothing.
+
+    Teeth, measured by sabotaging ``reapply_canopy``: forcing the mask to
+    all-``False`` (i.e. ignoring it) moves 1,418 of the 25,000 voxels in the
+    masked columns and fails assertion 1; making the whole call a no-op leaves
+    zero unmasked columns with new canopy and fails assertion 2.
+    """
+    from voxcitygml import generate_voxcity, reapply_canopy
+    from voxcitygml.citygml.coordinates import create_rectangle
+
+    rect = create_rectangle(*VEG_CENTRE, 200)
+    city = generate_voxcity(_lod2_config(rect, tmp_path))
+    classes = city.voxels.classes
+
+    mask = city.extras["mesh_vegetation_mask"]
+    n_masked = int(mask.sum())
+    print(f"\nvegetation preservation: grid {classes.shape}, "
+          f"mesh-vegetation columns {n_masked}, "
+          f"building voxels {int((classes == BUILDING_CODE).sum())}, "
+          f"tree voxels {int((classes == TREE_CODE).sum())}")
+
+    # Loudly, first: with an empty mask every assertion below passes without
+    # exercising the preservation logic at all. If this ever trips, the
+    # rectangle stopped covering vegetation or the mask stopped being captured
+    # -- fix that, do not weaken the test.
+    assert mask.shape == classes.shape[:2], (mask.shape, classes.shape)
+    assert mask.any(), (
+        f"no mesh-vegetation columns at {VEG_CENTRE} -- this test is vacuous. "
+        f"Either extras['mesh_vegetation_mask'] is not being captured, or the "
+        f"rectangle no longer covers PLATEAU tile 53393690's vegetation.")
+    # The buildings matter too: this has to be a working LOD2 model, not just
+    # a patch of trees.
+    assert (classes == BUILDING_CODE).any(), "no buildings in the vegetation tile"
+    assert roof_slope_fraction(classes) > MIN_ROOF_SLOPE_FRACTION
+
+    before = classes.copy()
+    tree_before = before == TREE_CODE
+
+    new_canopy = _sparse_canopy(classes.shape[:2])
+    reapply_canopy(city, new_canopy)
+
+    # Re-read: see the note in the LOD2 test above -- a rebuild rebinds
+    # ``city.voxels`` rather than editing the array in place.
+    classes = city.voxels.classes
+    assert classes.shape == before.shape
+
+    # 1. Masked columns are bitwise untouched -- whole column, every class.
+    np.testing.assert_array_equal(
+        classes[mask], before[mask],
+        err_msg="CityGML vegetation columns were modified by the canopy "
+                "re-apply; the mesh-vegetation mask was ignored")
+
+    # 2. Somewhere outside the mask, canopy was written. Otherwise the mask
+    #    could simply be "everything", and preservation would be trivial.
+    gained = ((classes == TREE_CODE) & ~tree_before).any(axis=2) & ~mask
+    n_gained = int(gained.sum())
+    print(f"  unmasked columns that gained canopy: {n_gained}")
+    assert n_gained > 0, (
+        "no unmasked column received canopy -- the overlay wrote nothing, so "
+        "preservation of the masked columns proves nothing")
 
 
 # ---------------------------------------------------------------------------

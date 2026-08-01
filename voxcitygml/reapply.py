@@ -55,7 +55,13 @@ def reapply_canopy(
             north-up like ``city.voxels.classes``.  Cells ``<= 0`` get no
             canopy.
         canopy_bottom: matching crown-base heights above ground (m).  Derived
-            from ``trunk_height_ratio`` when omitted.
+            from ``trunk_height_ratio`` when omitted — and the derived array
+            is **written back onto** ``city.tree_canopy.bottom``, replacing a
+            ``None`` "unknown" marker, so the component grid describes the
+            crowns that are really in the voxel grid.  Note the consequence:
+            a later ``voxcity.generator.update`` call that revises only the
+            canopy *top* will reuse this stored bottom rather than re-deriving
+            one from the new top.
         trunk_height_ratio: crown base as a fraction of crown top, used only
             when ``canopy_bottom`` is ``None``.  Defaults to the voxelizer's
             own ratio.
@@ -141,7 +147,6 @@ def reapply_canopy(
     stale = voxel_grid == TREE_CODE
     if mask.any():
         stale &= ~mask[:, :, None]
-    n_cleared = int(np.count_nonzero(stale))
     voxel_grid[stale] = 0
 
     # -- 2. Keep the 2.5-D component grids describing the voxels ------------
@@ -155,9 +160,13 @@ def reapply_canopy(
     _apply_canopy(voxel_grid, gp, dem, canopy_top, canopy_bottom,
                   trunk_height_ratio, mesh_tree_mask=mask)
 
-    _log.info(
-        "  [reapply_canopy] cleared %d stale canopy voxels, preserved %d "
-        "mesh-vegetation column(s)", n_cleared, int(np.count_nonzero(mask)))
+    # Counting `stale` is a second full pass over the grid for a log line the
+    # caller may not even be listening to; only pay for it if they are.
+    if _log.isEnabledFor(_logging.INFO):
+        _log.info(
+            "  [reapply_canopy] cleared %d stale canopy voxels, preserved %d "
+            "mesh-vegetation column(s)",
+            int(np.count_nonzero(stale)), int(np.count_nonzero(mask)))
 
 
 def _write_through(obj, attr: str, values: np.ndarray, extras: dict,

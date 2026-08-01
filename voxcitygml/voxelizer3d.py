@@ -1482,6 +1482,11 @@ def _apply_canopy(
             re-applying canopy onto an already-populated grid must pass the
             mask captured back then: a scan would then also catch the previous
             canopy overlay and invert the fill-the-gaps rule.
+        mesh_tree_mask_out: optional dict; receives a copy of the mask under
+            the key ``"mesh_tree_mask"`` — whichever mask was used, scanned or
+            injected — on every path, including the "no canopy anywhere" early
+            return.  ``voxelize_citygml_meshes`` re-exports it to its own
+            callers as ``mesh_vegetation_mask``.
     """
     top_arr = canopy_top.astype(np.float64)
     has_tree = top_arr > 0
@@ -1491,13 +1496,14 @@ def _apply_canopy(
     # CityGML vegetation meshes; overwriting with a rectangular column would
     # destroy the spheroid/ellipsoid form, so the column fill skips them.
     #
-    # Scanned *here* — before a single canopy voxel is written, and before
-    # the "no canopy anywhere" early return below — deliberately: at this
-    # point in `voxelize_citygml_meshes` the only TREE_CODE voxels present
-    # are mesh-derived (vegetation meshes are voxelized before canopy), so
-    # this is exactly the mesh-vegetation column mask.  Recomputing it later
-    # — e.g. during a canopy re-apply onto an already-populated grid — would
-    # also pick up canopy voxels and silently invert the fill-the-gaps rule.
+    # When no mask is injected it is scanned *here* — before a single canopy
+    # voxel is written, and before the "no canopy anywhere" early return below
+    # — deliberately: at this point in `voxelize_citygml_meshes` the only
+    # TREE_CODE voxels present are mesh-derived (vegetation meshes are
+    # voxelized before canopy), so the scan is exactly the mesh-vegetation
+    # column mask.  Scanning any later — e.g. during a canopy re-apply onto an
+    # already-populated grid — would also pick up canopy voxels and silently
+    # invert the fill-the-gaps rule; that is what `mesh_tree_mask` is for.
     #
     # Naming: "tree" here is the voxel class (TREE_CODE); the caller
     # re-exports this same array as ``mesh_vegetation_mask`` after the CityGML

@@ -411,7 +411,7 @@ def test_reapply_canopy_clears_stale_canopy_outside_the_mask():
     assert grid[2, 2, 8] == TREE_CODE, "tall canopy did not reach z=8"
 
     reapply_canopy(city, np.full((4, 4), 4.0), np.zeros((4, 4)))
-    assert list(grid[2, 2, 1:2]) == [TREE_CODE]
+    assert grid[2, 2, 1] == TREE_CODE
     assert not np.any(grid[:, :, 2:] == TREE_CODE), \
         "stale canopy above the new crown was not cleared"
 
@@ -544,3 +544,126 @@ def test_reapply_canopy_honours_the_z_datum_and_terrain():
     assert not np.any(grid[0, 0, :5] == TREE_CODE)
     assert np.all(grid[0, 0, 5:9] == TREE_CODE)
     assert grid[0, 0, 9] == 0
+
+
+def test_reapply_canopy_ignores_the_placeholder_xy_bounds():
+    """The synthesised Grid3DParams' x/y bounds must never reach the overlay.
+
+    ``reapply_canopy`` is a per-column overlay, so it fills gp's x/y bounds
+    with a placeholder frame -- justified today by ``_apply_canopy`` reading
+    only ``min_z`` / ``voxel_size`` / ``n_z``.  The trap is that
+    ``Grid3DParams`` also carries ``xyz_to_indices``, the *truncating* mesh
+    mapping; a future edit reaching for it would silently get plausible wrong
+    rows/cols out of the placeholder frame rather than an error.  Poisoning
+    the bounds with NaN turns "unused" from a comment into a checked contract:
+    NaN would propagate into any index derived from them.
+    """
+    import voxcitygml.reapply as rp
+    from voxcitygml import reapply_canopy
+
+    top, bottom = np.full((4, 4), 6.0), np.zeros((4, 4))
+    reference = _seeded_grid()
+    reapply_canopy(_make_city(reference), top, bottom)
+
+    real_params = rp.Grid3DParams
+
+    def poisoned(**kwargs):
+        kwargs.update(min_x=np.nan, max_x=np.nan, min_y=np.nan, max_y=np.nan)
+        return real_params(**kwargs)
+
+    poisoned_grid = _seeded_grid()
+    try:
+        rp.Grid3DParams = poisoned
+        reapply_canopy(_make_city(poisoned_grid), top, bottom)
+    finally:
+        rp.Grid3DParams = real_params
+
+    assert np.array_equal(poisoned_grid, reference), \
+        "the canopy overlay depends on gp's x/y bounds after all"
+
+
+def test_reapply_canopy_with_zero_canopy_removes_all_of_it():
+    """An all-zero canopy must clear the overlay and leave everything else.
+
+    The 'Use nDSM for Canopy' checkbox turned off is exactly this call, and
+    it is the one path where the clear does the entire job -- ``_apply_canopy``
+    takes its "no canopy anywhere" early return and writes nothing.
+    """
+    from voxcitygml import reapply_canopy
+    from voxcitygml.voxelizer3d import GROUND_CODE, BUILDING_CODE, TREE_CODE
+
+    grid = _seeded_grid()
+    grid[1, 1, 6:8] = TREE_CODE          # a CityGML crown, must survive
+    mask = np.zeros((4, 4), dtype=bool)
+    mask[1, 1] = True
+    city = _make_city(grid, mask=mask)
+
+    reapply_canopy(city, np.full((4, 4), 8.0), np.zeros((4, 4)))
+    assert np.any(grid[2, 2] == TREE_CODE)
+
+    reapply_canopy(city, np.zeros((4, 4)), np.zeros((4, 4)))
+
+    assert np.array_equal(np.where(grid == TREE_CODE)[0], np.array([1, 1])), \
+        "only the masked mesh column may still hold TREE_CODE"
+    assert list(grid[1, 1, 6:8]) == [TREE_CODE, TREE_CODE]
+    assert np.all(grid[:, :, 0] == GROUND_CODE)
+    assert list(grid[0, 0, 1:5]) == [BUILDING_CODE] * 4
+    assert grid[3, 3, 1] == 6
+    assert np.allclose(city.tree_canopy.top, 0.0)
+
+
+def test_reapply_canopy_default_trunk_ratio_matches_the_voxelizer():
+    """Omitting both canopy_bottom and the ratio must use 11.76/19.98.
+
+    Pinned as a literal rather than by importing the constant, so the value
+    itself is under test and not merely its own definition.
+    """
+    from voxcitygml import reapply_canopy
+    from voxcitygml.voxelizer3d import TREE_CODE
+
+    city = _make_city(_seeded_grid())
+    reapply_canopy(city, np.full((4, 4), 20.0))
+
+    expected_base = 20.0 * 11.76 / 19.98          # 11.7718 m
+    assert np.allclose(city.tree_canopy.bottom, expected_base)
+    # rint(11.7718/2) = 6 .. rint(20/2) = 10, half-open -> z 6..9.
+    column = city.voxels.classes[2, 2, :]
+    assert not np.any(column[1:6] == TREE_CODE)
+    assert np.all(column[6:10] == TREE_CODE)
+    assert column[10] == 0
+
+
+def test_reapply_canopy_resamples_a_coarser_dem():
+    """A DEM at component-grid resolution is resampled onto the voxel grid."""
+    from voxcitygml import reapply_canopy
+    from voxcitygml.voxelizer3d import TREE_CODE
+
+    grid = np.zeros((4, 4, _NZ), dtype=np.int16)
+    # Flat, so the bilinear resample has an unambiguous answer: every voxel
+    # column sits on 6 m of terrain -> ground level rint(6/2) = 3.
+    city = _make_city(grid, dem=np.full((2, 2), 6.0))
+    reapply_canopy(city, np.full((4, 4), 4.0), np.zeros((4, 4)))
+
+    assert not np.any(grid[:, :, :3] == TREE_CODE)
+    assert np.all(grid[:, :, 3:5] == TREE_CODE)
+    assert not np.any(grid[:, :, 5:] == TREE_CODE)
+    # The model's own DEM must not have been resized under the caller.
+    assert city.dem.elevation.shape == (2, 2)
+
+
+def test_reapply_canopy_does_not_mutate_the_stored_mask():
+    """extras['mesh_vegetation_mask'] is an input; re-applying must not edit it."""
+    from voxcitygml import reapply_canopy
+    from voxcitygml.voxelizer3d import TREE_CODE
+
+    grid = _seeded_grid()
+    grid[1, 1, 6:8] = TREE_CODE
+    mask = np.zeros((4, 4), dtype=bool)
+    mask[1, 1] = True
+    city = _make_city(grid, mask=mask)
+    before = mask.copy()
+
+    reapply_canopy(city, np.full((4, 4), 6.0), np.zeros((4, 4)))
+
+    assert np.array_equal(mask, before)
+    assert city.extras["mesh_vegetation_mask"] is mask

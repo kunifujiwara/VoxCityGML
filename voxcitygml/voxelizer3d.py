@@ -20,7 +20,7 @@ from .citygml.coordinates import (
     swap_coordinates_3d,
     create_rectangle_frame_transformer,
 )
-from .grid_utils import _check_non_degenerate
+from .grid_utils import check_non_degenerate
 from .watertight import make_watertight_mesh
 from .terrain_solid import build_terrain_solid
 
@@ -260,7 +260,7 @@ def _compute_grid_params_3d(
     # function is module-level and takes raw vertices, so the guard travels
     # with it rather than relying on the current call order.
     _sw, _nw, _ne, _se = [tuple(v[:2]) for v in rectangle_vertices]
-    _check_non_degenerate(_sw, _nw, _ne)
+    check_non_degenerate(_sw, _nw, _ne)
 
     # Rotated local frame: the rectangle is axis-aligned in this frame, so
     # the bbox below is tight even for a rotated target rectangle.

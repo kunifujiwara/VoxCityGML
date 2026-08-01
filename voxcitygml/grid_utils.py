@@ -175,7 +175,7 @@ class GridParams:
 _MIN_SIDE_SIN = 1e-9
 
 
-def _check_non_degenerate(sw, nw, ne) -> None:
+def check_non_degenerate(sw, nw, ne) -> None:
     """Reject rectangles whose affine frame would be singular.
 
     The mapping inverts the 2×2 basis built from the side vectors NW→NE
@@ -240,7 +240,7 @@ def compute_grid_params(
     # SE is not used: the affine frame is defined by NW (origin) plus the
     # two side vectors NW→NE and NW→SW.  See the GridParams docstring.
     sw, nw, ne, _se = [tuple(v[:2]) for v in rectangle_vertices]
-    _check_non_degenerate(sw, nw, ne)
+    check_non_degenerate(sw, nw, ne)
 
     geom = compute_grid_geometry(rectangle_vertices, meshsize)
     if geom is None:

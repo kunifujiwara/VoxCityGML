@@ -160,7 +160,6 @@ class PipelineArtifacts:
     citygml_paths: List[str]
     land_cover_source: str
     canopy_height_source: str
-    dem_source: str
     dem_grid: np.ndarray
     land_cover_grid: np.ndarray
     building_height_grid: np.ndarray
@@ -169,6 +168,13 @@ class PipelineArtifacts:
     canopy_top: np.ndarray
     canopy_bottom: np.ndarray
     voxel_grid: np.ndarray
+
+    # Which DEM the pipeline actually used: "CityGML Terrain", "Flat", or a
+    # named voxcity source.  Defaulted rather than required because callers
+    # outside this package construct synthetic artifacts (e.g. VoxCityApp's
+    # frame-consumer tests), and the default is exactly the behaviour that
+    # predates ``dem_source``.
+    dem_source: str = "CityGML Terrain"
 
     # -- Facts about the 3-D grid needed to overlay revised layers onto it
     #    later (e.g. an nDSM-refined canopy) without rebuilding it.

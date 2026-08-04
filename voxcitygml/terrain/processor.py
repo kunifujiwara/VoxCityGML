@@ -136,6 +136,11 @@ def anchor_meshes_to_dem(
     replaced (the caller drops them after this).  Mutates in place.
     ``Mesh3D.vertices`` columns are (lat, lon, z).
 
+    Each mesh is shifted rigidly by a single ``dz`` sampled at its
+    centroid cell, which assumes the DEM is locally near-uniform under
+    the footprint; a long or L-shaped mesh straddling a steep gradient is
+    seated by one representative cell rather than followed exactly.
+
     Parameters
     ----------
     collection : CityGMLMeshCollection
@@ -161,6 +166,14 @@ def anchor_meshes_to_dem(
         Mesh vertices are mutated in place.
     """
     gp = compute_grid_params(rectangle_vertices, meshsize)
+    if dem_new.shape != gp.shape:
+        raise ValueError(
+            f"dem_new shape {dem_new.shape} does not match the grid "
+            f"{gp.shape} implied by rectangle_vertices/meshsize")
+    if dem_citygml is not None and dem_citygml.shape != gp.shape:
+        raise ValueError(
+            f"dem_citygml shape {dem_citygml.shape} does not match the "
+            f"grid {gp.shape}")
     for meshes in (collection.buildings, collection.bridges,
                    collection.vegetation):
         for m in meshes:

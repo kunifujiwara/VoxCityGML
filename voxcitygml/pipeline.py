@@ -36,7 +36,11 @@ from .models import (
 from .citygml.parser import parse_citygml_directory, merge_terrain_meshes
 
 # Component processors
-from .terrain.processor import terrain_meshes_to_dem_grid
+from .terrain.processor import (
+    terrain_meshes_to_dem_grid,
+    dem_grid_from_named_source,
+    anchor_meshes_to_dem,
+)
 from .landcover.processor import get_land_cover_grid
 from .buildings.processor import meshes_to_building_grids
 from .canopy.processor import get_canopy_grids
@@ -107,6 +111,7 @@ class VoxCityGML:
                 "citygml_paths": art.citygml_paths,
                 "land_cover_source": art.land_cover_source,
                 "canopy_height_source": art.canopy_height_source,
+                "dem_source": art.dem_source,
                 "citygml_collection": art.collection,
                 "voxel_min_z": art.voxel_min_z,
                 # Pairs with voxels.classes, so it converts with it.
@@ -154,6 +159,7 @@ class PipelineArtifacts:
     citygml_paths: List[str]
     land_cover_source: str
     canopy_height_source: str
+    dem_source: str
     dem_grid: np.ndarray
     land_cover_grid: np.ndarray
     building_height_grid: np.ndarray
@@ -181,6 +187,62 @@ class PipelineArtifacts:
     # always populates this with a real array (all-False on the legacy path),
     # so consumers of run_core's artifacts need no None branch.
     mesh_vegetation_mask: Optional[np.ndarray] = None
+
+
+def _resolve_dem_step(cfg, collection, rectangle):
+    """Step 2 of the pipeline: produce the (north-up) DEM grid.
+
+    Returns ``(dem_grid, effective_dem_source)``.
+
+    ``dem_source`` semantics (``None`` == "CityGML Terrain"):
+
+    * CityGML Terrain — existing behaviour: interpolate the TINRelief
+      terrain meshes (``dem_path`` GeoTIFFs arrive as terrain meshes via
+      the parser, so they are covered too);
+    * Flat — all-zeros DEM; buildings are re-seated on the plane and the
+      terrain meshes are dropped so the voxelizer fills ground from the
+      DEM instead of the TIN solid;
+    * anything else — a voxcity named source (FABDEM, GSI DEM Japan, …),
+      fetched via ``voxcity.generator.grids.get_dem_grid``; buildings are
+      re-anchored and terrain meshes dropped, as for Flat.
+    """
+    from .grid_utils import compute_grid_params
+    gp = compute_grid_params(rectangle, cfg.meshsize)
+
+    dem_source = getattr(cfg, "dem_source", None)
+    if dem_source in (None, "CityGML Terrain"):
+        print("\n[2/5] Creating DEM grid from terrain TIN...")
+        return (
+            terrain_meshes_to_dem_grid(collection.terrain, rectangle,
+                                       cfg.meshsize),
+            "CityGML Terrain",
+        )
+
+    # Replacement DEM: keep the CityGML DEM as the anchoring reference
+    # (None when the dataset ships no terrain), then swap in the new grid.
+    dem_citygml = None
+    if collection.terrain:
+        dem_citygml = terrain_meshes_to_dem_grid(
+            collection.terrain, rectangle, cfg.meshsize)
+
+    if dem_source == "Flat":
+        print("\n[2/5] Using flat DEM (dem_source='Flat')...")
+        dem_grid = np.zeros(gp.shape, dtype=np.float64)
+    else:
+        print(f"\n[2/5] Fetching DEM from named source: {dem_source}...")
+        dem_grid = dem_grid_from_named_source(
+            rectangle, cfg.meshsize, dem_source, cfg.output_dir,
+            dem_interpolation=getattr(cfg, "dem_interpolation", None),
+        )
+        if dem_grid.shape != gp.shape:
+            dem_grid = _resize_float_grid(dem_grid, *gp.shape)
+
+    anchor_meshes_to_dem(collection, dem_citygml, dem_grid, rectangle,
+                         cfg.meshsize)
+    # The old terrain must not be voxelized as a solid — ground now comes
+    # from the replacement DEM (per-column fill in the voxelizer).
+    collection.terrain = []
+    return dem_grid, dem_source
 
 
 def run_core(cfg: VoxelizerConfig) -> PipelineArtifacts:
@@ -223,6 +285,8 @@ def run_core(cfg: VoxelizerConfig) -> PipelineArtifacts:
     print(f"  Voxel size:         {cfg.meshsize} m")
     print(f"  Land cover source:  {land_cover_source}")
     print(f"  Canopy source:      {canopy_height_source}")
+    if getattr(cfg, "dem_source", None) not in (None, "CityGML Terrain"):
+        print(f"  DEM source:         {cfg.dem_source}")
     if cfg.building_lod is not None:
         print(f"  Building LOD:       {cfg.building_lod}")
     print("=" * 60)
@@ -265,10 +329,8 @@ def run_core(cfg: VoxelizerConfig) -> PipelineArtifacts:
         collection.bridges = []
 
     # -- Step 2: DEM --------------------------------------------------
-    print("\n[2/5] Creating DEM grid from terrain TIN...")
-    dem_grid = terrain_meshes_to_dem_grid(
-        collection.terrain, rectangle, cfg.meshsize,
-    )
+    dem_grid, effective_dem_source = _resolve_dem_step(
+        cfg, collection, rectangle)
     print(f"  DEM grid shape: {dem_grid.shape}, "
           f"elevation range: [{dem_grid.min():.1f}, {dem_grid.max():.1f}] m")
     if cfg.gridvis:
@@ -367,6 +429,7 @@ def run_core(cfg: VoxelizerConfig) -> PipelineArtifacts:
         citygml_paths=citygml_paths,
         land_cover_source=land_cover_source,
         canopy_height_source=canopy_height_source,
+        dem_source=effective_dem_source,
         dem_grid=dem_grid,
         land_cover_grid=land_cover_grid,
         building_height_grid=building_height_grid,

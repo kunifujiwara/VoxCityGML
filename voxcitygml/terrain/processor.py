@@ -152,3 +152,25 @@ def _barycentric(xy: np.ndarray, tri_verts: np.ndarray,
     w = 1.0 - u - v
 
     return np.column_stack([w, u, v])
+
+
+def dem_grid_from_named_source(
+    rectangle_vertices: List[Tuple[float, float]],
+    meshsize: float,
+    dem_source: str,
+    output_dir: str,
+    dem_interpolation: Optional[bool] = None,
+) -> np.ndarray:
+    """Fetch a named DEM source via voxcity, returned **north-up**.
+
+    ``voxcity.generator.grids.get_dem_grid`` produces grids in voxcity's
+    south-up row order; everything inside voxcitygml is north-up, so the
+    result is flipped (and copied — downstream numba/taichi consumers
+    degrade on non-contiguous views).
+    """
+    from voxcity.generator.grids import get_dem_grid
+    dem_south_up = get_dem_grid(
+        rectangle_vertices, meshsize, dem_source, output_dir,
+        dem_interpolation=dem_interpolation, gridvis=False,
+    )
+    return np.flipud(np.asarray(dem_south_up, dtype=np.float64)).copy()

@@ -249,3 +249,24 @@ def test_resolve_dem_step_named_source_resizes_mismatched_grid_even_without_city
     assert effective == "FABDEM"
     assert dem.shape == gp.shape
     assert coll.terrain == []
+
+
+def test_grid_params_3d_zbounds_include_dem_range():
+    from voxcitygml.voxelizer3d import _compute_grid_params_3d
+
+    # One building well above the DEM floor.
+    bldg = _box_mesh(35.648, 139.7725, 30.0, 40.0)
+    coll = CityGMLMeshCollection(buildings=[bldg])
+    center_lon = (RECT[0][0] + RECT[2][0]) / 2
+    center_lat = (RECT[0][1] + RECT[2][1]) / 2
+
+    without_dem, _ = _compute_grid_params_3d(
+        [list(v) for v in RECT], center_lon, center_lat, 5.0, coll)
+    dem = np.full((4, 4), -8.0)  # river valley below every building
+    with_dem, _ = _compute_grid_params_3d(
+        [list(v) for v in RECT], center_lon, center_lat, 5.0, coll,
+        dem_grid=dem)
+
+    assert without_dem.min_z > -8.0          # meaningful baseline
+    assert with_dem.min_z <= -8.0            # DEM floor is inside the grid
+    assert with_dem.max_z == without_dem.max_z

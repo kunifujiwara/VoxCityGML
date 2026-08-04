@@ -36,6 +36,7 @@ from .models import (
 from .citygml.parser import parse_citygml_directory, merge_terrain_meshes
 
 # Component processors
+from .grid_utils import compute_grid_params
 from .terrain.processor import (
     terrain_meshes_to_dem_grid,
     dem_grid_from_named_source,
@@ -192,6 +193,9 @@ class PipelineArtifacts:
 def _resolve_dem_step(cfg, collection, rectangle):
     """Step 2 of the pipeline: produce the (north-up) DEM grid.
 
+    Mutates ``collection`` in the replacement paths: meshes are
+    re-anchored and ``collection.terrain`` is cleared.
+
     Returns ``(dem_grid, effective_dem_source)``.
 
     ``dem_source`` semantics (``None`` == "CityGML Terrain"):
@@ -206,7 +210,6 @@ def _resolve_dem_step(cfg, collection, rectangle):
       fetched via ``voxcity.generator.grids.get_dem_grid``; buildings are
       re-anchored and terrain meshes dropped, as for Flat.
     """
-    from .grid_utils import compute_grid_params
     gp = compute_grid_params(rectangle, cfg.meshsize)
 
     dem_source = getattr(cfg, "dem_source", None)

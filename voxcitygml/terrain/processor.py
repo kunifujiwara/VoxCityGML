@@ -70,6 +70,130 @@ def terrain_meshes_to_dem_grid(
     return dem_grid
 
 
+def dem_grid_from_named_source(
+    rectangle_vertices: List[Tuple[float, float]],
+    meshsize: float,
+    dem_source: str,
+    output_dir: str,
+    dem_interpolation: Optional[bool] = None,
+) -> np.ndarray:
+    """Fetch a named DEM source via voxcity, returned **north-up**.
+
+    ``voxcity.generator.grids.get_dem_grid`` produces grids in voxcity's
+    south-up row order; everything inside voxcitygml is north-up, so the
+    result is flipped (and copied — downstream numba/taichi consumers
+    degrade on non-contiguous views).
+
+    Parameters
+    ----------
+    rectangle_vertices : list[(lon, lat)]
+        Target rectangle [SW, NW, NE, SE].
+    meshsize : float
+        Grid resolution in metres.
+    dem_source : str
+        Named DEM source recognised by ``voxcity.generator.grids.get_dem_grid``
+        (e.g. "FABDEM").
+    output_dir : str
+        Directory voxcity may use for caching/intermediate downloads.
+    dem_interpolation : bool, optional
+        Forwarded to ``get_dem_grid`` to control interpolation of gaps.
+
+    Returns
+    -------
+    np.ndarray
+        2-D float64 array, shape ``(n_rows, n_cols)``, in *north-up*
+        orientation (row 0 = north), C-contiguous.
+    """
+    from voxcity.generator.grids import get_dem_grid
+    dem_south_up = get_dem_grid(
+        rectangle_vertices, meshsize, dem_source, output_dir,
+        dem_interpolation=dem_interpolation, gridvis=False,
+    )
+    return np.flipud(np.asarray(dem_south_up, dtype=np.float64)).copy()
+
+
+def anchor_meshes_to_dem(
+    collection,
+    dem_citygml: Optional[np.ndarray],
+    dem_new: np.ndarray,
+    rectangle_vertices: List[Tuple[float, float]],
+    meshsize: float,
+) -> None:
+    """Vertically re-seat building/bridge/vegetation meshes on ``dem_new``.
+
+    CityGML meshes carry absolute elevations consistent with the CityGML
+    terrain.  When the DEM is replaced (``dem_source`` = "Flat" or a named
+    source), every mesh is shifted so its position relative to the ground
+    is preserved:
+
+    * with a CityGML terrain reference (``dem_citygml``):
+      ``dz = dem_new - dem_citygml`` sampled at the mesh centroid cell —
+      exact relative preservation, immune to vertical-datum mismatches;
+    * without one (``dem_citygml is None``): the mesh base is seated on
+      the new DEM, ``dz = dem_new - min(z)``.
+
+    Terrain meshes are never shifted — they are the geometry being
+    replaced (the caller drops them after this).  Mutates in place.
+    ``Mesh3D.vertices`` columns are (lat, lon, z).
+
+    Each mesh is shifted rigidly by a single ``dz`` sampled at its
+    centroid cell, which assumes the DEM is locally near-uniform under
+    the footprint; a long or L-shaped mesh straddling a steep gradient is
+    seated by one representative cell rather than followed exactly.
+
+    Parameters
+    ----------
+    collection : CityGMLMeshCollection
+        Mesh collection to re-seat in place. ``collection.buildings``,
+        ``collection.bridges`` and ``collection.vegetation`` are shifted;
+        ``collection.terrain`` is left untouched.
+    dem_citygml : np.ndarray or None
+        North-up DEM grid derived from the CityGML terrain meshes
+        (``terrain_meshes_to_dem_grid``), or ``None`` if the CityGML
+        dataset ships no terrain.
+    dem_new : np.ndarray
+        North-up DEM grid the meshes are being re-seated onto.
+    rectangle_vertices : list[(lon, lat)]
+        Target rectangle [SW, NW, NE, SE] — must match the grid the two
+        DEM arrays were built on.
+    meshsize : float
+        Grid resolution in metres — must match the grid the two DEM
+        arrays were built on.
+
+    Returns
+    -------
+    None
+        Mesh vertices are mutated in place.
+    """
+    gp = compute_grid_params(rectangle_vertices, meshsize)
+    if dem_new.shape != gp.shape:
+        raise ValueError(
+            f"dem_new shape {dem_new.shape} does not match the grid "
+            f"{gp.shape} implied by rectangle_vertices/meshsize")
+    if dem_citygml is not None and dem_citygml.shape != gp.shape:
+        raise ValueError(
+            f"dem_citygml shape {dem_citygml.shape} does not match the "
+            f"grid {gp.shape}")
+    for meshes in (collection.buildings, collection.bridges,
+                   collection.vegetation):
+        for m in meshes:
+            if len(m.vertices) == 0:
+                continue
+            lat = float(np.mean(m.vertices[:, 0]))
+            lon = float(np.mean(m.vertices[:, 1]))
+            row, col = gp.lonlat_to_rowcol_int(lon, lat)  # clipped to grid
+            r, c = int(row), int(col)
+            if dem_citygml is not None:
+                dz = float(dem_new[r, c]) - float(dem_citygml[r, c])
+            else:
+                dz = float(dem_new[r, c]) - float(np.min(m.vertices[:, 2]))
+            m.vertices[:, 2] += dz
+
+
+# -----------------------------------------------------------------------
+# Internal helpers
+# -----------------------------------------------------------------------
+
 def _collect_terrain_points(meshes: List[Mesh3D]) -> np.ndarray:
     """Merge terrain vertices and swap to (lon, lat, z)."""
     parts = []

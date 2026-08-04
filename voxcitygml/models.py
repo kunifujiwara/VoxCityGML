@@ -196,6 +196,15 @@ class VoxelizerConfig:
         dem_path: Optional path to a GeoTIFF DEM/DTM file.  Used as terrain
                   source when the CityGML dataset does not include TINRelief
                   geometry (common for German / European datasets).
+        dem_source: DEM source selection.  ``None`` or ``"CityGML Terrain"``
+                  keeps the existing behaviour (TINRelief terrain, with the
+                  ``dem_path`` GeoTIFF fallback).  ``"Flat"`` uses an
+                  all-zeros DEM and re-seats buildings on it.  Any other
+                  name (e.g. ``"FABDEM"``, ``"GSI DEM Japan"``) is fetched
+                  via ``voxcity.generator.grids.get_dem_grid`` and buildings
+                  are re-anchored onto it.
+        dem_interpolation: Forwarded to ``get_dem_grid`` for named
+                  ``dem_source`` values.  Ignored otherwise.
         gee_project: Optional Google Earth Engine cloud project ID
                      (e.g. ``'my-gee-project'``).  Passed to
                      ``ee.Initialize(project=...)``.  Required for GEE-based
@@ -239,6 +248,8 @@ class VoxelizerConfig:
     occupancy_subdivisions: int = 3
     building_lod: Optional[int] = None
     dem_path: Optional[str] = None
+    dem_source: Optional[str] = None
+    dem_interpolation: Optional[bool] = None
     tree_citygml_path: Optional[str] = None
     terrain_underground_depth: float = 0.0
     include_bridges: bool = True

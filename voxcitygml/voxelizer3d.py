@@ -188,6 +188,7 @@ def voxelize_citygml_meshes(
         meshsize,
         collection,
         underground_depth=underground_depth,
+        dem_grid=dem_grid,
     )
 
     voxel_grid = _allocate_voxel_grid(gp, max_voxel_ram_mb=max_voxel_ram_mb)
@@ -302,6 +303,7 @@ def _compute_grid_params_3d(
     meshsize: float,
     collection: CityGMLMeshCollection,
     underground_depth: float = 0.0,
+    dem_grid: Optional[np.ndarray] = None,
 ) -> Tuple[Grid3DParams, object]:
     # Degenerate input would make theta = atan2(0, 0) = 0.0 and silently
     # produce a 1-cell garbage grid.  The 2-D `compute_grid_params` applies
@@ -335,6 +337,13 @@ def _compute_grid_params_3d(
     else:
         z_min = 0.0
         z_max = meshsize
+
+    # A replacement DEM (dem_source="Flat"/named) is no longer represented
+    # by terrain meshes, so its range must widen the bounds directly —
+    # otherwise low-lying DEM cells clip below the grid and leave holes.
+    if dem_grid is not None and dem_grid.size:
+        z_min = min(z_min, float(np.min(dem_grid)))
+        z_max = max(z_max, float(np.max(dem_grid)))
 
     z_min -= meshsize
     z_max += meshsize

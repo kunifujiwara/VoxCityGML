@@ -133,6 +133,7 @@ def test_run_and_export_uses_resolved_center(monkeypatch, tmp_path):
         citygml_paths=[str(tmp_path)],
         land_cover_source='OpenStreetMap',
         canopy_height_source='Static',
+        dem_source='CityGML Terrain',
         dem_grid=np.zeros((10, 10)),
         land_cover_grid=np.zeros((10, 10), dtype=np.int32),
         building_height_grid=np.zeros((10, 10)),

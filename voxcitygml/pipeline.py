@@ -43,9 +43,12 @@ from .terrain.processor import (
     anchor_meshes_to_dem,
 )
 from .landcover.processor import get_land_cover_grid
-from .buildings.processor import meshes_to_building_grids
+from .buildings.processor import (
+    fill_building_id_gaps,
+    meshes_to_building_grids,
+)
 from .canopy.processor import get_canopy_grids
-from .voxelizer3d import voxelize_citygml_meshes
+from .voxelizer3d import BUILDING_CODE, voxelize_citygml_meshes
 
 
 def _to_south_up(arr):
@@ -408,6 +411,19 @@ def run_core(cfg: VoxelizerConfig) -> PipelineArtifacts:
         # looks valid.
         voxel_min_z = float(vox_info["voxel_min_z"])
         mesh_vegetation_mask = vox_info["mesh_vegetation_mask"]
+
+        # Reconcile the two independent rasterisations of the same meshes.
+        # meshes_to_building_grids claims a cell on a centre-inside-triangle
+        # test; the voxeliser above marks every voxel the mesh touches, so its
+        # footprint is up to a cell wider. Without this, every consumer that
+        # intersects the two -- per-building highlighting, landmark marking,
+        # per-building statistics, carve/delete -- silently drops that fringe
+        # (7.5% of building columns at 2 m, 14.9% at 5 m on real PLATEAU LoD2).
+        # Done here rather than inside meshes_to_building_grids because this is
+        # the first point where both grids exist, and both are still north-up.
+        building_id_grid = fill_building_id_gaps(
+            building_id_grid, voxel_grid, building_code=BUILDING_CODE,
+        )
     else:
         from voxcity.generator.voxelizer import Voxelizer
         voxelizer = Voxelizer(

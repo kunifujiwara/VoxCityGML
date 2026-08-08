@@ -173,3 +173,49 @@ def test_flipped_arrays_are_contiguous(lod2_city):
 def test_land_cover_is_not_flipped(lod2_city, lod2_artifacts):
     assert np.array_equal(lod2_city.land_cover.classes,
                           lod2_artifacts.land_cover_grid)
+
+
+def test_every_building_column_carries_an_id(lod2_city):
+    """``buildings.ids`` must name an owner for every column the voxeliser
+    filled with building voxels.
+
+    The id grid and the voxel grid are built by independent rasterisations of
+    the same meshes -- a centre-inside-triangle test versus an any-touch shell
+    plus interior fill -- so the id footprint used to be up to a cell narrower
+    on every side. Consumers that intersect the two (per-building
+    highlighting, landmark marking, per-building statistics, carve/delete)
+    dropped that fringe silently: measured at 7.5% of building columns on this
+    dataset at 2 m and 14.9% at 5 m. ``fill_building_id_gaps`` in
+    ``pipeline.run_core`` reconciles them.
+
+    This is the wiring test for that call. The unit tests in
+    ``test_building_id_voxel_gaps`` pin the helper's behaviour; only a real
+    pipeline run proves it is actually invoked, and on which grid.
+    """
+    from tests.test_integration_plateau import BUILDING_CODE
+
+    city = lod2_city
+    has_building = (city.voxels.classes == BUILDING_CODE).any(axis=2)
+    ids = np.asarray(city.buildings.ids)
+    assert has_building.shape == ids.shape
+
+    n_building = int(has_building.sum())
+    assert n_building > 0, "fixture has no buildings; test is vacuous"
+
+    orphaned = has_building & (ids <= 0)
+    n_orphaned = int(orphaned.sum())
+    assert n_orphaned == 0, (
+        f"{n_orphaned} of {n_building} building columns "
+        f"({100.0 * n_orphaned / n_building:.1f}%) have building voxels but no "
+        f"building id, so nothing can highlight, mark or measure them"
+    )
+
+    # The converse must NOT hold: a cell may legitimately carry an id with no
+    # building voxels of its own (a mesh whose whole volume fell below the
+    # occupancy threshold). Asserting symmetry here would be wrong, so this
+    # only records the count -- if it ever grows large it means the id grid is
+    # claiming ground the voxeliser disagrees with.
+    idless_voxels = int((~has_building & (ids > 0)).sum())
+    assert idless_voxels <= n_building, (
+        f"{idless_voxels} cells carry a building id with no building voxels, "
+        f"against {n_building} that do -- the two grids have diverged")

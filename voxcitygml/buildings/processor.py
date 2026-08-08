@@ -241,3 +241,79 @@ def meshes_to_building_grids(
     n_occupied = np.count_nonzero(building_height_grid)
     print(f"  {n_occupied} grid cells contain building/bridge data")
     return building_height_grid, building_min_height_grid, building_id_grid
+
+
+def fill_building_id_gaps(
+    building_id_grid: np.ndarray,
+    voxel_grid: np.ndarray,
+    building_code: int = -3,
+) -> np.ndarray:
+    """Extend ``building_id_grid`` to every column the voxeliser filled.
+
+    The two grids are built by independent rasterisations of the same meshes.
+    ``meshes_to_building_grids`` above claims a cell only when the cell
+    *centre* passes a barycentric inside-triangle test, whereas
+    ``voxelizer3d.voxelize_citygml_meshes`` marks every voxel the mesh
+    *touches* -- an SAT any-touch surface shell unioned with an SDF/winding
+    interior fill. The 3-D footprint is therefore up to one cell wider on each
+    side, and two smaller rules here widen the gap further: a cell whose mesh
+    does not rise above the DEM is skipped entirely (``h_max <= 0``), and a
+    contested cell goes to the *tallest* mesh alone.
+
+    Anything that intersects the two grids -- per-building highlighting,
+    landmark marking, per-building surface statistics, carve/delete -- drops
+    that fringe silently. On real PLATEAU LoD2 tiles it is 7.5% of building
+    columns at 2 m and 14.9% at 5 m, and 30-45% for small buildings.
+
+    Every dropped column is adjacent to a claimed one (measured: a pure
+    1-cell fringe, no interior holes), so propagating the nearest claimed id
+    recovers it -- to 0.04% residual at 2 m and 0.8% at 5 m. The residual is
+    irreducible here: one id per cell cannot name both owners of a column two
+    buildings share.
+
+    Columns with no building voxels are left at 0, so a building never
+    acquires ground it has no voxels in.
+
+    Both grids must be in the same orientation and share their first two axes;
+    in ``pipeline.run_core`` both are north-up before assembly flips them.
+
+    Parameters
+    ----------
+    building_id_grid : (R, C) int array
+        Per-cell building id, ``0`` meaning unclaimed.
+    voxel_grid : (R, C, Z) array
+        The 3-D voxel grid whose ``building_code`` columns define coverage.
+    building_code : int
+        Voxel class marking a building (also used for bridges).
+
+    Returns
+    -------
+    (R, C) array, same dtype as *building_id_grid* -- a copy; the input is
+    never mutated.
+    """
+    from scipy.ndimage import distance_transform_edt
+
+    if voxel_grid.shape[:2] != building_id_grid.shape:
+        raise ValueError(
+            "building_id_grid and voxel_grid must share their first two axes; "
+            f"got {building_id_grid.shape} and {voxel_grid.shape[:2]}. These "
+            "grids come from separately-computed frames, so a mismatch would "
+            "mis-attribute every column rather than a few."
+        )
+
+    has_id = building_id_grid > 0
+    # No source to propagate from. scipy's returned indices are meaningless
+    # when the background is empty, so filling here would fabricate ids.
+    if not has_id.any():
+        return building_id_grid.copy()
+
+    needs_id = np.any(voxel_grid == building_code, axis=2) & ~has_id
+    if not needs_id.any():
+        return building_id_grid.copy()
+
+    # For every unclaimed cell, the (row, col) of the nearest claimed one.
+    _distances, indices = distance_transform_edt(~has_id, return_indices=True)
+
+    out = building_id_grid.copy()
+    out[needs_id] = building_id_grid[indices[0][needs_id], indices[1][needs_id]]
+    return out

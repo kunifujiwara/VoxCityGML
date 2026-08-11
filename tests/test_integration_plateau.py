@@ -42,19 +42,41 @@ requires_dataset = pytest.mark.skipif(
     reason="local PLATEAU dataset not available",
 )
 
-# Measured on the reference rectangle below (Chuo-ku, 200 m, 2 m voxels):
-# LOD2 scores 0.151, LOD1 scores 0.035. 0.08 sits between the two, more than
-# 2x above the LOD1 figure and about half the LOD2 figure.
+# Recalibrated 2026-08-11 for the voxelizer-alignment fix (see
+# docs/superpowers/specs/2026-08-11-voxelizer-alignment-fix-design.md).
+# Buildings now voxelize via a grid-aligned winding SDF on the raw mesh, with
+# the surface shell kept only at >= 0.5 occupancy (surface-contact) instead
+# of > 0.0 (any-corner-contact). That drops boundary cells that are less than
+# half inside the mesh -- notably the single lone roof-skin face at a ridge
+# or eave, which typically covers about 9 of the 27 sub-cells SAT samples
+# (9/27 ~= 0.33 occupancy) and used to be kept at threshold 0 but is dropped
+# at 0.5. Those dropped skin cells were exactly the single-voxel roof steps
+# this metric counts, so the metric's absolute scale fell even though it
+# still separates LOD2 from LOD1 by a comparable ratio -- the envelope is
+# tighter and more accurate (round-to-nearest instead of round-up), not
+# flatter.
 #
-# The margin used to be justified as absorbing run-to-run variation from live
-# OpenStreetMap land cover. Every dataset test now takes land cover from the
-# CityGML dataset itself, so there is no run-to-run variation left to absorb --
-# but the threshold is unchanged, because the switch moved no geometry at all
-# (26,088 building voxels, shape (100, 100, 37), slope 0.151 both ways). Land
-# cover only labels the topmost terrain voxels; it never touches building
-# geometry, which is what this metric measures. The margin now buys headroom
-# against dataset and voxelizer changes instead.
-MIN_ROOF_SLOPE_FRACTION = 0.08
+# Measured on the reference rectangle (Chuo-ku, 200 m, 2 m voxels) and its
+# 30 deg-rotated counterpart (200 m x 150 m), both post-fix:
+#   unrotated LOD2: n=22,100 building voxels, slope=0.0741
+#   unrotated LOD1: n=21,178 building voxels, slope=0.0163
+#   rotated30 LOD2: n=16,081 building voxels, slope=0.0594
+#   rotated30 LOD1: n=15,219 building voxels, slope=0.0093
+#
+# The worst case across rotation is the higher of the two LOD1 figures
+# (unrotated, 0.0163) and the lower of the two LOD2 figures (rotated,
+# 0.0594) -- the pairing that leaves the least room for a threshold in
+# between. 0.03 sits inside that gap with margin on both sides:
+#   0.03 / 0.0163 = 1.84x above the worst LOD1 figure
+#   0.0594 / 0.03 = 1.98x below the worst LOD2 figure
+# matching the old calibration's asymmetric-but->=1.8x-both-ways balance.
+#
+# Land cover still does not affect this: it only labels the topmost terrain
+# voxels and never touches building geometry, which is all this metric
+# measures. Every dataset test takes land cover from the CityGML dataset
+# itself, so there is no run-to-run variation to absorb; the margin buys
+# headroom against dataset and voxelizer changes instead.
+MIN_ROOF_SLOPE_FRACTION = 0.03
 
 
 def roof_slope_fraction(classes: np.ndarray) -> float:
@@ -189,7 +211,7 @@ def test_lod2_generate_voxcity_end_to_end(tmp_path):
     assert np.any(heights > 0)
 
     # The feature's central claim: LOD2 gives true roof geometry, not a flat
-    # extrusion. Re-running this config at building_lod=1 scores 0.035, so a
+    # extrusion. Re-running this config at building_lod=1 scores 0.0163, so a
     # regression that quietly rebuilt the grid from the 2.5-D height grids
     # (as nDSM canopy refinement once did on the app side) fails here.
     assert slope > MIN_ROOF_SLOPE_FRACTION, (
@@ -301,10 +323,13 @@ def test_rotated_rectangle_end_to_end(tmp_path):
     # NOTE on what each assertion below actually catches. Reverting
     # ``_compute_grid_params_3d`` to the unrotated ``create_local_transformer``
     # was measured to give shape (115, 124, 37) -- caught by the shape
-    # assertion -- while roof slope (0.150) and empty columns (0) were
-    # *unaffected*. Those two are LOD2-quality and coverage guards, not
-    # frame guards. The frame guard with teeth beyond shape is the 2-D/3-D
-    # footprint IoU below.
+    # assertion -- while roof slope and empty columns (0) were *unaffected*
+    # (roof slope on this rectangle is now ~0.0594 post-2026-08-11 alignment
+    # fix -- see the MIN_ROOF_SLOPE_FRACTION comment above for how that
+    # figure was recalibrated; the frame-reversion side-experiment itself
+    # was not re-run under the new voxelizer). Those two are LOD2-quality
+    # and coverage guards, not frame guards. The frame guard with teeth
+    # beyond shape is the 2-D/3-D footprint IoU below.
 
     # Grid dims follow the rectangle's own sides, not the bbox of its corners
     # in an unrotated frame -- which at 30 deg spans 200*cos30 + 150*sin30 =
@@ -314,10 +339,11 @@ def test_rotated_rectangle_end_to_end(tmp_path):
     assert abs(classes.shape[0] - 75) <= 2, classes.shape
     assert abs(classes.shape[1] - 100) <= 2, classes.shape
 
-    # Measured 19,872 here vs 17,952 for the same rectangle at rotation 0 --
-    # the 10% spread is different ground being covered, not a frame error.
-    # The bound is deliberately loose: it only has to reject "the rotated
-    # frame landed the buildings outside the grid".
+    # Measured 16,081 here vs 15,192 for the same rectangle at rotation 0
+    # (both post-2026-08-11 alignment fix) -- the ~6% spread is different
+    # ground being covered, not a frame error. The bound is deliberately
+    # loose: it only has to reject "the rotated frame landed the buildings
+    # outside the grid".
     assert n_building > 1000, f"too few building voxels: {n_building}"
 
     # The two frames agree on real geometry, not just on grid dimensions.
@@ -341,12 +367,15 @@ def test_rotated_rectangle_end_to_end(tmp_path):
         f"2-D/3-D building footprint IoU {iou:.3f} -- the rasterized grids "
         f"and the voxel grid disagree about where the buildings are")
 
-    # True LOD2 roofs survive rotation. Measured on this exact rectangle:
-    #   rotation 30, LOD2 -> 0.145   (this test)
-    #   rotation  0, LOD2 -> 0.161   (rotation costs ~10%, not the metric)
-    #   rotation 30, LOD1 -> 0.032   (flat extrusion, as expected)
-    # so the 0.08 threshold still sits between the two with 1.8x / 2.5x of
-    # margin either side after rotation.
+    # True LOD2 roofs survive rotation. Measured on this exact rectangle,
+    # post-2026-08-11 alignment fix (shell threshold 0.5):
+    #   rotation 30, LOD2 -> 0.0594   (this test)
+    #   rotation  0, LOD2 -> 0.0819   (rotation costs ~27%, not the metric)
+    #   rotation 30, LOD1 -> 0.0093   (flat extrusion, as expected)
+    # so the 0.03 threshold still sits between the two: 1.98x margin below
+    # the LOD2 figure here, 3.23x above the LOD1 figure here. The tighter
+    # global margin (1.84x) comes from the *unrotated* LOD1 figure -- see
+    # the MIN_ROOF_SLOPE_FRACTION comment above for the full calibration.
     assert slope > MIN_ROOF_SLOPE_FRACTION, (
         f"roof slope {slope:.4f} <= {MIN_ROOF_SLOPE_FRACTION} -- LOD2 geometry "
         f"missing, or the rotated frame mis-binned the roof columns")
@@ -430,16 +459,23 @@ def test_reapply_canopy_preserves_lod2_roofs(tmp_path):
 
     This is the guard against anyone reintroducing ``regenerate_voxels`` on
     the LOD2 path. Measured by temporarily rewiring ``reapply_canopy`` to that
-    rebuild, on this exact rectangle:
+    rebuild, on this exact rectangle, post-2026-08-11 alignment fix:
 
-        roof slope     0.1512 -> 0.0965
-        building voxels 26,088 -> 21,623
+        roof slope     0.0741 -> 0.0965
+        building voxels 22,100 -> 21,623
         grid shape (100, 100, 37) -> (100, 100, 43)
 
-    Note that 0.0965 is still *above* ``MIN_ROOF_SLOPE_FRACTION`` (0.08): the
+    The "before" figures moved from the pre-fix reference (0.1512, 26,088)
+    because they come from the mesh voxelizer this fix changed; the "after"
+    figures are unchanged by the fix, because ``regenerate_voxels`` rebuilds
+    from ``buildings.heights`` -- the 2.5-D component grid, extruded by
+    ``voxcity.generator.update`` itself -- not through voxcitygml's mesh
+    path at all.
+
+    Note that 0.0965 is still *above* ``MIN_ROOF_SLOPE_FRACTION`` (0.03): the
     rebuild extrudes from ``buildings.heights``, which on a LOD2 model was
     rasterized per cell from the mesh and so retains a coarse staircase --
-    it is nowhere near as flat as a true LOD1 run (0.035).
+    it is nowhere near as flat as a true LOD1 run (0.0163).
 
     So ``assert slope > MIN_ROOF_SLOPE_FRACTION`` -- the exact assertion form
     used by ``test_lod2_generate_voxcity_end_to_end`` and

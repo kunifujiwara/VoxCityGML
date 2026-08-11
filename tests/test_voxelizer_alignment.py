@@ -154,3 +154,29 @@ def test_shell_threshold_discriminates_surface_contact():
     v2, f2 = box_mesh(extents=(12.0, 12.0, 1.2))
     building_solid(v2, f2, gp, grid, -3, True, shell_threshold=0.5)
     assert len(filled(grid)) > 0
+
+
+def test_building_shell_threshold_reaches_shell(monkeypatch):
+    """The config value must arrive at _overlay_surface_shell for buildings.
+
+    Covers seam -> shell only.  The upper plumbing (VoxelizerConfig ->
+    voxelize_citygml_meshes -> _voxelize_mesh_group) is left to review, as
+    exercising it needs a full CityGMLMeshCollection fixture; the three
+    edits are single-line pass-throughs.
+    """
+    import voxcitygml.voxelizer3d as vx
+
+    seen = {}
+    real = vx._overlay_surface_shell
+
+    def spy(verts, faces, gp, grid, code, overwrite, **kw):
+        seen["occupancy_threshold"] = kw.get("occupancy_threshold")
+        return real(verts, faces, gp, grid, code, overwrite, **kw)
+
+    monkeypatch.setattr(vx, "_overlay_surface_shell", spy)
+    gp = make_gp()
+    grid = np.zeros((12, 12, 10), np.int32)
+    v, f = box_mesh()
+    vx._voxelize_building_solid(v, f, gp, grid, -3, True,
+                                shell_threshold=0.31)
+    assert seen["occupancy_threshold"] == 0.31

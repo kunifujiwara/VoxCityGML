@@ -401,6 +401,7 @@ def run_core(cfg: VoxelizerConfig) -> PipelineArtifacts:
             max_voxel_ram_mb=cfg.max_voxel_ram_mb,
             occupancy_threshold=cfg.occupancy_threshold,
             occupancy_subdivisions=cfg.occupancy_subdivisions,
+            building_shell_threshold=cfg.building_shell_threshold,
             underground_depth=cfg.terrain_underground_depth,
             info_out=vox_info,
         )

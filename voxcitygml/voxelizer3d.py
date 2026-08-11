@@ -132,6 +132,7 @@ def voxelize_citygml_meshes(
     max_voxel_ram_mb: Optional[float] = None,
     occupancy_threshold: float = 0.0,
     occupancy_subdivisions: int = 3,
+    building_shell_threshold: float = 0.5,
     underground_depth: float = 0.0,
     *,
     info_out: Optional[dict] = None,
@@ -147,12 +148,23 @@ def voxelize_citygml_meshes(
         complete geometry representation even at areal boundaries.
 
     Args:
-        occupancy_threshold: Minimum volume overlap fraction (0.0–1.0) for a
-            boundary voxel to be kept.  0.0 (default) keeps every voxel that
-            has *any* geometric contact (current behaviour).  E.g. 0.5 means
-            a voxel must be at least 50 % filled by geometry.
+        occupancy_threshold: Minimum SURFACE-CONTACT occupancy (0.0–1.0) for
+            a boundary voxel to be kept — the fraction of a voxel's
+            subdivided sub-cells that touch mesh geometry, not the fraction
+            of its volume enclosed.  0.0 (default) keeps every voxel that
+            has *any* geometric contact.  For buildings this only reaches
+            the watertight-cascade fallback: the primary MeshLib winding
+            path (the common case) ignores it entirely.  It still governs
+            vegetation and bridges (``force_surface=True``) directly.
         occupancy_subdivisions: Number of sub-divisions per axis when
-            estimating the volume fraction (default 3 → 27 sub-samples).
+            estimating surface-contact occupancy (default 3 → 27
+            sub-samples).
+        building_shell_threshold: Surface-contact occupancy threshold for
+            the building surface shell (default 0.5).  Same metric as
+            ``occupancy_threshold`` above, but applied where buildings
+            actually go: the raw-mesh shell overlaid on top of the MeshLib
+            winding fill.  See ``VoxelizerConfig.building_shell_threshold``
+            in ``models.py`` for the full explanation.
         info_out: Optional dict filled with facts about the voxel grid that
             the return value cannot carry, for callers that need to overlay
             revised layers onto the finished grid later:
@@ -217,7 +229,8 @@ def voxelize_citygml_meshes(
         # as a safety-net — only writes to cells that are currently AIR (0).
         _fill_terrain_gaps_from_dem(voxel_grid, gp, dem_grid)
 
-    # Buildings (watertight cascade → Z-scanline interior fill)
+    # Buildings (grid-aligned winding fill on the raw mesh, unioned with a
+    # raw-mesh surface shell at building_shell_threshold)
     _voxelize_mesh_group(
         collection.buildings,
         transformer,
@@ -227,6 +240,7 @@ def voxelize_citygml_meshes(
         overwrite=True,
         occupancy_threshold=occupancy_threshold,
         occupancy_subdivisions=occupancy_subdivisions,
+        shell_threshold=building_shell_threshold,
     )
 
     # Bridges – thin shell structures; always use surface + dilation + fill
@@ -842,6 +856,11 @@ def _voxelize_building_solid(
 
     Fallback (meshlib missing or winding failed): the legacy watertight →
     occupancy → sealed-surface path, unchanged.
+
+    ``occupancy_threshold`` is inert whenever the MeshLib winding pass
+    succeeds — it only governs the fallback cascade below.  The shell
+    overlaid on the winding fill is controlled by ``shell_threshold``
+    instead; the two thresholds are not interchangeable.
     """
     if _MESHLIB_VOXEL_AVAILABLE:
         ok = _voxelize_meshlib_winding(
@@ -893,19 +912,38 @@ def _voxelize_mesh_group(
     that extend outside the voxelization grid.  For buildings and bridges,
     this ensures complete geometry representation even at areal boundaries.
 
-    Strategy (ordered by preference):
+    Dispatch (per class, see ``_voxelize_building_solid`` and the branches
+    below for the exact cascades):
 
-    **MeshLib path** (when ``meshlib`` is installed):
-        1. Watertight cascade → ``meshToVolume(Signed)`` (OpenVDB level-set).
-        2. Fallback           → ``meshToDistanceVolume(HoleWindingRule)``
-           (robust winding number, works for open/self-intersecting meshes).
+    **Buildings** (``class_code == BUILDING_CODE``, ``force_surface=False``):
+        Grid-aligned MeshLib winding-number SDF on the raw mesh
+        (``_voxelize_meshlib_winding`` with ``align_origin=True``), unioned
+        with a raw-mesh surface shell kept at ``shell_threshold`` occupancy
+        (``_overlay_surface_shell``).  Only if MeshLib is unavailable or the
+        winding pass fails does it fall back to the legacy watertight-repair
+        → interior-fill cascade, and finally to a sealed surface stamp at
+        ``occupancy_threshold``.
 
-    **Legacy Numba path** (when ``meshlib`` is not available):
-        1. Watertight cascade → Z-scanline ray-parity interior fill.
-        2. Fallback           → surface SAT rasterization + dilation +
-           flood-fill.
+    **Bridges** (``force_surface=True``): Always the legacy raw-mesh
+        surface stamp + dilation + flood-fill (``_voxelize_single_mesh``
+        with ``seal_surface=True``), skipping MeshLib winding entirely —
+        bridges are thin shells where the winding-number SDF never goes
+        negative and would produce empty output.
+
+    **Vegetation / other classes**: When MeshLib is available, the winding
+        SDF (no grid alignment) unioned with a surface shell at
+        ``occupancy_threshold``; otherwise a surface-only rasterization
+        with dilation + flood-fill (``seal_surface=False``).  No watertight
+        cascade is ever attempted for this class.
 
     Args:
+        occupancy_threshold: Surface-contact occupancy threshold passed to
+            whichever fallback / shell path a given class actually uses.
+        shell_threshold: Surface-contact occupancy threshold for the
+            building surface shell specifically (buildings only).  Distinct
+            from ``occupancy_threshold``: the shell is unioned on top of the
+            winding fill and is reached even when ``occupancy_threshold``
+            is not (see the buildings branch above).
         force_surface: If True, always use surface + dilation + fill
             (legacy) or winding-number (MeshLib) instead of the closed-
             mesh path.  Recommended for thin shell structures (bridges).

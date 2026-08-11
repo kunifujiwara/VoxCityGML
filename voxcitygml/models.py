@@ -185,11 +185,25 @@ class VoxelizerConfig:
         use_3d_voxelizer: If True, voxelize all CityGML meshes in a shared
                   3-D grid. If False, use the legacy 2.5-D grids.
         max_voxel_ram_mb: Optional hard limit for 3-D voxel grid allocation.
-        occupancy_threshold: Minimum volume overlap fraction (0.0–1.0) a
-            boundary voxel must reach to be kept during surface voxelization.
-            0.0 (default) keeps every voxel with any geometric contact.
+        occupancy_threshold: Minimum SURFACE-CONTACT occupancy (0.0–1.0) a
+            boundary voxel must reach to be kept during surface voxelization
+            — the fraction of a voxel's subdivided sub-cells that touch
+            mesh geometry, not the fraction of its volume enclosed.  0.0
+            (default) keeps every voxel with any geometric contact.  Does
+            not govern the building surface shell; see
+            ``building_shell_threshold``.
         occupancy_subdivisions: Sub-divisions per axis when estimating
-            volume fraction (default 3 → 27 sub-samples per voxel).
+            surface-contact occupancy (default 3 → 27 sub-samples per voxel).
+        building_shell_threshold: Minimum SURFACE-CONTACT occupancy for the
+            building surface-shell overlay (default 0.5): the fraction of a
+            boundary voxel's 3x3x3 sub-cells that touch building geometry.
+            This is NOT volume overlap — a lone flat face crossing a voxel
+            scores ~0.33 and is dropped at 0.5; two crossing faces or a slab
+            spanning two sub-slabs score >= 0.5 and are kept.  The interior
+            fill independently keeps every centre-inside cell, so the shell
+            only decides thin-feature and edge cells.  At 0 the shell keeps
+            every corner-grazed cell and visibly inflates the envelope
+            (2026-08-11 diagnosis).
         building_lod: Preferred CityGML building LOD (1–4) to voxelize.
                       If ``None``, the highest available LOD for each
                       building is selected automatically.
@@ -246,6 +260,7 @@ class VoxelizerConfig:
     max_voxel_ram_mb: Optional[float] = None
     occupancy_threshold: float = 0.0
     occupancy_subdivisions: int = 3
+    building_shell_threshold: float = 0.5
     building_lod: Optional[int] = None
     dem_path: Optional[str] = None
     dem_source: Optional[str] = None

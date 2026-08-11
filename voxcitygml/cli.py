@@ -73,7 +73,9 @@ Examples:
     parser.add_argument('--dem-path', type=str, default=None,
                         help='Path to a GeoTIFF DEM/DTM file for terrain (optional)')
     parser.add_argument('--occupancy-threshold', type=float, default=0.0,
-                        help='Min volume overlap fraction (0-1) for boundary voxels (default: 0 = any contact)')
+                        help="Min surface-contact occupancy (0-1) for boundary voxels: the fraction "
+                             "of a voxel's sub-cells a triangle passes through, not volume filled "
+                             "(default: 0 = any contact). Does not govern the building shell.")
     parser.add_argument('--occupancy-subdivisions', type=int, default=3,
                         help='Sub-divisions per axis for occupancy estimation (default: 3)')
 

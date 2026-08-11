@@ -791,9 +791,13 @@ def _overlay_surface_shell(
     is marked, even when the SDF discretisation misses thin walls whose
     thickness is smaller than the voxel size.
 
-    When *occupancy_threshold* > 0, boundary voxels whose volume overlap
-    fraction is below the threshold are discarded.  This controls how
-    "inclusive" the surface shell is.
+    When *occupancy_threshold* > 0, boundary voxels whose SURFACE-CONTACT
+    occupancy is below the threshold are discarded.  This controls how
+    "inclusive" the surface shell is.  The metric is the fraction of the
+    voxel's sub-cells that a triangle passes through, not how much of the
+    voxel lies inside the mesh: a lone flat face crossing the voxel scores
+    ~1/3 and is dropped at 0.5, while an edge or corner where two faces
+    cross scores higher and survives.  See ``_compute_occupancy_fraction``.
     """
     vmin = verts.min(axis=0)
     vmax = verts.max(axis=0)
@@ -1406,12 +1410,22 @@ def _compute_occupancy_fraction(
     nr: int, nc: int, nz: int,
     subdivisions: int,
 ) -> np.ndarray:
-    """Compute volume overlap fraction for each surface voxel via sub-voxel sampling.
+    """Compute SURFACE-CONTACT occupancy for each surface voxel via sub-voxel sampling.
 
     Each marked surface voxel is subdivided into ``subdivisions**3`` sub-cubes.
     For every sub-cube we test whether at least one mesh triangle overlaps it
     (using the SAT triangle-box test).  The returned fraction is the ratio of
     overlapping sub-cubes to the total number of sub-cubes.
+
+    Note what this does and does not measure.  A sub-cube counts when a
+    triangle *passes through* it, so the result is how much of the voxel the
+    surface sweeps, NOT how much of the voxel lies inside the solid.  A lone
+    flat face crossing the voxel touches roughly one 3x3 slab of a 3x3x3
+    subdivision -- about 9/27 = 0.33 -- regardless of which side of the face
+    the voxel's interior is on.  Callers therefore get: threshold <= 0.33
+    keeps single-face cells, threshold > 0.33 keeps only edges, corners, and
+    slabs thick enough to span two sub-slabs.  Interior volume is decided by
+    the SDF fill, not here.
     """
     fractions = np.zeros((nr, nc, nz), dtype=np.float64)
     n_faces = len(faces)
@@ -1498,7 +1512,7 @@ def _filter_surface_by_occupancy(
     occupancy_threshold: float,
     occupancy_subdivisions: int = 3,
 ) -> np.ndarray:
-    """Remove surface voxels whose volume overlap fraction is below *occupancy_threshold*."""
+    """Remove surface voxels whose surface-contact occupancy is below *occupancy_threshold*."""
     if occupancy_threshold <= 0.0:
         return surface
     fractions = _compute_occupancy_fraction(

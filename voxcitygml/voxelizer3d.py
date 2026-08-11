@@ -559,6 +559,24 @@ def _voxelize_meshlib_levelset(
     algorithm that also encodes the surface shell in one pass.
 
     Returns True on success, False if the mesh cannot be voxelized this way.
+
+    .. warning:: Not used for buildings since 2026-08-11: ``meshToVolume``'s
+       SDF is corner-sampled, but ``_stamp_meshlib_mask`` assumes centre
+       samples, displacing the fill by +half a voxel per axis.  Fix the
+       convention before reusing this for solid stamping.  Note the terrain
+       path pre-shifts its solid by -0.5 voxel (see ``_voxelize_terrain_solid``
+       around voxelizer3d.py:446-450) to compensate for this same bias — a
+       future fix of the stamp convention must remove that compensation in
+       the same change, or terrain will double-correct.
+
+       Adjacent defect, also out of scope here: ``_stamp_meshlib_mask``
+       truncates indices with ``astype(np.intp)`` instead of flooring, so
+       SDF cells less than one voxel outside the grid on the min_x / min_z /
+       max_y sides produce index fractions in (-1, 0) that truncate to 0 and
+       pass the ``>= 0`` validity check — folding out-of-grid cells onto the
+       edge row/col/layer.  With the grid-aligned lattice those fractions
+       become exactly -0.5, so the folding is now deterministic instead of
+       phase-dependent.  Eventual fix: ``np.floor`` before the cast.
     """
     try:
         ml_mesh, shift = _meshlib_mesh_from_numpy(verts, faces)
@@ -801,6 +819,60 @@ def _overlay_surface_shell(
         subgrid[mask] = class_code
 
 
+def _voxelize_building_solid(
+    verts: np.ndarray,
+    faces: np.ndarray,
+    gp: Grid3DParams,
+    voxel_grid: np.ndarray,
+    class_code: int,
+    overwrite: bool,
+    occupancy_threshold: float = 0.0,
+    occupancy_subdivisions: int = 3,
+    shell_threshold: float = 0.5,
+) -> None:
+    """Voxelize one building solid.
+
+    MeshLib path: grid-aligned winding SDF on the RAW mesh
+    (``HoleWindingRule`` signs open / self-intersecting shells robustly),
+    then the raw-mesh surface shell at ``shell_threshold`` occupancy.
+    ``make_watertight_mesh`` is deliberately NOT used here: repairing at grid
+    resolution resculpted surfaces by ~1 m and the old levelset stamping
+    displaced every building by +half a voxel (2026-08-11 diagnosis,
+    docs/superpowers/specs/2026-08-11-voxelizer-alignment-fix-design.md).
+
+    Fallback (meshlib missing or winding failed): the legacy watertight →
+    occupancy → sealed-surface path, unchanged.
+    """
+    if _MESHLIB_VOXEL_AVAILABLE:
+        ok = _voxelize_meshlib_winding(
+            verts, faces, gp, voxel_grid, class_code, overwrite,
+            align_origin=True,
+        )
+        if ok:
+            _overlay_surface_shell(
+                verts, faces, gp, voxel_grid, class_code, overwrite,
+                occupancy_threshold=shell_threshold,
+                occupancy_subdivisions=occupancy_subdivisions,
+            )
+            return
+
+    wt = make_watertight_mesh(verts, faces, voxel_size=gp.voxel_size)
+    if wt.is_watertight and len(wt.faces) > 0 and len(wt.vertices) > 0:
+        ok = _voxelize_by_occupancy(
+            wt.vertices, wt.faces, gp, voxel_grid, class_code, overwrite,
+            occupancy_threshold=occupancy_threshold,
+            occupancy_subdivisions=occupancy_subdivisions,
+        )
+        if ok:
+            return
+    _voxelize_single_mesh(
+        verts, faces, gp, voxel_grid, class_code, overwrite,
+        seal_surface=True,
+        occupancy_threshold=occupancy_threshold,
+        occupancy_subdivisions=occupancy_subdivisions,
+    )
+
+
 # ── Dispatcher ────────────────────────────────────────────────────────
 
 def _voxelize_mesh_group(
@@ -812,6 +884,7 @@ def _voxelize_mesh_group(
     overwrite: bool,
     occupancy_threshold: float = 0.0,
     occupancy_subdivisions: int = 3,
+    shell_threshold: float = 0.5,
     force_surface: bool = False,
 ) -> None:
     """Voxelize a group of meshes (buildings, bridges, or vegetation).
@@ -849,58 +922,13 @@ def _voxelize_mesh_group(
 
         faces = mesh.faces
 
-        # ── Buildings / Bridges (solid via watertight cascade) ────────
+        # ── Buildings (solid) ─────────────────────────────────────────
         if class_code == BUILDING_CODE and not force_surface:
-            # Try MeshLib signed level-set (fastest, requires watertight)
-            if _MESHLIB_VOXEL_AVAILABLE:
-                wt = make_watertight_mesh(verts, faces, voxel_size=gp.voxel_size)
-                if wt.is_watertight and len(wt.faces) > 0 and len(wt.vertices) > 0:
-                    ok = _voxelize_meshlib_levelset(
-                        wt.vertices, wt.faces, gp, voxel_grid,
-                        class_code, overwrite,
-                    )
-                    if ok:
-                        # Union with watertight-mesh surface shell so that
-                        # thin walls (< 1 voxel) are never missed.
-                        # Use wt (not raw verts) to avoid stray-triangle
-                        # artifacts from the uncleaned original mesh.
-                        _overlay_surface_shell(
-                            wt.vertices, wt.faces, gp, voxel_grid,
-                            class_code, overwrite,
-                            occupancy_threshold=occupancy_threshold,
-                            occupancy_subdivisions=occupancy_subdivisions,
-                        )
-                        continue
-                # Watertight failed → winding number (open-mesh robust)
-                ok = _voxelize_meshlib_winding(
-                    verts, faces, gp, voxel_grid,
-                    class_code, overwrite,
-                )
-                if ok:
-                    _overlay_surface_shell(
-                        verts, faces, gp, voxel_grid,
-                        class_code, overwrite,
-                        occupancy_threshold=occupancy_threshold,
-                        occupancy_subdivisions=occupancy_subdivisions,
-                    )
-                    continue
-
-            # Legacy Numba path
-            wt = make_watertight_mesh(verts, faces, voxel_size=gp.voxel_size)
-            if wt.is_watertight and len(wt.faces) > 0 and len(wt.vertices) > 0:
-                ok = _voxelize_by_occupancy(
-                    wt.vertices, wt.faces, gp, voxel_grid,
-                    class_code, overwrite,
-                    occupancy_threshold=occupancy_threshold,
-                    occupancy_subdivisions=occupancy_subdivisions,
-                )
-                if ok:
-                    continue
-            _voxelize_single_mesh(
+            _voxelize_building_solid(
                 verts, faces, gp, voxel_grid, class_code, overwrite,
-                seal_surface=True,
                 occupancy_threshold=occupancy_threshold,
                 occupancy_subdivisions=occupancy_subdivisions,
+                shell_threshold=shell_threshold,
             )
 
         # ── Bridges (force_surface) ──────────────────────────────────

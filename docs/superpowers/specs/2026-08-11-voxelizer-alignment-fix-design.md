@@ -57,20 +57,17 @@ The `force_surface` (bridges) and vegetation branches are unchanged.
   in `_overlay_surface_shell` already suppresses floating fragments.
 - `meshToDistanceVolume` is somewhat slower than the OpenVDB levelset;
   per-building cost measured acceptable during diagnosis (< 1 s/building).
-- **The per-category OBJ export is NOT fixed by this change.** Corrected
-  2026-08-11 after the final review; the original wording here claimed exports
-  stay consistent with the main grid, which is false for the path real callers
-  use. `export_per_category_voxels_obj` has two branches:
-  `export_obj.py:1003–1035` runs when `mesh_groups` is supplied and calls
-  `_voxelize_meshlib_levelset` directly on watertight-repaired meshes, with no
-  grid alignment and no shell union — so it still carries M1 and M2. The `else`
-  fallback at `export_obj.py:1036+` does reach `_voxelize_mesh_group` and hence
-  the new seam, but it only runs when `mesh_groups is None`, and
-  `pipeline_export.py:103` always supplies it. So in practice the fixed path is
-  the dead one. Buildings in `mesh_voxels.obj` remain displaced by +½ voxel per
-  axis and resculpted by up to ~1 m. Nothing tests this
-  (`test_pipeline_core.py:156` monkeypatches the exporter away). Routing that
-  branch through `_voxelize_building_solid` is a separate follow-up.
+- **Per-category OBJ export: buildings fixed in the follow-up commit**
+  (`303ca25`, 2026-08-11). The `mesh_groups` branch — the path
+  `pipeline_export.run_and_export` always takes — now routes buildings
+  through `_voxelize_building_solid`, verified by
+  `tests/test_export_building_alignment.py` (grid-aligned box exports to
+  exactly its 180 analytic cells). **Bridges and terrain in that export
+  intentionally keep the levelset path** and its +½-voxel displacement:
+  fixing them means fixing `_stamp_meshlib_mask`'s convention, which must
+  happen together with removing the terrain path's −0.5-voxel compensation
+  (below) — until then, building voxels in `mesh_voxels.obj` are exact while
+  bridge/terrain voxels are not.
 - The terrain path pre-shifts its solid by −0.5 voxel
   (`_voxelize_terrain_solid`, voxelizer3d.py:446–450) to compensate for the
   very stamp bias diagnosed here. Out of scope, but any future fix of the

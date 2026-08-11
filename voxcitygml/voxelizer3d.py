@@ -605,13 +605,23 @@ def _voxelize_meshlib_winding(
     voxel_grid: np.ndarray,
     class_code: int,
     overwrite: bool,
+    align_origin: bool = False,
 ) -> bool:
     """Voxelize a mesh (possibly open) via MeshLib's Generalized Winding Number.
 
     ``meshToDistanceVolume`` with ``SignDetectionMode.HoleWindingRule``
     robustly classifies inside/outside even for meshes with holes, gaps,
-    or self-intersections.  This replaces the surface + dilation +
-    flood-fill fallback.
+    or self-intersections.
+
+    When ``align_origin`` is True the SDF lattice origin is snapped to the
+    main voxel-grid lattice, so SDF cell centres coincide exactly with main
+    grid cell centres and ``_stamp_meshlib_mask`` becomes a phase-free
+    integer copy.  The snap anchors are per-axis — ``(min_x, max_y, min_z)``
+    — because those are the anchors the stamp itself uses (rows count down
+    from ``max_y``, and ``max_y - min_y`` is generally not a whole number of
+    voxels, so ``min_y`` is NOT on the row lattice).  Without the snap, each
+    mesh's own bounding box sets the lattice phase and the stamped result
+    can land up to half a voxel away (2026-08-11 diagnosis).
 
     Returns True on success.
     """
@@ -622,12 +632,35 @@ def _voxelize_meshlib_winding(
         box = ml_mesh.computeBoundingBox()
         expansion = _mr.Vector3f.diagonal(3 * vs)
 
+        origin_local = box.min - expansion
+        if align_origin:
+            # Snap in world coordinates, then convert back to the shifted
+            # MeshLib frame.  floor() moves the origin down by < 1 voxel,
+            # covered by the +2 dimension margin below.
+            #
+            # Anchor per axis to the lattice the stamp actually indexes
+            # against: cols from min_x, z from min_z, but ROWS from max_y
+            # (_stamp_meshlib_mask: row = (max_y - y)/vs).  min_y must NOT
+            # be used for y — production grids keep max_y raw while n_rows
+            # is rounded (_compute_grid_params_3d), so max_y - min_y is
+            # generally not a multiple of vs and the min_y lattice is out
+            # of phase with the row lattice by up to half a voxel.
+            anchor = np.array([gp.min_x, gp.max_y, gp.min_z],
+                              dtype=np.float64)
+            world = np.array(
+                [origin_local.x, origin_local.y, origin_local.z],
+                dtype=np.float64) + shift
+            snapped = anchor + np.floor((world - anchor) / vs) * vs
+            local = snapped - shift
+            origin_local = _mr.Vector3f(
+                float(local[0]), float(local[1]), float(local[2]))
+
         params = _mr.MeshToDistanceVolumeParams()
-        params.vol.origin = box.min - expansion
+        params.vol.origin = origin_local
         params.vol.voxelSize = _mr.Vector3f.diagonal(vs)
-        dim_f = (box.max + expansion - params.vol.origin) / vs
+        dim_f = (box.max + expansion - origin_local) / vs
         params.vol.dimensions = _mr.Vector3i(
-            int(dim_f.x) + 1, int(dim_f.y) + 1, int(dim_f.z) + 1,
+            int(dim_f.x) + 2, int(dim_f.y) + 2, int(dim_f.z) + 2,
         )
         params.dist.signMode = _mr.SignDetectionMode.HoleWindingRule
         params.dist.maxDistSq = (3 * vs) ** 2

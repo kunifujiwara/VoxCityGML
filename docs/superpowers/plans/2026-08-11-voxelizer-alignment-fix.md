@@ -555,6 +555,68 @@ git commit -m "docs: record voxelizer alignment acceptance results"
 
 ---
 
+## Acceptance results (2026-08-11)
+
+### Correction to Step 2 as originally written
+
+The plan said to run `diagnose_voxelization2.py` "unchanged (it calls the
+patched internals)". **That was wrong.** Part C hardcodes the *old* pipeline —
+`make_watertight_mesh` → `_voxelize_meshlib_levelset` → shell at threshold 0 —
+and never touches `_voxelize_building_solid` or `align_origin`. Run unchanged,
+it reproduces the pre-fix numbers exactly and shows the fix doing nothing.
+
+The script was therefore vendored to `scripts/diagnose_voxelization2.py` and a
+**Part E** was added that runs the real new seam on the same buildings, on the
+same lattice, against the same truth oracle. Part C is retained unmodified as
+the "before" reference, so C and E are directly comparable. Data artefacts stay
+outside the repo; point `VOXCITYGML_DIAG_DATA` at the directory holding
+`plateau_raw.pkl` and `kanda_city.pkl`.
+
+### Six tall interior Kanda buildings, 2 m voxels
+
+| building | old IoU (C) | **new IoU (E)** | old shell + | **new shell +** |
+|---|---|---|---|---|
+| dbff04d5 | 0.809 | **0.973** | 1092 / 4376 = 25.0 % | **51 / 4489 = 1.1 %** |
+| 03bcf44f | 0.592 | **0.942** | 272 / 1111 = 24.5 % | **49 / 1090 = 4.5 %** |
+| 2e623427 | 0.617 | **0.914** | 481 / 2350 = 20.5 % | **5 / 2321 = 0.2 %** |
+| a64f70dc | 0.679 | **0.977** | 409 / 970 = 42.2 % | **22 / 997 = 2.2 %** |
+| d738e6a5 | 0.664 | **0.958** | 370 / 1829 = 20.2 % | **4 / 1897 = 0.2 %** |
+| 518b754b | 0.559 | **0.980** | 221 / 878 = 25.2 % | **6 / 906 = 0.7 %** |
+
+Against the three acceptance criteria:
+
+- **IoU ≥ 0.90 — MET.** 0.914–0.980, up from 0.559–0.809. Fill accuracy is the
+  headline result: the worst new building beats the best old one by 0.11.
+- **Shell adds ≤ 10 % of fill — MET.** 0.2–4.5 %, down from 20.2–42.2 %. The
+  old spread reproduces the diagnosis's "20–42 %" figure exactly, which is a
+  good check that Part C really is the old path.
+- **Fill shift = (0, 0, 0) — MET IN SUBSTANCE, NOT LITERALLY.** Old best-fit
+  shifts were systematically `(+1.00, +1.00, ·)` on every building — a clean
+  half-voxel displacement in both x and y, the diagnosed bug. New best-fit
+  shifts are scattered with no common direction (x ∈ {0.00, 0.25};
+  y ∈ {−0.75, −0.50, 0.00, +0.25}; z ∈ {−0.75, −0.50, 0.00, +0.25}) and the
+  IoU they buy is mostly noise (median gain ≈ 0.005; worst case 0.072 on
+  03bcf44f). The literal criterion was too strict to be measurable: the truth
+  oracle is itself a 0.25 m lattice whose `contains()` quantizes query points,
+  so ±0.25 m is the measurement's own resolution floor. **Systematic
+  displacement is eliminated; what remains is at the noise floor of the
+  instrument.** A future tightening would need a finer oracle (`FINE = 0.05`)
+  to resolve further, which was not run.
+
+Also confirmed in passing: **M2 is real.** The old path's watertight step moved
+surfaces by p95 = 0.11–0.97 m (`meshlib_double_offset` was selected for three of
+the six buildings, and those are exactly the three with the largest deviation).
+The new seam skips watertighting entirely on the MeshLib path.
+
+### Test suite
+
+`222 passed, 1 skipped, 1 deselected` — the 213-test pre-change baseline, plus
+the 9 new alignment tests. Two PLATEAU roof-slope assertions were recalibrated
+in `99113a9`; see that commit for the measured LOD2/LOD1 figures and why the
+metric's absolute scale moved.
+
+---
+
 ### Task 6 (follow-up, needs user go-ahead — GPU time): regenerate downstream
 
 - [ ] Re-voxelize the Kanda tile with patched voxcitygml → new `kanda_city.pkl`

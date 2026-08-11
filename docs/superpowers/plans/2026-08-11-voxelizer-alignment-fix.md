@@ -533,7 +533,9 @@ git commit -m "chore: vendor voxelization diagnosis script for acceptance"
 Run (Git-Bash): `& "C:\Users\kunih\miniconda3\Scripts\conda.exe" run -n voxcitygml python -m pytest tests -q 2>&1 | tail -5`
 Expected: no new failures relative to the pre-change baseline (record the baseline first with `git stash` if unsure; data-dependent suites like munich/plateau may already skip).
 
-Known blast radius beyond the main pipeline — NOT regressions: `export_obj.py:1048` (fallback per-category OBJ export) also reaches the building branch of `_voxelize_mesh_group`, so exported building voxels switch to the new seam too (desired: exports stay consistent with the main grid); `tests/test_profile.py` only prints timings. Any diff in export-related tests should be read in that light before being treated as a failure.
+Known blast radius beyond the main pipeline — NOT regressions: `export_obj.py:1048` (the `mesh_groups is None` fallback of the per-category OBJ export) reaches the building branch of `_voxelize_mesh_group`, so it switches to the new seam; `tests/test_profile.py` only prints timings. Any diff in export-related tests should be read in that light before being treated as a failure.
+
+**Correction (2026-08-11, from the final review):** that note above is true but nearly irrelevant, and an earlier version of it wrongly concluded "exports stay consistent with the main grid". The branch it describes is effectively dead — `pipeline_export.py:103` always passes `mesh_groups`, which selects the *other* branch at `export_obj.py:1003–1035`. That live branch calls `_voxelize_meshlib_levelset` directly on watertight-repaired meshes and is **not** fixed by this plan: exported building voxels keep the +½-voxel displacement (M1) and the ~1 m watertight resculpting (M2). Treat fixing it as a follow-up, not as something this plan delivered.
 
 - [ ] **Step 2: Diagnosis Part C reruns clean**
 

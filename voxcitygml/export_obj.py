@@ -1006,6 +1006,17 @@ def export_per_category_voxels_obj(
             if not meshes:
                 continue
             cat_grid = _allocate_voxel_grid(gp, max_voxel_ram_mb=max_voxel_ram_mb)
+            # NOTE (2026-08-11): buildings here still go through
+            # _voxelize_meshlib_levelset, so this export does NOT get the
+            # alignment fix the main voxel grid received.  Its voxels are
+            # displaced +half a voxel per axis (corner-sampled SDF stamped as
+            # centre-sampled) and, when the caller watertight-repaired the
+            # meshes, resculpted by up to ~1 m.  The main grid now uses
+            # _voxelize_building_solid instead; see
+            # docs/superpowers/specs/2026-08-11-voxelizer-alignment-fix-design.md.
+            # Routing buildings here through that seam is an open follow-up --
+            # note the `else` branch below already does, but it only runs when
+            # mesh_groups is None, which pipeline_export.run_and_export never does.
             use_levelset = (
                 cat_name in ("building", "bridge", "terrain")
                 and _MESHLIB_VOXEL_AVAILABLE

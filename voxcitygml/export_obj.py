@@ -46,6 +46,7 @@ from .voxelizer3d import (
     _voxelize_mesh_group,
     _voxelize_single_mesh,
     _voxelize_meshlib_levelset,
+    _voxelize_building_solid,
     _MESHLIB_VOXEL_AVAILABLE,
     GROUND_CODE,
     TREE_CODE,
@@ -1006,23 +1007,31 @@ def export_per_category_voxels_obj(
             if not meshes:
                 continue
             cat_grid = _allocate_voxel_grid(gp, max_voxel_ram_mb=max_voxel_ram_mb)
-            # NOTE (2026-08-11): buildings here still go through
-            # _voxelize_meshlib_levelset, so this export does NOT get the
-            # alignment fix the main voxel grid received.  Its voxels are
-            # displaced +half a voxel per axis (corner-sampled SDF stamped as
-            # centre-sampled) and, when the caller watertight-repaired the
-            # meshes, resculpted by up to ~1 m.  The main grid now uses
-            # _voxelize_building_solid instead; see
+            # Buildings use the same seam as the main voxel grid --
+            # grid-aligned winding on the raw mesh + occupancy shell -- so
+            # exported building voxels match voxelize_citygml_meshes exactly
+            # (alignment fix 2026-08-11).  Bridges and terrain keep the
+            # levelset path: they still carry its +half-voxel stamp
+            # displacement, consistent with their history but now DIFFERENT
+            # from buildings in the same OBJ.  Fixing them means fixing
+            # _stamp_meshlib_mask's convention, which must happen together
+            # with removing the terrain path's -0.5-voxel compensation
+            # (voxelizer3d.py ~:446-450); see
             # docs/superpowers/specs/2026-08-11-voxelizer-alignment-fix-design.md.
-            # Routing buildings here through that seam is an open follow-up --
-            # note the `else` branch below already does, but it only runs when
-            # mesh_groups is None, which pipeline_export.run_and_export never does.
             use_levelset = (
-                cat_name in ("building", "bridge", "terrain")
+                cat_name in ("bridge", "terrain")
                 and _MESHLIB_VOXEL_AVAILABLE
             )
             for verts, faces in meshes:
                 if len(verts) == 0 or len(faces) == 0:
+                    continue
+                if cat_name == "building":
+                    _voxelize_building_solid(
+                        verts, faces, gp, cat_grid,
+                        class_code=code, overwrite=False,
+                        occupancy_threshold=occupancy_threshold,
+                        occupancy_subdivisions=occupancy_subdivisions,
+                    )
                     continue
                 # Watertight meshes → prefer MeshLib level-set (no holes)
                 if use_levelset:

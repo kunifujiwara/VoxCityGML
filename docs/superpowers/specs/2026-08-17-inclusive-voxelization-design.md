@@ -217,6 +217,30 @@ plain numeric/flag **mechanism** parameters.
   (245 vs 180), and no change at all on grid-aligned geometry — plus the
   thin features tight loses entirely (60 vs 0). The 2026-08-11 tight
   envelope remains one word away (`voxelization_mode="tight"`).
+- **Boundary-coincident flat features (2026-08-18).** A mesh that is a
+  single flat surface exactly coincident with a cell-boundary plane
+  penetrates no voxel interior and would vanish. This is reachable in
+  production, not synthetic: the grid's z origin is
+  `scene_min_z - meshsize` (geometry-derived, not projected), so with
+  `dem_source="Flat"` at the default `meshsize=1.0` every integer
+  elevation sits exactly on a cell plane. `_overlay_surface_shell`
+  therefore re-rasterizes with the contact box when the penetration
+  rasterization is empty for a non-degenerate mesh **and** that mesh's own
+  bbox has no prior coverage. The second condition is required: an exactly
+  grid-aligned *solid* box also rasterizes to an empty penetration shell
+  on all six faces, but its interior is already filled by the winding
+  pass, so that emptiness is correct.
+  *Residual limitation:* the fallback does not fire for a flat feature
+  whose bbox (padded one voxel) already overlaps other filled voxels — a
+  deck one voxel above terrain, say. Such a feature is still dropped. It
+  was judged acceptable because the obstruction is adjacent to solid
+  geometry either way; revisit if flat decks over open space appear in
+  real data.
+  *Not fixable by tolerance:* a symmetric epsilon cannot separate "solid
+  face on a boundary" (outer cell must stay empty) from "zero-thickness
+  surface on a boundary" (one cell must own it) — that needs orientation
+  or degeneracy information. Half-open and shifted boxes were both tested
+  and rejected.
 - The no-anchor fallback can admit a genuinely floating mesh if that mesh
   has *no* filled voxels at all; accepted because completeness of real
   features outweighs suppressing that rare artifact class in inclusive

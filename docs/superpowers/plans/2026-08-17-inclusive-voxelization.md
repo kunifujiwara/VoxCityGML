@@ -4,7 +4,9 @@
 
 **Goal:** Add a `voxelization_mode: "inclusive" | "tight"` option (default `"inclusive"`) so thin geometry (< 1 voxel) voxelizes with no gaps for sunlight/wind obstruction analyses.
 
-**Architecture:** Mode is policy resolved at the `VoxelizerConfig` boundary into three mechanism knobs (`building_shell_threshold`, `occupancy_threshold`, `shell_anchor`). The voxelizer keeps plain numeric/flag parameters, with defaults flipped to the inclusive values (shell threshold 0.0, connectivity-flood anchor). `"tight"` reproduces the 2026-08-11 behavior exactly.
+**Architecture:** Mode is policy resolved at the `VoxelizerConfig` boundary into three mechanism knobs (`building_shell_threshold`, `occupancy_threshold`, `shell_anchor`). The voxelizer keeps plain numeric/flag parameters, with defaults flipped to the inclusive values (shell threshold `INCLUSIVE_SHELL_THRESHOLD` = 0.25, connectivity-flood anchor). `"tight"` reproduces the 2026-08-11 behavior exactly.
+
+**Threshold revised 2026-08-17 after measurement — 0.25, not the originally-specced 0.0.** At 0.0 the shell also marks the *empty* voxel on the outside of every boundary face, inflating solid buildings 2–2.5× with voxels containing no material (aligned box 180 → 448). Any value in [0.15, 0.33] reproduces the analytic ideal — every voxel containing mesh volume, and no other — exactly on all ten calibration geometries; 0.25 is the plateau midpoint. Full table in the design spec under "Threshold calibration". The value is expected to be retuned against real PLATEAU data, so it lives in exactly one place: `INCLUSIVE_SHELL_THRESHOLD` in `models.py` (Task 3), imported by `voxelizer3d.py` for its defaults.
 
 **Tech Stack:** Python, numpy, scipy.ndimage (`binary_propagation`), numba, meshlib, trimesh (tests), pytest.
 
@@ -361,7 +363,66 @@ def test_shell_anchor_reaches_shell(monkeypatch):
     vx._voxelize_building_solid(v, f, gp, grid, -3, True,
                                 shell_anchor="adjacent")
     assert seen["anchor"] == "adjacent"
-    assert seen["occupancy_threshold"] == 0.0   # inclusive shell default
+    assert seen["occupancy_threshold"] == INCLUSIVE_SHELL_THRESHOLD
+
+
+# The calibration guard.  Inclusive mode must produce EXACTLY the set of
+# voxels containing mesh volume: no gaps (the comb bug) and no empty
+# voxels (the threshold-0.0 inflation).  Both failure directions are
+# pinned here, so retuning INCLUSIVE_SHELL_THRESHOLD outside the
+# [0.15, 0.33] plateau fails loudly instead of silently changing every
+# building envelope.  See "Threshold calibration" in the design spec.
+INCLUSIVE_CASES = [
+    ("box exactly aligned",       (0.0,   0.0, 0.0, 12.0, 12.0, 10.0)),
+    ("box +0.05 off aligned",     (0.05,  0.0, 0.0, 12.0, 12.0, 10.0)),
+    ("box offset 0.7",            (0.7,   0.7, 0.0, 12.0, 12.0, 10.0)),
+    ("thin wall 0.5m mid-cell",   (3.9,   0.3, 0.3, 0.5, 11.4, 9.4)),
+    ("thin wall 0.5m on bound.",  (3.75,  0.3, 0.3, 0.5, 11.4, 9.4)),
+    ("very thin wall 0.1m",       (3.95,  0.3, 0.3, 0.1, 11.4, 9.4)),
+    ("thin slab 0.3m horizontal", (0.3,   0.3, 4.85, 11.4, 11.4, 0.3)),
+]
+
+
+def cells_containing_volume(x0, y0, z0, ex, ey, ez):
+    """Voxels whose volume meets the box in a set of positive measure."""
+    gp = make_gp()
+    out = set()
+    for row in range(gp.n_rows):
+        for col in range(gp.n_cols):
+            for zi in range(gp.n_z):
+                cx0 = gp.min_x + col * MS
+                cy1 = gp.max_y - row * MS
+                cz0 = gp.min_z + zi * MS
+                ox = min(cx0 + MS, x0 + ex) - max(cx0, x0)
+                oy = min(cy1, y0 + ey) - max(cy1 - MS, y0)
+                oz = min(cz0 + MS, z0 + ez) - max(cz0, z0)
+                if ox > 1e-9 and oy > 1e-9 and oz > 1e-9:
+                    out.add((row, col, zi))
+    return out
+
+
+@pytest.mark.skipif(not _MESHLIB_VOXEL_AVAILABLE, reason="meshlib required")
+@pytest.mark.parametrize("label,args", INCLUSIVE_CASES,
+                         ids=[c[0] for c in INCLUSIVE_CASES])
+def test_inclusive_defaults_match_volume_exactly(label, args):
+    from voxcitygml.voxelizer3d import _voxelize_building_solid
+    x0, y0, z0, ex, ey, ez = args
+    b = trimesh.creation.box(extents=[ex, ey, ez])
+    b.apply_translation([x0 + ex / 2, y0 + ey / 2, z0 + ez / 2])
+    v = np.asarray(b.vertices, float)
+    f = np.asarray(b.faces)
+
+    gp = make_gp()
+    grid = np.zeros((12, 12, 10), np.int16)
+    grid[:, :, 0] = -1                     # terrain floor, well below
+    _voxelize_building_solid(v, f, gp, grid, -3, True)
+
+    got = filled(grid)
+    want = cells_containing_volume(*args)
+    assert got == want, (
+        f"{label}: {len(got)} cells vs ideal {len(want)} "
+        f"({len(got - want)} empty voxels added, "
+        f"{len(want - got)} solid voxels missed)")
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -374,7 +435,32 @@ Expected: the 6 Task-1 tests pass; the 3 new tests fail —
 
 - [ ] **Step 3: Thread `shell_anchor` and flip defaults in `voxelizer3d.py`**
 
-Four edits:
+Five edits. **(0) first**, because the other four reference the constant:
+
+**(0) The shared threshold constant.** Add to `voxcitygml/models.py`, just above the "Pipeline configuration" banner comment:
+
+```python
+#: Surface-contact occupancy threshold for the inclusive-mode surface
+#: shell.  A voxel is kept when this fraction of its 3x3x3 sub-cells
+#: touch mesh geometry.  Calibrated 2026-08-17: any value in
+#: [0.15, 0.33] reproduces the analytic ideal — exactly the voxels
+#: containing mesh volume — on all ten calibration geometries, so 0.25
+#: is the plateau midpoint.  Below ~0.15 the shell also marks the empty
+#: voxel outside every boundary face (solid buildings inflate 2-2.5x);
+#: above ~0.33 a lone flat face scores too low and thin walls vanish
+#: again.  See "Threshold calibration" in
+#: docs/superpowers/specs/2026-08-17-inclusive-voxelization-design.md.
+#: Retuning this single value retunes inclusive mode everywhere.
+INCLUSIVE_SHELL_THRESHOLD = 0.25
+```
+
+This is the ONLY change to `models.py` in this task (Task 3 adds the mode enum and resolver, and consumes this constant). Import it in `voxcitygml/voxelizer3d.py` by extending the existing models import (no import cycle — `models.py` does not import `voxelizer3d`):
+
+```python
+from .models import Mesh3D, CityGMLMeshCollection, INCLUSIVE_SHELL_THRESHOLD
+```
+
+Then the four threading edits:
 
 **(a) `_voxelize_building_solid`** — signature (currently `shell_threshold: float = 0.5` is at line ~849):
 
@@ -388,7 +474,7 @@ def _voxelize_building_solid(
     overwrite: bool,
     occupancy_threshold: float = 0.0,
     occupancy_subdivisions: int = 3,
-    shell_threshold: float = 0.0,
+    shell_threshold: float = INCLUSIVE_SHELL_THRESHOLD,
     shell_anchor: str = "connected",
 ) -> None:
 ```
@@ -410,9 +496,13 @@ Append to its docstring (after the `occupancy_threshold` paragraph):
 
 ```
     ``shell_threshold`` / ``shell_anchor`` default to the INCLUSIVE mode
-    (0.0 / "connected", 2026-08-17 design): every voxel the raw mesh
-    touches becomes solid and thin features survive via the connectivity
-    flood.  Pass 0.5 / "adjacent" for the historic tight envelope
+    (``INCLUSIVE_SHELL_THRESHOLD`` / "connected", 2026-08-17 design):
+    every voxel that CONTAINS part of the raw mesh becomes solid, and
+    thin features survive via the connectivity flood.  Note the shell
+    threshold is deliberately not 0: at 0 the surface-contact metric also
+    marks the empty voxel on the far side of every boundary face, which
+    inflates solid buildings 2-2.5x without adding any obstruction.  Pass
+    0.5 / "adjacent" for the historic tight envelope
     (``voxelization_mode="tight"``).
 ```
 
@@ -421,7 +511,7 @@ Append to its docstring (after the `occupancy_threshold` paragraph):
 ```python
     occupancy_threshold: float = 0.0,
     occupancy_subdivisions: int = 3,
-    shell_threshold: float = 0.0,
+    shell_threshold: float = INCLUSIVE_SHELL_THRESHOLD,
     shell_anchor: str = "connected",
     force_surface: bool = False,
 ```
@@ -469,7 +559,7 @@ Add to the `Args:` section of its docstring:
 ```python
     occupancy_threshold: float = 0.0,
     occupancy_subdivisions: int = 3,
-    building_shell_threshold: float = 0.0,
+    building_shell_threshold: float = INCLUSIVE_SHELL_THRESHOLD,
     shell_anchor: str = "connected",
     underground_depth: float = 0.0,
 ```
@@ -549,13 +639,23 @@ Append to `tests/test_inclusive_voxelization.py`:
 
 
 def test_default_mode_is_inclusive():
-    from voxcitygml.models import ResolvedVoxelParams, VoxelizerConfig
+    from voxcitygml.models import (
+        INCLUSIVE_SHELL_THRESHOLD, ResolvedVoxelParams, VoxelizerConfig)
     p = VoxelizerConfig().resolved_voxel_params()
     assert p == ResolvedVoxelParams(
-        building_shell_threshold=0.0,
+        building_shell_threshold=INCLUSIVE_SHELL_THRESHOLD,
         occupancy_threshold=0.0,
         shell_anchor="connected",
     )
+
+
+def test_inclusive_threshold_stays_on_the_calibrated_plateau():
+    """Guards the retuning contract: outside [0.15, 0.33] the mode stops
+    reproducing the analytic ideal (see the design spec's calibration
+    table), so a retune past either edge must be a deliberate, reviewed
+    change to this bound — not a silent drift."""
+    from voxcitygml.models import INCLUSIVE_SHELL_THRESHOLD
+    assert 0.15 <= INCLUSIVE_SHELL_THRESHOLD <= 0.33
 
 
 def test_tight_mode_reproduces_2026_08_11_defaults():
@@ -612,12 +712,12 @@ class ResolvedVoxelParams(NamedTuple):
 
 
 _MODE_PARAMS = {
-    # Every voxel geometry touches becomes solid; thin features survive
-    # via the connectivity-flood anchor.  Right bias for obstruction
-    # (sunlight / wind) analyses: over-blocks by up to ~1 voxel on
-    # corner-grazed edges, never leaks through a crossed voxel.
+    # Every voxel CONTAINING mesh volume becomes solid; thin features
+    # survive via the connectivity-flood anchor.  Right semantics for
+    # obstruction (sunlight / wind): nothing leaks through a voxel the
+    # geometry occupies, and no empty voxel is marked solid.
     "inclusive": ResolvedVoxelParams(
-        building_shell_threshold=0.0,
+        building_shell_threshold=INCLUSIVE_SHELL_THRESHOLD,
         occupancy_threshold=0.0,
         shell_anchor="connected",
     ),
@@ -697,15 +797,16 @@ and add the mode field next to them:
             surface-contact occupancy (default 3 → 27 sub-samples per voxel).
         building_shell_threshold: Minimum SURFACE-CONTACT occupancy for the
             building surface-shell overlay.  ``None`` (default) defers to
-            ``voxelization_mode``: 0.0 in inclusive mode, 0.5 in tight
-            mode.  This is NOT volume overlap — a lone flat face crossing a
-            voxel scores ~0.33 and is dropped at 0.5; two crossing faces or
-            a slab spanning two sub-slabs score >= 0.5 and are kept.  The
-            interior fill independently keeps every centre-inside cell, so
-            the shell only decides thin-feature and edge cells.  At 0 the
-            shell keeps every corner-grazed cell — deliberate in inclusive
-            mode (complete obstruction), rejected by the 2026-08-11 tight
-            calibration (envelope inflation).
+            ``voxelization_mode``: ``INCLUSIVE_SHELL_THRESHOLD`` (0.25) in
+            inclusive mode, 0.5 in tight mode.  This is NOT volume overlap
+            — a lone flat face crossing a voxel scores ~0.33 and is dropped
+            at 0.5; two crossing faces or a slab spanning two sub-slabs
+            score >= 0.5 and are kept.  The interior fill independently
+            keeps every centre-inside cell, so the shell only decides
+            thin-feature and edge cells.  Setting it to 0 is a trap: the
+            metric then also keeps the empty cell on the outside of every
+            boundary face, inflating solid buildings 2-2.5x (measured
+            2026-08-17) — which is why inclusive mode uses 0.25, not 0.
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**

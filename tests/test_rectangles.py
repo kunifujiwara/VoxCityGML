@@ -55,10 +55,23 @@ def test_missing_inputs_raise():
         resolve_rectangles(cfg)
 
 
-def test_negative_buffer_raises():
+def test_negative_buffer_raises_at_construction():
+    """Validation moved to __post_init__ (2026-08-18), so a bad buffer now
+    fails at the user's construction site rather than deep in the pipeline.
+    Previously this raised from resolve_rectangles instead."""
     verts = create_rectangle(139.77, 35.65, 400)
-    cfg = VoxelizerConfig(rectangle_vertices=verts, buffer_meters=-1)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="buffer_meters"):
+        VoxelizerConfig(rectangle_vertices=verts, buffer_meters=-1)
+
+
+def test_negative_buffer_set_after_construction_still_raises():
+    """VoxelizerConfig is a plain mutable dataclass, so __post_init__ alone
+    would not catch a buffer assigned afterwards -- resolve_rectangles keeps
+    its own check as the mutation guard."""
+    verts = create_rectangle(139.77, 35.65, 400)
+    cfg = VoxelizerConfig(rectangle_vertices=verts, buffer_meters=50)
+    cfg.buffer_meters = -1
+    with pytest.raises(ValueError, match="buffer_meters"):
         resolve_rectangles(cfg)
 
 

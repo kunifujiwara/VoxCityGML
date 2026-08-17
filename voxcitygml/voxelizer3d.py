@@ -13,9 +13,9 @@ from typing import List, Tuple, Optional
 
 import numpy as np
 from numba import njit, prange
-from scipy.ndimage import binary_fill_holes, zoom
+from scipy.ndimage import binary_fill_holes, binary_propagation, zoom
 
-from .models import Mesh3D, CityGMLMeshCollection
+from .models import Mesh3D, CityGMLMeshCollection, INCLUSIVE_SHELL_THRESHOLD
 from .citygml.coordinates import (
     swap_coordinates_3d,
     create_rectangle_frame_transformer,
@@ -48,6 +48,12 @@ GROUND_CODE = -1
 TREE_CODE = -2
 BUILDING_CODE = -3
 
+#: The anchor rules ``_overlay_surface_shell`` implements -- the single
+#: source of truth for the pair.  ``models._MODE_PARAMS`` picks one of
+#: these per voxelization mode; tests import this rather than restating
+#: the literals.
+SHELL_ANCHORS = ("adjacent", "connected")
+
 
 def _bbox_to_index_range(gp: "Grid3DParams", bmin: np.ndarray, bmax: np.ndarray) -> Tuple[int, int, int, int, int, int]:
     vs = gp.voxel_size
@@ -76,6 +82,49 @@ def _bbox_to_index_range(gp: "Grid3DParams", bmin: np.ndarray, bmax: np.ndarray)
         z0, z1 = z1, z0
 
     return r0, r1, c0, c1, z0, z1
+
+
+def _boundary_epsilon(vs: float) -> float:
+    """SAT tolerance shared by ``_contact_half`` / ``_penetration_half``:
+    ``vs * 1e-6`` (~2 micron at 2 m voxels).  This is a fixed constant,
+    not a per-grid tuning knob, because two invariants hold regardless of
+    where the grid sits in space:
+
+    - It swamps coordinate rounding: ``vs * 1e-6 >> ulp(|x|)`` by at least
+      three decades for any coordinate magnitude this pipeline reaches,
+      from local metres up to raw ECEF, so the +/- choice below never
+      flips on floating-point noise alone -- only on real geometry.
+    - It is also the MINIMUM REPORTED PENETRATION DEPTH for
+      ``_penetration_half``: a cell is only marked once the mesh crosses
+      roughly 2 microns into its interior, not at first contact.
+    """
+    return vs * 1e-6
+
+
+def _contact_half(vs: float) -> np.ndarray:
+    """SAT half-extents for a BOUNDARY-CONTACT test: does geometry touch
+    this cell's closure?  Expanded by ``_boundary_epsilon``, so a face
+    lying exactly on a cell wall registers in BOTH neighbouring cells.
+    Deliberate for the legacy surface-stamp paths (``_voxelize_by_occupancy``,
+    ``_voxelize_single_mesh``): over-marking a thin or bridge feature is
+    the safer failure there.  See ``_penetration_half`` for the opposite
+    question, used by the inclusive shell.
+    """
+    return np.array([vs / 2.0 + _boundary_epsilon(vs)] * 3, dtype=np.float64)
+
+
+def _penetration_half(vs: float) -> np.ndarray:
+    """SAT half-extents for a VOXEL-PENETRATION test: does geometry enter
+    this cell's interior?  Shrunk by ``_boundary_epsilon``, so a face
+    lying exactly on a cell wall marks NEITHER neighbour -- the
+    boundary-contact box above marks BOTH neighbours of every
+    grid-aligned solid face, which inflated buildings by a full layer on
+    non-round grid origins (2026-08-17 metric fix; a round origin
+    cancelled the same bug by floating-point luck, which is how it first
+    shipped unnoticed).  Used by ``_overlay_surface_shell``'s inclusive
+    shell, where "does this cell contain mesh volume" is the question.
+    """
+    return np.array([vs / 2.0 - _boundary_epsilon(vs)] * 3, dtype=np.float64)
 
 
 def _dilate6(mask: np.ndarray) -> np.ndarray:
@@ -132,7 +181,8 @@ def voxelize_citygml_meshes(
     max_voxel_ram_mb: Optional[float] = None,
     occupancy_threshold: float = 0.0,
     occupancy_subdivisions: int = 3,
-    building_shell_threshold: float = 0.5,
+    building_shell_threshold: float = INCLUSIVE_SHELL_THRESHOLD,
+    shell_anchor: str = "connected",
     underground_depth: float = 0.0,
     *,
     info_out: Optional[dict] = None,
@@ -160,11 +210,15 @@ def voxelize_citygml_meshes(
             estimating surface-contact occupancy (default 3 → 27
             sub-samples).
         building_shell_threshold: Surface-contact occupancy threshold for
-            the building surface shell (default 0.5).  Same metric as
-            ``occupancy_threshold`` above, but applied where buildings
-            actually go: the raw-mesh shell overlaid on top of the MeshLib
-            winding fill.  See ``VoxelizerConfig.building_shell_threshold``
-            in ``models.py`` for the full explanation.
+            the building surface shell (default ``INCLUSIVE_SHELL_THRESHOLD``
+            — inclusive).  Same metric as ``occupancy_threshold`` above, but
+            applied where buildings actually go: the raw-mesh shell overlaid
+            on top of the MeshLib winding fill.  See
+            ``VoxelizerConfig.building_shell_threshold`` in ``models.py`` for
+            the full explanation.
+        shell_anchor: Anchor rule for surface-shell overlays ("connected"
+            default — inclusive; "adjacent" — tight).  See
+            ``_overlay_surface_shell``.
         info_out: Optional dict filled with facts about the voxel grid that
             the return value cannot carry, for callers that need to overlay
             revised layers onto the finished grid later:
@@ -241,6 +295,7 @@ def voxelize_citygml_meshes(
         occupancy_threshold=occupancy_threshold,
         occupancy_subdivisions=occupancy_subdivisions,
         shell_threshold=building_shell_threshold,
+        shell_anchor=shell_anchor,
     )
 
     # Bridges – thin shell structures; always use surface + dilation + fill
@@ -267,6 +322,7 @@ def voxelize_citygml_meshes(
         overwrite=False,
         occupancy_threshold=occupancy_threshold,
         occupancy_subdivisions=occupancy_subdivisions,
+        shell_anchor=shell_anchor,
     )
 
     # Land cover overlay (topmost terrain voxel)
@@ -784,12 +840,18 @@ def _overlay_surface_shell(
     overwrite: bool,
     occupancy_threshold: float = 0.0,
     occupancy_subdivisions: int = 3,
+    anchor: str = "adjacent",
 ) -> None:
     """Stamp the triangle surface shell onto the voxel grid via SAT.
 
-    This guarantees that every voxel touching an original mesh triangle
-    is marked, even when the SDF discretisation misses thin walls whose
-    thickness is smaller than the voxel size.
+    This guarantees that every voxel the mesh geometrically PENETRATES is
+    marked, even when the SDF discretisation misses thin walls whose
+    thickness is smaller than the voxel size.  A face exactly coplanar
+    with a cell wall is the edge of that guarantee, not inside it: it
+    marks NEITHER of the two cells it separates (``_penetration_half``,
+    2026-08-17 metric fix -- the previous boundary-contact box marked
+    BOTH neighbours of such a face, inflating solid buildings by a full
+    layer).
 
     When *occupancy_threshold* > 0, boundary voxels whose SURFACE-CONTACT
     occupancy is below the threshold are discarded.  This controls how
@@ -798,15 +860,66 @@ def _overlay_surface_shell(
     voxel lies inside the mesh: a lone flat face crossing the voxel scores
     ~1/3 and is dropped at 0.5, while an edge or corner where two faces
     cross scores higher and survives.  See ``_compute_occupancy_fraction``.
+
+    *anchor* controls which shell voxels survive relative to already-filled
+    voxels (2026-08-17 inclusive-voxelization design):
+
+    ``"adjacent"``
+        Keep only shell voxels 6-adjacent (1 step) to a filled voxel.
+        Historic rule; a tall thin feature whose interior fill is empty
+        keeps just the slice next to its anchor.
+    ``"connected"``
+        Flood (``scipy.ndimage.binary_propagation``, 6-connectivity) from
+        the adjacent seeds through the shell itself: every shell voxel
+        connected to an anchored voxel survives, disconnected floating
+        fragments are still discarded.  If no seed exists in THIS MESH's
+        bounding box (padded 1 voxel) — a fully thin mesh whose winding
+        fill produced nothing and which sits clear of any other filled
+        voxel, e.g. buildings in per-category export grids with no
+        terrain — the whole shell is kept: dropping an entire real
+        feature is worse for obstruction than keeping an unanchored one.
+        Note this is a per-mesh test, not a global one: an isolated mesh
+        keeps its shell unfiltered even when the wider grid is full.
+
+    Whole-feature-lost fallback (2026-08-18): a mesh that is a single flat
+    surface exactly coincident with a cell-boundary plane penetrates NO
+    voxel's interior under the penetration box, so it would otherwise
+    vanish completely.  That is correct for a solid's own boundary face
+    (an adjacent wall or the winding fill already supplies that cell) but
+    wrong for a feature whose entire geometry IS that one coincident
+    plane -- exactly the failure class inclusive mode exists to fix.
+    Z-plane coincidence is reachable in production, not just a synthetic
+    edge case: the grid's z origin is derived from scene geometry
+    (``scene_min_z - meshsize``), not a pyproj projection, so with
+    ``dem_source="Flat"`` at the default ``meshsize=1.0`` every integer
+    elevation in the scene sits exactly on a cell plane.  When the
+    penetration-box rasterization comes back completely empty for a
+    non-degenerate mesh AND this mesh's own bbox has no existing
+    coverage in ``voxel_grid`` yet (the "AND" matters: an exactly
+    grid-aligned SOLID box also rasterizes to an empty penetration shell
+    on all six faces, but its interior is already filled by the winding
+    pass that runs before this function, so that emptiness is correct,
+    not lost), this function re-rasterizes that one mesh with the contact
+    (expanded) box instead, so it gets the cells its plane touches rather
+    than nothing.  This does not touch the exactness contract: every case
+    that already produces a non-empty penetration surface, or is covered
+    by prior voxel_grid content (typically the winding fill), is
+    unaffected.
     """
+    if anchor not in SHELL_ANCHORS:
+        raise ValueError(
+            f"anchor must be one of {SHELL_ANCHORS}, got {anchor!r}")
     vmin = verts.min(axis=0)
     vmax = verts.max(axis=0)
     r0, r1, c0, c1, z0, z1 = _bbox_to_index_range(gp, vmin, vmax)
     if r0 > r1 or c0 > c1 or z0 > z1:
         return
     nr, nc, nz = r1 - r0 + 1, c1 - c0 + 1, z1 - z0 + 1
-    half_eps = gp.voxel_size * 1e-6
-    half = np.array([gp.voxel_size / 2.0 + half_eps] * 3, dtype=np.float64)
+    # Penetration test, not boundary contact: see _penetration_half's
+    # docstring for why (2026-08-17 metric fix) and _contact_half for the
+    # deliberately opposite semantics still used at the legacy / bridge
+    # surface-stamp paths.
+    half = _penetration_half(gp.voxel_size)
     verts_f64 = np.ascontiguousarray(verts, dtype=np.float64)
     faces_ip = np.ascontiguousarray(faces, dtype=np.intp)
     surface = _surface_voxelize_numba(
@@ -815,6 +928,31 @@ def _overlay_surface_shell(
         r0, r1, c0, c1, z0, z1,
         nr, nc, nz, half,
     )
+    # Computed early (normally built just before the anchor filter below)
+    # so the whole-feature-lost fallback can see it: a mesh's own bbox
+    # already being non-empty means something upstream of this call
+    # (typically the winding fill for a proper solid) already represents
+    # it, so an empty penetration shell there is the CORRECT answer, not
+    # a lost feature -- see e.g. an exactly grid-aligned solid box, whose
+    # six faces are all coplanar with cell walls and whose penetration
+    # shell is genuinely empty, but whose interior is already filled.
+    subgrid = voxel_grid[r0:r1 + 1, c0:c1 + 1, z0:z1 + 1]
+    existing = subgrid != 0  # any non-empty voxel counts as anchor
+    if not surface.any() and not existing.any() and not np.allclose(vmin, vmax):
+        # Whole-feature-lost fallback (see the docstring above): the
+        # penetration box found nothing anywhere in this mesh's bbox, the
+        # mesh has real extent, AND nothing already fills this region --
+        # so this is not a solid whose boundary happens to be grid-
+        # aligned, it is a flat feature sitting exactly on a cell plane
+        # with no other geometry to represent it.  Re-rasterize with the
+        # contact box so it claims the cells its plane touches instead of
+        # disappearing entirely.
+        surface = _surface_voxelize_numba(
+            verts_f64, faces_ip,
+            gp.min_x, gp.max_y, gp.min_z, gp.voxel_size,
+            r0, r1, c0, c1, z0, z1,
+            nr, nc, nz, _contact_half(gp.voxel_size),
+        )
     if occupancy_threshold > 0.0:
         surface = _filter_surface_by_occupancy(
             surface, verts_f64, faces_ip, gp,
@@ -822,13 +960,15 @@ def _overlay_surface_shell(
             occupancy_threshold, occupancy_subdivisions,
         )
 
-    # Only keep surface voxels that are 6-connected neighbours of an
-    # already-filled voxel in the main grid.  This prevents stray /
-    # disconnected mesh fragments from creating floating artifacts.
-    subgrid = voxel_grid[r0:r1 + 1, c0:c1 + 1, z0:z1 + 1]
-    existing = subgrid != 0  # any non-empty voxel counts as anchor
-    adjacent = _dilate6(existing)
-    surface &= adjacent
+    # Anchor filter: prevents stray / disconnected mesh fragments from
+    # creating floating artifacts.  See the docstring for the two rules.
+    seeds = surface & _dilate6(existing)
+    if anchor == "adjacent":
+        surface = seeds
+    elif anchor == "connected" and seeds.any():
+        surface = binary_propagation(seeds, mask=surface)
+    # else: connected with no seed in THIS mesh's bbox -> keep the whole
+    # shell (see the docstring: the test is per-mesh, not global)
 
     if overwrite:
         subgrid[surface] = class_code
@@ -846,7 +986,8 @@ def _voxelize_building_solid(
     overwrite: bool,
     occupancy_threshold: float = 0.0,
     occupancy_subdivisions: int = 3,
-    shell_threshold: float = 0.5,
+    shell_threshold: float = INCLUSIVE_SHELL_THRESHOLD,
+    shell_anchor: str = "connected",
 ) -> None:
     """Voxelize one building solid.
 
@@ -865,6 +1006,19 @@ def _voxelize_building_solid(
     succeeds — it only governs the fallback cascade below.  The shell
     overlaid on the winding fill is controlled by ``shell_threshold``
     instead; the two thresholds are not interchangeable.
+
+    ``shell_threshold`` / ``shell_anchor`` default to the INCLUSIVE mode
+    (``INCLUSIVE_SHELL_THRESHOLD`` = 0.0 / "connected", 2026-08-17 design):
+    every voxel that CONTAINS part of the raw mesh becomes solid, and thin
+    features survive via the connectivity flood.  The threshold can stay
+    at 0 because ``_overlay_surface_shell``'s SAT test already answers a
+    penetration question (does the mesh enter this cell's interior?), not
+    a boundary-contact one -- a face lying exactly on a cell wall no
+    longer marks the empty cell on its far side (2026-08-17 metric fix;
+    an earlier 0.25 "calibrated" threshold was tried and rejected because
+    it only masked that boundary-contact bug on round grid origins).  Pass
+    0.5 / "adjacent" for the historic tight envelope
+    (``voxelization_mode="tight"``).
     """
     if _MESHLIB_VOXEL_AVAILABLE:
         ok = _voxelize_meshlib_winding(
@@ -876,6 +1030,7 @@ def _voxelize_building_solid(
                 verts, faces, gp, voxel_grid, class_code, overwrite,
                 occupancy_threshold=shell_threshold,
                 occupancy_subdivisions=occupancy_subdivisions,
+                anchor=shell_anchor,
             )
             return
 
@@ -898,6 +1053,14 @@ def _voxelize_building_solid(
 
 # ── Dispatcher ────────────────────────────────────────────────────────
 
+# Note for anyone revisiting the "this has too many pass-through knobs"
+# idea (2026-08-18): bundling the four into models.ResolvedVoxelParams was
+# proposed and declined, because that is a CONFIG-layer type -- its field
+# is named building_shell_threshold, which reads wrong in this function's
+# generic (vegetation-serving) body, and it carries occupancy_subdivisions
+# that no voxelization_mode influences.  If it is revisited, the right
+# shape is a MECHANISM-layer type -- ShellParams(threshold, anchor) --
+# defined here, which has neither problem.
 def _voxelize_mesh_group(
     meshes: List[Mesh3D],
     transformer,
@@ -907,7 +1070,8 @@ def _voxelize_mesh_group(
     overwrite: bool,
     occupancy_threshold: float = 0.0,
     occupancy_subdivisions: int = 3,
-    shell_threshold: float = 0.5,
+    shell_threshold: float = INCLUSIVE_SHELL_THRESHOLD,
+    shell_anchor: str = "connected",
     force_surface: bool = False,
 ) -> None:
     """Voxelize a group of meshes (buildings, bridges, or vegetation).
@@ -948,6 +1112,10 @@ def _voxelize_mesh_group(
             from ``occupancy_threshold``: the shell is unioned on top of the
             winding fill and is reached even when ``occupancy_threshold``
             is not (see the buildings branch above).
+        shell_anchor: Anchor rule for every ``_overlay_surface_shell``
+            call this group makes (building shell and vegetation shell):
+            "connected" (default, inclusive) or "adjacent" (tight).  See
+            ``_overlay_surface_shell``.
         force_surface: If True, always use surface + dilation + fill
             (legacy) or winding-number (MeshLib) instead of the closed-
             mesh path.  Recommended for thin shell structures (bridges).
@@ -971,6 +1139,7 @@ def _voxelize_mesh_group(
                 occupancy_threshold=occupancy_threshold,
                 occupancy_subdivisions=occupancy_subdivisions,
                 shell_threshold=shell_threshold,
+                shell_anchor=shell_anchor,
             )
 
         # ── Bridges (force_surface) ──────────────────────────────────
@@ -1002,6 +1171,7 @@ def _voxelize_mesh_group(
                         class_code, overwrite,
                         occupancy_threshold=occupancy_threshold,
                         occupancy_subdivisions=occupancy_subdivisions,
+                        anchor=shell_anchor,
                     )
                     continue
             _voxelize_single_mesh(
@@ -1060,8 +1230,11 @@ def _voxelize_by_occupancy(
     # Also compute surface shell via triangle-box overlap and union with
     # interior.  This guarantees boundary voxels are always present even
     # if ray-parity fails for some columns (edge/vertex degeneracy).
-    half_eps = vs * 1e-6
-    half = np.array([vs / 2.0 + half_eps] * 3, dtype=np.float64)
+    # Contact (expanded) box, deliberately: this is the legacy
+    # watertight-fallback surface stamp, not the inclusive shell -- see
+    # _overlay_surface_shell / _penetration_half for the 2026-08-17 metric
+    # fix and why that box is shrunk instead.
+    half = _contact_half(vs)
     surface = _surface_voxelize_numba(
         tri_verts, tri_faces,
         gp.min_x, gp.max_y, gp.min_z, vs,
@@ -1237,8 +1410,11 @@ def _voxelize_single_mesh(
     sub_cols = c1 - c0 + 1
     sub_z = z1 - z0 + 1
 
-    half_eps = gp.voxel_size * 1e-6
-    half = np.array([gp.voxel_size / 2.0 + half_eps] * 3, dtype=np.float64)
+    # Contact (expanded) box, deliberately: this is the legacy / bridge
+    # surface-stamp path, not the inclusive shell -- see
+    # _overlay_surface_shell / _penetration_half for the 2026-08-17 metric
+    # fix and why that box is shrunk instead.
+    half = _contact_half(gp.voxel_size)
 
     # Call the Numba-compiled surface voxelization kernel
     surface = _surface_voxelize_numba(

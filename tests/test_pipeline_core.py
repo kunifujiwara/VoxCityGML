@@ -8,6 +8,44 @@ import voxcitygml.pipeline as pl
 from voxcitygml.models import (
     VoxelizerConfig, CityGMLMeshCollection, Mesh3D,
 )
+#: The anchors the shell rasterizer actually implements -- imported, not
+#: restated, so this stays a real check rather than a second opinion.
+from voxcitygml.voxelizer3d import SHELL_ANCHORS
+
+#: Centre coordinates only ``run_core`` can supply, so a caller that used
+#: ``cfg``'s instead is caught.
+_SENTINEL_LON, _SENTINEL_LAT = 12345.0, 6789.0
+
+
+def _assert_concrete_voxel_kwargs(kwargs, where):
+    """Fail if the voxelizer seam got policy instead of resolved values.
+
+    ``VoxelizerConfig.occupancy_threshold`` / ``.building_shell_threshold``
+    are ``Optional[float]`` whose ``None`` means "``voxelization_mode``
+    decides".  Only ``cfg.resolved_voxel_params()`` turns that into a
+    number.  A caller that forwards the raw attribute instead ships ``None``
+    into ``if occupancy_threshold > 0.0:`` and dies with a ``TypeError`` on
+    the first real run — invisible to any test whose stub merely tolerates
+    whatever it is handed.  So the stubs assert here instead.
+
+    Both are documented 0–1 occupancy fractions, so the range is checked
+    too: type alone would wave through an argument-order slip that landed
+    ``occupancy_subdivisions=3`` in a threshold slot.
+    """
+    for name in ("occupancy_threshold", "building_shell_threshold"):
+        assert name in kwargs, f"{where} did not pass {name}"
+        value = kwargs[name]
+        assert isinstance(value, (int, float)) and not isinstance(value, bool), (
+            f"{where} passed {name}={value!r}; it must resolve the config "
+            f"through cfg.resolved_voxel_params() rather than forward the "
+            f"raw Optional attribute")
+        assert 0.0 <= value <= 1.0, (
+            f"{where} passed {name}={value!r}; occupancy is a 0-1 fraction, "
+            f"so this is a wrong value in the right slot (or the right "
+            f"value in the wrong slot)")
+    assert kwargs.get("shell_anchor") in SHELL_ANCHORS, (
+        f"{where} passed shell_anchor={kwargs.get('shell_anchor')!r}; "
+        f"expected one of {SHELL_ANCHORS}")
 
 
 @pytest.fixture
@@ -40,6 +78,7 @@ def stub_pipeline(monkeypatch, tmp_path):
     def fake_voxelize(collection, rectangle, center_lon, center_lat,
                       meshsize, *, info_out=None, **kwargs):
         calls['voxelize_kwargs'] = kwargs
+        _assert_concrete_voxel_kwargs(kwargs, 'run_core')
         # Honour the info_out contract: run_core subscripts these keys, so a
         # stub that omitted them would diverge from the real function.
         if info_out is not None:
@@ -83,6 +122,47 @@ def test_run_core_passes_underground_depth(stub_pipeline, tmp_path):
     assert stub_pipeline['voxelize_kwargs']['underground_depth'] == 7.5
 
 
+@pytest.mark.parametrize('mode', ['inclusive', 'tight'])
+def test_run_core_passes_resolved_voxel_params(stub_pipeline, tmp_path, mode):
+    """Both modes must reach the voxelizer as the resolver's own values.
+
+    Pinned to ``cfg.resolved_voxel_params()`` rather than to literals so
+    retuning a mode in models.py cannot silently desync the pipeline from
+    the policy it is supposed to implement.
+    """
+    cfg = replace(_config(tmp_path), voxelization_mode=mode)
+    pl.run_core(cfg)
+    kwargs = stub_pipeline['voxelize_kwargs']
+    expected = cfg.resolved_voxel_params()
+    assert kwargs['occupancy_threshold'] == expected.occupancy_threshold
+    assert kwargs['building_shell_threshold'] == expected.building_shell_threshold
+    assert kwargs['shell_anchor'] == expected.shell_anchor
+    # Guard against a resolver that quietly agrees with itself: the two
+    # modes must actually differ at this seam.
+    assert kwargs['shell_anchor'] == (
+        'connected' if mode == 'inclusive' else 'adjacent')
+
+
+def test_run_core_forwards_explicit_threshold_override(stub_pipeline, tmp_path):
+    """Explicit thresholds must survive the plumbing, beating the mode.
+
+    ``occupancy_threshold`` is covered here as well as
+    ``building_shell_threshold``: both modes resolve it to 0.0, so a user
+    override is the ONLY way it is ever non-zero — and
+    examples/run_building_gvi.py depends on exactly that.  A plumbing bug
+    that pinned it to the mode value would be invisible otherwise.
+    """
+    cfg = replace(_config(tmp_path),
+                  building_shell_threshold=0.5, occupancy_threshold=0.25)
+    assert cfg.voxelization_mode == 'inclusive'
+    pl.run_core(cfg)
+    kwargs = stub_pipeline['voxelize_kwargs']
+    assert kwargs['building_shell_threshold'] == 0.5
+    assert kwargs['occupancy_threshold'] == 0.25
+    # The anchor has no per-field override; it still follows the mode.
+    assert kwargs['shell_anchor'] == 'connected'
+
+
 def test_run_core_forwards_parse_kwargs(stub_pipeline, tmp_path):
     cfg = _config(tmp_path)
     pl.run_core(cfg)
@@ -117,19 +197,20 @@ def test_run_assembles_voxcity(stub_pipeline, tmp_path):
     assert city.voxels.classes.shape == (10, 10, 5)
 
 
-def test_run_and_export_uses_resolved_center(monkeypatch, tmp_path):
-    """run_and_export must route through run_core and use its resolved
-    center_lon/center_lat (not cfg's, which are wrong for
-    rectangle_vertices configs)."""
+@pytest.fixture
+def stub_export(monkeypatch, tmp_path):
+    """Stub every exporter so ``run_and_export`` runs in milliseconds.
+
+    Returns the dict the stubs record their kwargs into.
+    """
     import voxcitygml.pipeline_export as pe
 
-    sentinel_lon, sentinel_lat = 12345.0, 6789.0
     fake_artifacts = pl.PipelineArtifacts(
         collection=CityGMLMeshCollection(),
         rectangle=[(0, 0), (0, 0), (0, 0), (0, 0)],
         buffered_rectangle=[(0, 0), (0, 0), (0, 0), (0, 0)],
-        center_lon=sentinel_lon,
-        center_lat=sentinel_lat,
+        center_lon=_SENTINEL_LON,
+        center_lat=_SENTINEL_LAT,
         citygml_paths=[str(tmp_path)],
         land_cover_source='OpenStreetMap',
         canopy_height_source='Static',
@@ -150,16 +231,58 @@ def test_run_and_export_uses_resolved_center(monkeypatch, tmp_path):
         captured['voxel_kwargs'] = kwargs
         return ('v.obj', object())
 
+    def fake_export_per_category_voxels_obj(*args, **kwargs):
+        captured['per_cat_kwargs'] = kwargs
+        _assert_concrete_voxel_kwargs(kwargs, 'run_and_export')
+        return ('p.obj', None)
+
     monkeypatch.setattr(pe, 'run_core', lambda cfg: fake_artifacts)
     monkeypatch.setattr(pe, 'export_voxels_obj', fake_export_voxels_obj)
     monkeypatch.setattr(pe, 'export_meshes_obj', lambda *a, **k: ('m.obj', {}))
     monkeypatch.setattr(pe, 'export_per_category_voxels_obj',
-                        lambda *a, **k: ('p.obj', None))
+                        fake_export_per_category_voxels_obj)
     monkeypatch.setattr(pe, 'export_landcover_obj', lambda *a, **k: 'l.obj')
+    return captured
+
+
+def test_run_and_export_uses_resolved_center(stub_export, tmp_path):
+    """run_and_export must route through run_core and use its resolved
+    center_lon/center_lat (not cfg's, which are wrong for
+    rectangle_vertices configs)."""
+    import voxcitygml.pipeline_export as pe
 
     cfg = _config(tmp_path)
     result = pe.run_and_export(cfg)
 
-    assert captured['voxel_kwargs']['center_lon'] == sentinel_lon
-    assert captured['voxel_kwargs']['center_lat'] == sentinel_lat
+    assert stub_export['voxel_kwargs']['center_lon'] == _SENTINEL_LON
+    assert stub_export['voxel_kwargs']['center_lat'] == _SENTINEL_LAT
     assert result == ('m.obj', 'v.obj', 'p.obj', 'l.obj')
+
+
+@pytest.mark.parametrize('mode', ['inclusive', 'tight'])
+def test_run_and_export_passes_resolved_voxel_params(stub_export, tmp_path, mode):
+    """The per-category OBJ export must voxelize buildings with the SAME
+    resolved knobs the main grid used, or exported building voxels stop
+    matching ``voxelize_citygml_meshes`` (the 2026-08-11 invariant)."""
+    import voxcitygml.pipeline_export as pe
+
+    cfg = replace(_config(tmp_path), voxelization_mode=mode)
+    pe.run_and_export(cfg)
+    kwargs = stub_export['per_cat_kwargs']
+    expected = cfg.resolved_voxel_params()
+    assert kwargs['occupancy_threshold'] == expected.occupancy_threshold
+    assert kwargs['building_shell_threshold'] == expected.building_shell_threshold
+    assert kwargs['shell_anchor'] == expected.shell_anchor
+
+
+def test_run_and_export_forwards_explicit_threshold_override(stub_export,
+                                                             tmp_path):
+    import voxcitygml.pipeline_export as pe
+
+    cfg = replace(_config(tmp_path),
+                  building_shell_threshold=0.5, occupancy_threshold=0.25)
+    pe.run_and_export(cfg)
+    kwargs = stub_export['per_cat_kwargs']
+    assert kwargs['building_shell_threshold'] == 0.5
+    assert kwargs['occupancy_threshold'] == 0.25
+    assert kwargs['shell_anchor'] == 'connected'

@@ -4,7 +4,7 @@ Data models for the VoxCityGML pipeline.
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Tuple, Optional, Dict, Any, Union
+from typing import List, Tuple, Optional, Dict, Any, Union, NamedTuple
 import numpy as np
 
 
@@ -152,6 +152,62 @@ class CityGMLMeshCollection:
 # Pipeline configuration
 # ---------------------------------------------------------------------------
 
+#: Surface-contact occupancy threshold for the inclusive-mode surface
+#: shell.  Zero: the shell rasterizer already tests PENETRATION of the
+#: voxel interior (see the shrunk SAT box in ``_overlay_surface_shell``),
+#: so every cell it reports genuinely contains mesh volume and no further
+#: filtering is wanted.  Raising this above ~0.33 starts dropping
+#: single-face thin walls -- the comb bug this mode exists to fix.
+#: History: a 0.25 "calibrated plateau" was tried on 2026-08-17 and
+#: rejected -- it only looked exact on round grid origins; on a real
+#: pyproj origin every solid face still leaked one layer.  The fix
+#: belonged in the metric, not the threshold.
+INCLUSIVE_SHELL_THRESHOLD = 0.0
+
+
+class ResolvedVoxelParams(NamedTuple):
+    """Concrete voxelizer knobs after applying ``voxelization_mode``.
+
+    ``VoxelizerConfig.resolved_voxel_params`` is the only producer; the
+    pipeline and the OBJ exporters consume the same instance so the main
+    grid and exported voxels always agree (the 2026-08-11 invariant).
+    """
+    building_shell_threshold: float
+    occupancy_threshold: float
+    shell_anchor: str
+
+
+_MODE_PARAMS: Dict[str, ResolvedVoxelParams] = {
+    # Every voxel CONTAINING mesh volume becomes solid; thin features
+    # survive via the connectivity-flood anchor.  Right semantics for
+    # obstruction (sunlight / wind): nothing leaks through a voxel the
+    # geometry occupies, and no empty voxel is marked solid.
+    "inclusive": ResolvedVoxelParams(
+        building_shell_threshold=INCLUSIVE_SHELL_THRESHOLD,
+        occupancy_threshold=0.0,
+        shell_anchor="connected",
+    ),
+    # The 2026-08-11 tight envelope: shell kept only at >= 0.5
+    # surface-contact occupancy, 1-step adjacency anchor.
+    "tight": ResolvedVoxelParams(
+        building_shell_threshold=0.5,
+        occupancy_threshold=0.0,
+        shell_anchor="adjacent",
+    ),
+}
+
+#: Derived from ``_MODE_PARAMS`` rather than restated: a mode the table
+#: cannot resolve must never be accepted by validation.
+VOXELIZATION_MODES = tuple(_MODE_PARAMS)
+
+
+def _invalid_mode_error(mode) -> ValueError:
+    """The single message both validation seams report for a bad mode."""
+    return ValueError(
+        f"voxelization_mode must be one of {VOXELIZATION_MODES}, "
+        f"got {mode!r}")
+
+
 @dataclass
 class VoxelizerConfig:
     """Configuration for the CityGML → VoxCity pipeline.
@@ -185,25 +241,40 @@ class VoxelizerConfig:
         use_3d_voxelizer: If True, voxelize all CityGML meshes in a shared
                   3-D grid. If False, use the legacy 2.5-D grids.
         max_voxel_ram_mb: Optional hard limit for 3-D voxel grid allocation.
+        voxelization_mode: "inclusive" (default) or "tight".  Inclusive
+            marks every voxel containing any part of a mesh and floods
+            thin features from their anchors, so nothing sub-voxel-thin is
+            lost for obstruction (sunlight / wind) analyses.  Tight
+            restores the 2026-08-11 envelope: building shell kept only at
+            >= 0.5 surface-contact occupancy with a 1-step adjacency
+            anchor.  The mode resolves to concrete knobs via
+            ``resolved_voxel_params()``; explicitly-set threshold fields
+            override it.
         occupancy_threshold: Minimum SURFACE-CONTACT occupancy (0.0–1.0) a
             boundary voxel must reach to be kept during surface voxelization
             — the fraction of a voxel's subdivided sub-cells that touch
-            mesh geometry, not the fraction of its volume enclosed.  0.0
-            (default) keeps every voxel with any geometric contact.  Does
-            not govern the building surface shell; see
+            mesh geometry, not the fraction of its volume enclosed.
+            ``None`` (default) defers to ``voxelization_mode`` (both modes
+            resolve it to 0.0: keep every voxel with any geometric
+            contact).  Does not govern the building surface shell; see
             ``building_shell_threshold``.
         occupancy_subdivisions: Sub-divisions per axis when estimating
             surface-contact occupancy (default 3 → 27 sub-samples per voxel).
         building_shell_threshold: Minimum SURFACE-CONTACT occupancy for the
-            building surface-shell overlay (default 0.5): the fraction of a
-            boundary voxel's 3x3x3 sub-cells that touch building geometry.
-            This is NOT volume overlap — a lone flat face crossing a voxel
-            scores ~0.33 and is dropped at 0.5; two crossing faces or a slab
-            spanning two sub-slabs score >= 0.5 and are kept.  The interior
-            fill independently keeps every centre-inside cell, so the shell
-            only decides thin-feature and edge cells.  At 0 the shell keeps
-            every corner-grazed cell and visibly inflates the envelope
-            (2026-08-11 diagnosis).
+            building surface-shell overlay.  ``None`` (default) defers to
+            ``voxelization_mode``: 0.0 (``INCLUSIVE_SHELL_THRESHOLD``) in
+            inclusive mode, 0.5 in tight mode.  The metric applies to a
+            candidate set that is already PENETRATION-tested (the shell
+            rasterizer's SAT box tests whether the mesh enters a voxel's
+            interior, not whether it merely touches the boundary), so this
+            is NOT volume overlap on top of that: a lone flat face crossing
+            a voxel scores ~0.33 and is dropped at 0.5; two crossing faces
+            or a slab spanning two sub-slabs score >= 0.5 and are kept.
+            The interior fill independently keeps every centre-inside cell,
+            so the shell only decides thin-feature and edge cells.
+            Inclusive mode uses 0.0 because the penetration-tested
+            candidate set already answers the volume question -- no further
+            occupancy filtering is wanted; see ``INCLUSIVE_SHELL_THRESHOLD``.
         building_lod: Preferred CityGML building LOD (1–4) to voxelize.
                       If ``None``, the highest available LOD for each
                       building is selected automatically.
@@ -258,9 +329,10 @@ class VoxelizerConfig:
     buffer_meters: float = 50.0
     use_3d_voxelizer: bool = True
     max_voxel_ram_mb: Optional[float] = None
-    occupancy_threshold: float = 0.0
+    occupancy_threshold: Optional[float] = None
     occupancy_subdivisions: int = 3
-    building_shell_threshold: float = 0.5
+    building_shell_threshold: Optional[float] = None
+    voxelization_mode: str = "inclusive"
     building_lod: Optional[int] = None
     dem_path: Optional[str] = None
     dem_source: Optional[str] = None
@@ -269,6 +341,40 @@ class VoxelizerConfig:
     terrain_underground_depth: float = 0.0
     include_bridges: bool = True
     use_parse_cache: bool = True
+
+    def __post_init__(self):
+        if self.voxelization_mode not in VOXELIZATION_MODES:
+            raise _invalid_mode_error(self.voxelization_mode)
+        if self.buffer_meters < 0:
+            raise ValueError(
+                f"buffer_meters must be >= 0, got {self.buffer_meters}")
+
+    def resolved_voxel_params(self) -> ResolvedVoxelParams:
+        """Mode defaults with explicit threshold overrides applied.
+
+        ``None`` in ``building_shell_threshold`` / ``occupancy_threshold``
+        means "the mode decides"; an explicit value always wins over the
+        mode.  ``shell_anchor`` has no per-field override — it follows the
+        mode.
+        """
+        # Re-validated, not just trusted from __post_init__: this is a
+        # plain mutable dataclass, so `cfg.voxelization_mode = "loose"`
+        # after construction reaches here unchecked.  This method is on
+        # the hot path at three production call sites; a bare
+        # KeyError('loose') mid-pipeline is a much worse diagnostic than
+        # the construction-time message.
+        base = _MODE_PARAMS.get(self.voxelization_mode)
+        if base is None:
+            raise _invalid_mode_error(self.voxelization_mode)
+        overrides = {
+            key: value
+            for key, value in (
+                ("building_shell_threshold", self.building_shell_threshold),
+                ("occupancy_threshold", self.occupancy_threshold),
+            )
+            if value is not None
+        }
+        return base._replace(**overrides)
 
 
 # ---------------------------------------------------------------------------
@@ -310,6 +416,13 @@ def resolve_rectangles(
     """
     from .citygml.coordinates import create_rectangle
 
+    # Primary validation is now in VoxelizerConfig.__post_init__, which
+    # fails at the user's construction site instead of here, deep in the
+    # pipeline.  This copy stays as the mutation guard, for the same
+    # reason resolved_voxel_params() re-checks its mode: the dataclass is
+    # mutable, so `cfg.buffer_meters = -1` after construction reaches here
+    # unvalidated and would otherwise shrink the buffered rectangle
+    # INSIDE the target one.
     if cfg.buffer_meters < 0:
         raise ValueError(
             f"buffer_meters must be >= 0, got {cfg.buffer_meters}")

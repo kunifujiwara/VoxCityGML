@@ -34,7 +34,7 @@ import numpy as np
 from shapely.geometry import Polygon as ShapelyPolygon
 from shapely.prepared import prep as shapely_prep
 
-from .models import Mesh3D, CityGMLMeshCollection
+from .models import Mesh3D, CityGMLMeshCollection, INCLUSIVE_SHELL_THRESHOLD
 from .citygml.coordinates import (
     swap_coordinates_3d,
     create_rectangle_frame_transformer,
@@ -962,10 +962,18 @@ def export_per_category_voxels_obj(
     center_lat: float,
     meshsize: float,
     output_dir: str,
+    # Keyword-only tail: this is an exported 14-parameter function whose
+    # optional block has already been inserted into once (2026-08-17, the
+    # two shell knobs below), silently shifting mesh_groups and
+    # underground_depth right.  The `*` makes the next such insertion
+    # structurally incapable of breaking a caller.
+    *,
     basename: str = "mesh_voxels",
     max_voxel_ram_mb: Optional[float] = None,
     occupancy_threshold: float = 0.0,
     occupancy_subdivisions: int = 3,
+    building_shell_threshold: float = INCLUSIVE_SHELL_THRESHOLD,
+    shell_anchor: str = "connected",
     mesh_groups: Optional[Dict[str, List[Tuple[np.ndarray, np.ndarray]]]] = None,
     underground_depth: float = 0.0,
 ) -> Tuple[str, Grid3DParams]:
@@ -975,6 +983,13 @@ def export_per_category_voxels_obj(
     geometry (e.g. buildings penetrating terrain) is preserved in full.
     The per-category grids are greedy-meshed separately and written as
     distinct material groups in a single OBJ file.
+
+    ``building_shell_threshold`` / ``shell_anchor`` default to the
+    inclusive mode (``INCLUSIVE_SHELL_THRESHOLD`` = 0.0 / "connected").
+    Callers driving this from a ``VoxelizerConfig`` should pass their
+    ``resolved_voxel_params()`` values instead of relying on the defaults,
+    so exported building voxels match the main grid produced by
+    ``voxelize_citygml_meshes`` (the 2026-08-11 alignment invariant).
 
     If *mesh_groups* is provided (from ``export_meshes_obj``), those
     already-clipped local-metre meshes are voxelized directly.
@@ -1010,10 +1025,14 @@ def export_per_category_voxels_obj(
             # Buildings use the same seam as the main voxel grid --
             # grid-aligned winding on the raw mesh + occupancy shell -- so
             # exported building voxels match voxelize_citygml_meshes exactly
-            # (alignment fix 2026-08-11).  Bridges and terrain keep the
-            # levelset path: they still carry its +half-voxel stamp
-            # displacement, consistent with their history but now DIFFERENT
-            # from buildings in the same OBJ.  Fixing them means fixing
+            # (alignment fix 2026-08-11), PROVIDED the caller passes the same
+            # building_shell_threshold / shell_anchor the main grid used
+            # (2026-08-17: both are now parameters, not silent defaults).
+            #
+            # Bridges and terrain keep the levelset path: they still carry
+            # its +half-voxel stamp displacement, consistent with their
+            # history but now DIFFERENT from buildings in the same OBJ.
+            # Fixing them means fixing
             # _stamp_meshlib_mask's convention, which must happen together
             # with removing the terrain path's -0.5-voxel compensation
             # (voxelizer3d.py ~:446-450); see
@@ -1031,6 +1050,8 @@ def export_per_category_voxels_obj(
                         class_code=code, overwrite=False,
                         occupancy_threshold=occupancy_threshold,
                         occupancy_subdivisions=occupancy_subdivisions,
+                        shell_threshold=building_shell_threshold,
+                        shell_anchor=shell_anchor,
                     )
                     continue
                 # Watertight meshes → prefer MeshLib level-set (no holes)
@@ -1071,6 +1092,8 @@ def export_per_category_voxels_obj(
                 overwrite=False,
                 occupancy_threshold=occupancy_threshold,
                 occupancy_subdivisions=occupancy_subdivisions,
+                shell_threshold=building_shell_threshold,
+                shell_anchor=shell_anchor,
                 force_surface=force_surface,
             )
             n_filled = np.count_nonzero(cat_grid == code)

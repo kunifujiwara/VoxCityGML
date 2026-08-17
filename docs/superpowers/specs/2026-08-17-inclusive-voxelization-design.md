@@ -1,7 +1,7 @@
 # Inclusive Voxelization Mode — Design
 
 **Date:** 2026-08-17
-**Status:** Approved
+**Status:** Implemented (2026-08-18)
 
 ## Problem
 
@@ -30,12 +30,88 @@ geometry *completely*: no voxel a surface passes through may be empty.
 | Question | Decision |
 |---|---|
 | Scope | All obstructing classes (buildings, bridges, vegetation) — in practice mostly changes buildings; bridges/vegetation already default to threshold 0. |
-| Semantics | **Any contact → solid**: shell threshold 0.0. Every voxel any triangle touches becomes solid. Conservative over-blocking (~+1 voxel on corner-grazed edges) is the right bias for shading/wind. |
+| Semantics | **Any material → solid**: a voxel is solid iff it contains any part of the mesh volume. Shell threshold **0.0**, with the shell rasterizer testing voxel *penetration* rather than boundary *contact*. See "Shell metric calibration" below — the threshold is as originally specced; the metric had to be corrected to make it mean what it says. |
 | API shape | Named mode enum `voxelization_mode: "inclusive" \| "tight"`, default `"inclusive"`. Explicit threshold values override the mode. |
 | Anchor rule | **Connectivity flood** in inclusive mode: keep every shell voxel connected *through the shell* to an anchored voxel; floating disconnected fragments still discarded. |
 
 `"tight"` reproduces today's behavior exactly (shell 0.5, 1-step adjacency
 anchor) and stays available for tight-envelope visualisation.
+
+## Shell metric calibration (2026-08-17, measured)
+
+This section records a two-step correction made during implementation.
+The conclusion is that the **shell metric** was wrong, not the threshold:
+the inclusive threshold is **0.0**, exactly as originally specced, but the
+shell rasterizer now tests voxel *penetration* rather than boundary
+*contact*.
+
+### Step 1 - the inflation bug
+
+`_overlay_surface_shell` built its SAT test box **expanded** by a
+tolerance (`half = voxel_size/2 + voxel_size*1e-6`). That answers "does
+the mesh touch this cell's closure?", so a building face lying on a cell
+boundary registered in **both** neighbouring cells - marking the empty
+cell just outside every solid wall. Measured on a 2 m grid, an
+exactly-aligned 12x12x10 m box filled 448 cells where 180 is correct
+(2.5x); an offset box filled 343 where 245 is correct. Those extra voxels
+contain no material, so they add no obstruction - only error (streets
+narrow, buildings over-shade).
+
+### Step 2 - the rejected threshold "fix"
+
+A shell threshold of 0.25 appeared to fix this: on the calibration grid a
+sweep showed any value in [0.15, 0.33] reproducing the analytic ideal
+exactly on all ten geometries, so 0.25 was adopted as the plateau
+midpoint.
+
+**That result was an artifact of the test fixture.** Every case used a
+grid with a round origin (`min_x = -6.0`), where the boundary coincidence
+cancelled by floating-point luck. Production grids take their origin from
+a pyproj transform and are never round. Re-measured on a realistic origin
+(`min_x = -100.10367673553799`), threshold 0.25 leaked a full layer on
+every case - aligned box 180 -> 336, thin wall 30 -> 60 - while 0.34 and
+above still deleted thin walls entirely. No threshold value works, because
+on a real origin an outside-face cell and a genuine thin-wall cell both
+score ~0.333: the surface-contact metric cannot distinguish them.
+
+This was caught by the `test_export_building_alignment` regression, whose
+grid comes from an actual rectangle transform.
+
+### Step 3 - the metric fix
+
+Negating the tolerance (`half = voxel_size/2 - voxel_size*1e-6`) makes the
+rasterizer ask "does the mesh penetrate this cell's interior?" - the
+volume question inclusive mode actually means. It is robust to origin
+rounding: the tolerance is ~2 microns at 2 m voxels, orders of magnitude
+above coordinate float noise (~1e-12) and below any real feature.
+
+With the shrunk box at threshold 0.0, output equals the analytic ideal
+exactly - zero extra, zero missing - on **both** grid origins across all
+seven geometries kept in the test suite (aligned box, off-aligned box,
+offset box, thin walls at 0.5 m and 0.1 m both mid-cell and
+boundary-coincident, horizontal 0.3 m slab).
+
+### Consequences
+
+- `INCLUSIVE_SHELL_THRESHOLD = 0.0`. It is not a tuning knob: the
+  rasterizer already answers the volume question. Raising it above ~0.33
+  reintroduces the comb bug.
+- **Tight mode is unaffected.** Measured on all seven geometries at
+  `shell_threshold=0.5, shell_anchor="adjacent"` on the real-origin grid:
+  identical counts with the shrunk and expanded box. `half` only decides
+  which cells are offered as candidates; `_compute_occupancy_fraction`
+  runs its own sub-voxel subdivision that never used `half`, and it
+  already scored boundary-leak cells at ~0.33, below the 0.5 cut.
+- The `"connected"` anchor is required regardless: with the historic
+  `"adjacent"` anchor, thin walls still vanish entirely, because their
+  winding fill is empty and nothing anchors them.
+
+### Testing rule this produced
+
+Every geometric calibration case runs against **two** grid fixtures - a
+round origin and a realistic pyproj origin - because a round origin hides
+boundary-coincidence bugs. Single-origin geometry tests are how the 0.25
+error reached the spec in the first place.
 
 ## Architecture
 
@@ -51,7 +127,7 @@ plain numeric/flag **mechanism** parameters.
   decides"; an explicit value always wins over the mode.
 - Resolver (function or property on `VoxelizerConfig`) maps mode →
   `(building_shell_threshold, occupancy_threshold, shell_anchor)`:
-  - `inclusive` → `(0.0, 0.0, "connected")`
+  - `inclusive` → `(INCLUSIVE_SHELL_THRESHOLD = 0.0, 0.0, "connected")`
   - `tight` → `(0.5, 0.0, "adjacent")`
 
 ### 2. Voxelizer mechanism (`voxelizer3d.py`)
@@ -67,14 +143,20 @@ plain numeric/flag **mechanism** parameters.
     in per-category OBJ grids with no terrain anchor — keep the whole
     shell. Dropping an entire real feature is worse for obstruction than
     keeping an unanchored one.
+- `_overlay_surface_shell` tests **penetration, not contact**: its SAT box
+  is `voxel_size/2 - voxel_size*1e-6` (shrunk), not `+` (expanded). See
+  "Shell metric calibration" — this is what makes threshold 0.0 mean "the
+  cell contains mesh volume" instead of "a face touches the cell's
+  boundary". Applies to both modes; measured to leave tight mode's output
+  identical.
 - Defaults flip to inclusive at the mechanism layer too:
   `voxelize_citygml_meshes`, `_voxelize_mesh_group`,
   `_voxelize_building_solid` default `building_shell_threshold`/
-  `shell_threshold` to **0.0** and thread `shell_anchor="connected"`
-  through. The anchor parameter applies wherever `_overlay_surface_shell`
-  is called: the building shell and the vegetation shell. Bridges already
-  use the sealed-surface path at threshold 0 (no anchor filter) and are
-  unchanged.
+  `shell_threshold` to `INCLUSIVE_SHELL_THRESHOLD` (**0.0**) and thread
+  `shell_anchor="connected"` through. The anchor parameter applies
+  wherever `_overlay_surface_shell` is called: the building shell and the
+  vegetation shell. Bridges already use the sealed-surface path at
+  threshold 0 (no anchor filter) and are unchanged.
 - The winding-number interior fill itself is unchanged; inclusive output is
   `winding fill ∪ complete shell`.
 
@@ -102,6 +184,16 @@ plain numeric/flag **mechanism** parameters.
 - **Red-first comb test:** a thin slab/wall (thickness < voxel size,
   positioned so faces do not straddle cell centres) voxelizes with **no
   gaps** in inclusive mode.
+- **Exactness test (both directions, both origins):** across seven
+  geometries — solid boxes grid-aligned, slightly off-aligned and offset;
+  thin walls at 0.5 m and 0.1 m, mid-cell and boundary-coincident; a
+  horizontal 0.3 m slab — inclusive mode produces *exactly* the analytic
+  set of voxels containing mesh volume: no gaps and no empty voxels. Every
+  case runs against **two grid fixtures**, one with a round origin and one
+  with a realistic pyproj origin. The two-origin requirement is not
+  optional: a round origin hides boundary-coincidence bugs by
+  floating-point luck, which is exactly how the rejected 0.25 threshold
+  passed review.
 - **Anchor tests:** a thin parapet ≥2 voxels above the winding fill
   survives via the connectivity flood; a detached floating fragment is
   still dropped; a mesh whose fill is empty keeps its full shell
@@ -115,11 +207,79 @@ plain numeric/flag **mechanism** parameters.
 
 ## Known trade-offs
 
-- Inclusive envelopes are up to ~1 voxel fatter where geometry grazes
-  voxel corners — deliberate, conservative over-blocking for obstruction
-  analyses. The 2026-08-11 tight default remains one word away
-  (`voxelization_mode="tight"`).
+- Inclusive envelopes are *wider than tight ones wherever a building's
+  faces do not fall on cell boundaries* — a boundary cell holding 35 % of a
+  wall becomes solid instead of being rounded away. That is the intended
+  semantics (it holds material, so it obstructs), and it is bounded: the
+  envelope never exceeds the set of voxels the mesh actually occupies.
+  Measured against tight on the calibration geometries: +30 voxels on a
+  slightly off-aligned box (210 vs 180), +65 on a 0.7 m offset box
+  (245 vs 180), and no change at all on grid-aligned geometry — plus the
+  thin features tight loses entirely (60 vs 0). The 2026-08-11 tight
+  envelope remains one word away (`voxelization_mode="tight"`).
+- **Boundary-coincident flat features (2026-08-18).** A mesh that is a
+  single flat surface exactly coincident with a cell-boundary plane
+  penetrates no voxel interior and would vanish. This is reachable in
+  production, not synthetic: the grid's z origin is
+  `scene_min_z - meshsize` (geometry-derived, not projected), so with
+  `dem_source="Flat"` at the default `meshsize=1.0` every integer
+  elevation sits exactly on a cell plane. `_overlay_surface_shell`
+  therefore re-rasterizes with the contact box when the penetration
+  rasterization is empty for a non-degenerate mesh **and** that mesh's own
+  bbox has no prior coverage. The second condition is required: an exactly
+  grid-aligned *solid* box also rasterizes to an empty penetration shell
+  on all six faces, but its interior is already filled by the winding
+  pass, so that emptiness is correct.
+  *Residual limitation:* the fallback does not fire for a flat feature
+  whose bbox (padded one voxel) already overlaps other filled voxels — a
+  deck one voxel above terrain, say. Such a feature is still dropped. It
+  was judged acceptable because the obstruction is adjacent to solid
+  geometry either way; revisit if flat decks over open space appear in
+  real data.
+  *Not fixable by tolerance:* a symmetric epsilon cannot separate "solid
+  face on a boundary" (outer cell must stay empty) from "zero-thickness
+  surface on a boundary" (one cell must own it) — that needs orientation
+  or degeneracy information. Half-open and shifted boxes were both tested
+  and rejected.
 - The no-anchor fallback can admit a genuinely floating mesh if that mesh
   has *no* filled voxels at all; accepted because completeness of real
   features outweighs suppressing that rare artifact class in inclusive
   mode.
+
+## Acceptance (2026-08-18)
+
+**Unit / mechanism suites — green.** Full offline suite `262 passed,
+1 skipped, 11 deselected`. Includes:
+
+- 14 exactness cases (7 geometries x 2 grid origins) pinning output to the
+  analytic set of voxels containing mesh volume — no gaps, no empty voxels.
+- Mutation-verified guards: restoring the expanded SAT box fails 6 cases;
+  the historic 0.25-plus-expanded-box state fails 3, all of them on the
+  real-origin fixture only. Reverting the `pipeline.py` plumbing reddens 8
+  tests at the config seam.
+- Tight-mode contracts (`tests/test_voxelizer_alignment.py`) unchanged and
+  pinned explicitly.
+
+**PLATEAU LOD2 integration — green.** All 12 tests pass on the Chuo-ku
+reference dataset (200 m, 2 m voxels) plus its 30-degree-rotated
+counterpart.
+
+| metric | tight (2026-08-11) | inclusive (2026-08-18) |
+|---|---|---|
+| building voxels, unrotated | 22,100 | 27,283 (+23.5%) |
+| building voxels, rotated 30 deg | 16,081 | 20,551 (+27.8%) |
+| roof slope, unrotated | 0.0741 | 0.0681 |
+| roof slope, rotated 30 deg | 0.0594 | 0.0690 |
+
+The voxel-count rise is the sub-voxel geometry that used to be dropped,
+plus boundary cells that genuinely hold material — not envelope inflation,
+which the exactness suite rules out on solid boxes at both grid origins.
+
+Roof slope moves in both directions and is not monotonic in completeness:
+filling thin roof skin gives neighbouring columns equal top heights as
+often as it creates a new single-voxel step. Both figures stay far above
+the 0.03 LOD2/LOD1 discriminator bound.
+
+**Not yet validated:** visual confirmation on the render that motivated
+this work. The quantitative evidence says thin geometry is now complete,
+but no before/after image has been compared.

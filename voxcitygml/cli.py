@@ -72,12 +72,20 @@ Examples:
                         help='Preferred CityGML building LOD (1-4). Default: highest available.')
     parser.add_argument('--dem-path', type=str, default=None,
                         help='Path to a GeoTIFF DEM/DTM file for terrain (optional)')
-    parser.add_argument('--occupancy-threshold', type=float, default=0.0,
+    parser.add_argument('--occupancy-threshold', type=float, default=None,
                         help="Min surface-contact occupancy (0-1) for boundary voxels: the fraction "
                              "of a voxel's sub-cells a triangle passes through, not volume filled "
-                             "(default: 0 = any contact). Does not govern the building shell.")
+                             "(default: decided by --voxelization-mode; both modes use 0 = any "
+                             "contact). Does not govern the building shell.")
     parser.add_argument('--occupancy-subdivisions', type=int, default=3,
                         help='Sub-divisions per axis for occupancy estimation (default: 3)')
+    parser.add_argument('--voxelization-mode', type=str, default='inclusive',
+                        choices=['inclusive', 'tight'],
+                        help="Voxelization completeness (default: inclusive). "
+                             "'inclusive' keeps every voxel containing part of a mesh - no gaps in "
+                             "thin walls, right for sunlight/wind obstruction. 'tight' "
+                             "restores the pre-2026-08-17 tight envelope (building shell "
+                             "at >= 0.5 surface-contact occupancy, adjacency anchor).")
 
     args = parser.parse_args()
 
@@ -101,6 +109,7 @@ Examples:
         dem_path=args.dem_path,
         occupancy_threshold=args.occupancy_threshold,
         occupancy_subdivisions=args.occupancy_subdivisions,
+        voxelization_mode=args.voxelization_mode,
     )
 
     city = VoxCityGML(config).run()

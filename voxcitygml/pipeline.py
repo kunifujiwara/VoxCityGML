@@ -390,6 +390,10 @@ def run_core(cfg: VoxelizerConfig) -> PipelineArtifacts:
     print("\nVoxelising all components...")
     vox_info: dict = {}
     if cfg.use_3d_voxelizer:
+        # Resolve voxelization_mode -> concrete knobs once.  The raw config
+        # fields are Optional and default to None ("the mode decides"), so
+        # forwarding them directly would ship None into the voxelizer.
+        vox_params = cfg.resolved_voxel_params()
         voxel_grid = voxelize_citygml_meshes(
             collection, rectangle, center_lon, center_lat, cfg.meshsize,
             dem_grid=dem_grid,
@@ -399,9 +403,10 @@ def run_core(cfg: VoxelizerConfig) -> PipelineArtifacts:
             land_cover_source=land_cover_source,
             trunk_height_ratio=cfg.trunk_height_ratio,
             max_voxel_ram_mb=cfg.max_voxel_ram_mb,
-            occupancy_threshold=cfg.occupancy_threshold,
+            occupancy_threshold=vox_params.occupancy_threshold,
             occupancy_subdivisions=cfg.occupancy_subdivisions,
-            building_shell_threshold=cfg.building_shell_threshold,
+            building_shell_threshold=vox_params.building_shell_threshold,
+            shell_anchor=vox_params.shell_anchor,
             underground_depth=cfg.terrain_underground_depth,
             info_out=vox_info,
         )

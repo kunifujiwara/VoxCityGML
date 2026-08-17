@@ -1,7 +1,7 @@
 # Inclusive Voxelization Mode — Design
 
 **Date:** 2026-08-17
-**Status:** Approved
+**Status:** Implemented (2026-08-18)
 
 ## Problem
 
@@ -245,3 +245,41 @@ plain numeric/flag **mechanism** parameters.
   has *no* filled voxels at all; accepted because completeness of real
   features outweighs suppressing that rare artifact class in inclusive
   mode.
+
+## Acceptance (2026-08-18)
+
+**Unit / mechanism suites — green.** Full offline suite `262 passed,
+1 skipped, 11 deselected`. Includes:
+
+- 14 exactness cases (7 geometries x 2 grid origins) pinning output to the
+  analytic set of voxels containing mesh volume — no gaps, no empty voxels.
+- Mutation-verified guards: restoring the expanded SAT box fails 6 cases;
+  the historic 0.25-plus-expanded-box state fails 3, all of them on the
+  real-origin fixture only. Reverting the `pipeline.py` plumbing reddens 8
+  tests at the config seam.
+- Tight-mode contracts (`tests/test_voxelizer_alignment.py`) unchanged and
+  pinned explicitly.
+
+**PLATEAU LOD2 integration — green.** All 12 tests pass on the Chuo-ku
+reference dataset (200 m, 2 m voxels) plus its 30-degree-rotated
+counterpart.
+
+| metric | tight (2026-08-11) | inclusive (2026-08-18) |
+|---|---|---|
+| building voxels, unrotated | 22,100 | 27,283 (+23.5%) |
+| building voxels, rotated 30 deg | 16,081 | 20,551 (+27.8%) |
+| roof slope, unrotated | 0.0741 | 0.0681 |
+| roof slope, rotated 30 deg | 0.0594 | 0.0690 |
+
+The voxel-count rise is the sub-voxel geometry that used to be dropped,
+plus boundary cells that genuinely hold material — not envelope inflation,
+which the exactness suite rules out on solid boxes at both grid origins.
+
+Roof slope moves in both directions and is not monotonic in completeness:
+filling thin roof skin gives neighbouring columns equal top heights as
+often as it creates a new single-voxel step. Both figures stay far above
+the 0.03 LOD2/LOD1 discriminator bound.
+
+**Not yet validated:** visual confirmation on the render that motivated
+this work. The quantitative evidence says thin geometry is now complete,
+but no before/after image has been compared.

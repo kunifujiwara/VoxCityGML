@@ -76,6 +76,28 @@ requires_dataset = pytest.mark.skipif(
 # measures. Every dataset test takes land cover from the CityGML dataset
 # itself, so there is no run-to-run variation to absorb; the margin buys
 # headroom against dataset and voxelizer changes instead.
+# 2026-08-18, inclusive voxelization (docs/superpowers/specs/
+# 2026-08-17-inclusive-voxelization-design.md).  The production default is
+# now voxelization_mode="inclusive": the shell rasterizer marks every voxel
+# CONTAINING part of a mesh (penetration test, not boundary contact) and
+# thin features survive via the connectivity-flood anchor.  Re-measured on
+# the same two rectangles, all four figures comfortably clear of the bound:
+#   unrotated LOD2: n=27,283 building voxels, slope=0.0681
+#   rotated30 LOD2: n=20,551 building voxels, slope=0.0690
+#
+# Building voxel counts rise ~24-28% versus the tight figures above.  That
+# is the sub-voxel geometry that used to be dropped -- walls, parapets and
+# roof skin thinner than one voxel -- plus boundary cells that genuinely
+# hold material.  It is NOT envelope inflation: the same change is exact on
+# solid boxes (see tests/test_inclusive_voxelization.py, which pins output
+# to the analytic set of voxels containing mesh volume on two grid origins).
+#
+# Roof slope moves in BOTH directions -- unrotated 0.0741 -> 0.0681,
+# rotated 0.0594 -> 0.0690 -- and that is expected, not noise.  Filling in
+# thin roof skin gives neighbouring columns the same top height as often as
+# it creates a new single-voxel step, so this metric is not monotonic in
+# completeness.  It still separates LOD2 from LOD1 by a wide margin, which
+# is all it is asked to do; do not read it as a quality score.
 MIN_ROOF_SLOPE_FRACTION = 0.03
 
 

@@ -478,3 +478,57 @@ def test_inclusive_defaults_match_volume_exactly(label, args, grid_id, make_grid
         f"{grid_id}/{label}: {len(got)} cells vs ideal {len(want)} "
         f"({len(got - want)} empty voxels added, "
         f"{len(want - got)} solid voxels missed)")
+
+
+# ── VoxelizerConfig mode resolution ───────────────────────────────────
+
+# Imported inside each test, not at module level: until Step 3 lands,
+# `ResolvedVoxelParams` does not exist, and a module-level import would
+# turn the red step into a collection ERROR for the whole file — taking
+# the passing Task 1 / Task 2 tests down with it.  Same lazy-import
+# rationale as tests/test_voxelizer_alignment.py's `building_solid`.
+
+
+def test_default_mode_is_inclusive():
+    from voxcitygml.models import (
+        INCLUSIVE_SHELL_THRESHOLD, ResolvedVoxelParams, VoxelizerConfig)
+    p = VoxelizerConfig().resolved_voxel_params()
+    assert p == ResolvedVoxelParams(
+        building_shell_threshold=INCLUSIVE_SHELL_THRESHOLD,
+        occupancy_threshold=0.0,
+        shell_anchor="connected",
+    )
+
+
+def test_inclusive_threshold_is_zero():
+    """Inclusive mode does no occupancy filtering: the shell rasterizer's
+    shrunk SAT box already answers the volume question (see the design
+    spec's "Shell metric calibration").  Raising this above ~0.33 would
+    reintroduce the comb bug this mode exists to fix, so the value is
+    pinned rather than left as a tuning knob."""
+    from voxcitygml.models import INCLUSIVE_SHELL_THRESHOLD
+    assert INCLUSIVE_SHELL_THRESHOLD == 0.0
+
+
+def test_tight_mode_reproduces_2026_08_11_defaults():
+    from voxcitygml.models import ResolvedVoxelParams, VoxelizerConfig
+    p = VoxelizerConfig(voxelization_mode="tight").resolved_voxel_params()
+    assert p == ResolvedVoxelParams(
+        building_shell_threshold=0.5,
+        occupancy_threshold=0.0,
+        shell_anchor="adjacent",
+    )
+
+
+def test_explicit_threshold_overrides_mode():
+    from voxcitygml.models import VoxelizerConfig
+    p = VoxelizerConfig(
+        building_shell_threshold=0.5).resolved_voxel_params()
+    assert p.building_shell_threshold == 0.5
+    assert p.shell_anchor == "connected"   # anchor still from the mode
+
+
+def test_unknown_mode_raises_at_construction():
+    from voxcitygml.models import VoxelizerConfig
+    with pytest.raises(ValueError):
+        VoxelizerConfig(voxelization_mode="loose")

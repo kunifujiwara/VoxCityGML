@@ -855,7 +855,8 @@ def _overlay_surface_shell(
         surface = seeds
     elif anchor == "connected" and seeds.any():
         surface = binary_propagation(seeds, mask=surface)
-    # else: connected with no seed anywhere -> keep the whole shell
+    # else: connected with no seed in THIS mesh's bbox -> keep the whole
+    # shell (see the docstring: the test is per-mesh, not global)
 
     if overwrite:
         subgrid[surface] = class_code

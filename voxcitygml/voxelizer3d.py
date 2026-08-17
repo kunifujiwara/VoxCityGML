@@ -13,7 +13,7 @@ from typing import List, Tuple, Optional
 
 import numpy as np
 from numba import njit, prange
-from scipy.ndimage import binary_fill_holes, zoom
+from scipy.ndimage import binary_fill_holes, binary_propagation, zoom
 
 from .models import Mesh3D, CityGMLMeshCollection
 from .citygml.coordinates import (
@@ -784,6 +784,7 @@ def _overlay_surface_shell(
     overwrite: bool,
     occupancy_threshold: float = 0.0,
     occupancy_subdivisions: int = 3,
+    anchor: str = "adjacent",
 ) -> None:
     """Stamp the triangle surface shell onto the voxel grid via SAT.
 
@@ -798,7 +799,27 @@ def _overlay_surface_shell(
     voxel lies inside the mesh: a lone flat face crossing the voxel scores
     ~1/3 and is dropped at 0.5, while an edge or corner where two faces
     cross scores higher and survives.  See ``_compute_occupancy_fraction``.
+
+    *anchor* controls which shell voxels survive relative to already-filled
+    voxels (2026-08-17 inclusive-voxelization design):
+
+    ``"adjacent"``
+        Keep only shell voxels 6-adjacent (1 step) to a filled voxel.
+        Historic rule; a tall thin feature whose interior fill is empty
+        keeps just the slice next to its anchor.
+    ``"connected"``
+        Flood (``scipy.ndimage.binary_propagation``, 6-connectivity) from
+        the adjacent seeds through the shell itself: every shell voxel
+        connected to an anchored voxel survives, disconnected floating
+        fragments are still discarded.  If NO seed exists anywhere — a
+        fully thin mesh whose winding fill produced nothing, e.g. buildings
+        in per-category export grids with no terrain — the whole shell is
+        kept: dropping an entire real feature is worse for obstruction than
+        keeping an unanchored one.
     """
+    if anchor not in ("adjacent", "connected"):
+        raise ValueError(
+            f"anchor must be 'adjacent' or 'connected', got {anchor!r}")
     vmin = verts.min(axis=0)
     vmax = verts.max(axis=0)
     r0, r1, c0, c1, z0, z1 = _bbox_to_index_range(gp, vmin, vmax)
@@ -822,13 +843,16 @@ def _overlay_surface_shell(
             occupancy_threshold, occupancy_subdivisions,
         )
 
-    # Only keep surface voxels that are 6-connected neighbours of an
-    # already-filled voxel in the main grid.  This prevents stray /
-    # disconnected mesh fragments from creating floating artifacts.
+    # Anchor filter: prevents stray / disconnected mesh fragments from
+    # creating floating artifacts.  See the docstring for the two rules.
     subgrid = voxel_grid[r0:r1 + 1, c0:c1 + 1, z0:z1 + 1]
     existing = subgrid != 0  # any non-empty voxel counts as anchor
-    adjacent = _dilate6(existing)
-    surface &= adjacent
+    seeds = surface & _dilate6(existing)
+    if anchor == "adjacent":
+        surface = seeds
+    elif seeds.any():
+        surface = binary_propagation(seeds, mask=surface)
+    # else: connected with no seed anywhere -> keep the whole shell
 
     if overwrite:
         subgrid[surface] = class_code

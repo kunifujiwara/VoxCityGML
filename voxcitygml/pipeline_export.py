@@ -89,6 +89,9 @@ def run_and_export(
         print("\n" + "=" * 60)
         print("Exporting per-category voxelized mesh OBJ...")
         print("=" * 60)
+        # Same resolved knobs run_core handed voxelize_citygml_meshes, so the
+        # exported building voxels match the main grid (2026-08-11 invariant).
+        vox_params = cfg.resolved_voxel_params()
         per_cat_obj, _ = export_per_category_voxels_obj(
             collection,
             rectangle,
@@ -98,8 +101,10 @@ def run_and_export(
             output_dir=cfg.output_dir,
             basename=per_category_basename,
             max_voxel_ram_mb=cfg.max_voxel_ram_mb,
-            occupancy_threshold=cfg.occupancy_threshold,
+            occupancy_threshold=vox_params.occupancy_threshold,
             occupancy_subdivisions=cfg.occupancy_subdivisions,
+            building_shell_threshold=vox_params.building_shell_threshold,
+            shell_anchor=vox_params.shell_anchor,
             mesh_groups=mesh_groups,
             underground_depth=cfg.terrain_underground_depth,
         )

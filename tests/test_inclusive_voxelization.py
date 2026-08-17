@@ -343,6 +343,71 @@ def test_vegetation_shell_anchor_reaches_shell(monkeypatch):
     assert seen["anchor"] == "adjacent"
 
 
+# The export seam.  These do not need meshlib: the building voxelizer is
+# spied out entirely, so what is under test is purely which knobs
+# export_per_category_voxels_obj hands it.
+def _export_seam_args():
+    """A minimal (collection, rectangle, centre) triple for the exporter.
+
+    Only the collection's z-extent and the rectangle reach
+    _compute_grid_params_3d; the mesh itself comes in via mesh_groups.
+    """
+    from types import SimpleNamespace
+
+    lon0, lat0 = 139.770, 35.695
+    dlon = 60.0 / 111320.0 / np.cos(np.radians(lat0))
+    dlat = 60.0 / 110540.0
+    rect = [(lon0, lat0), (lon0, lat0 + dlat),
+            (lon0 + dlon, lat0 + dlat), (lon0 + dlon, lat0)]
+    coll = SimpleNamespace(
+        buildings=[SimpleNamespace(
+            vertices=np.array([[lat0, lon0, 0.0], [lat0, lon0, 10.0]]))],
+        bridges=[], vegetation=[], terrain=[])
+    return coll, rect, lon0 + dlon / 2, lat0 + dlat / 2
+
+
+def _run_export_seam(tmp_path, monkeypatch, **kwargs):
+    """Call export_per_category_voxels_obj with _voxelize_building_solid
+    spied out; return the kwargs the building branch passed it."""
+    import voxcitygml.export_obj as eo
+
+    seen = {}
+
+    def spy(*args, **kw):
+        seen.update(kw)
+
+    monkeypatch.setattr(eo, "_voxelize_building_solid", spy)
+    coll, rect, clon, clat = _export_seam_args()
+    v, f = box((0.0, 0.0, 0.0), (6.0, 6.0, 6.0))
+    eo.export_per_category_voxels_obj(
+        coll, rect, clon, clat, MS, str(tmp_path),
+        basename="seam", mesh_groups={"building": [(v, f)]}, **kwargs)
+    return seen
+
+
+def test_export_shell_params_default_to_inclusive(tmp_path, monkeypatch):
+    """Unspecified, the exporter's building branch must use inclusive mode.
+
+    It used to pass neither knob, so it silently rode whatever
+    _voxelize_building_solid's default happened to be -- which changed
+    under it twice (0.5, then 0.0).  Now the default is stated here.
+    """
+    seen = _run_export_seam(tmp_path, monkeypatch)
+    assert seen["shell_threshold"] == INCLUSIVE_SHELL_THRESHOLD
+    assert seen["shell_anchor"] == "connected"
+
+
+def test_export_forwards_caller_shell_params(tmp_path, monkeypatch):
+    """Exported building voxels must be voxelized with the caller's
+    resolved knobs, or they stop matching the main grid produced by
+    voxelize_citygml_meshes (the 2026-08-11 alignment invariant)."""
+    seen = _run_export_seam(tmp_path, monkeypatch,
+                            building_shell_threshold=0.5,
+                            shell_anchor="adjacent")
+    assert seen["shell_threshold"] == 0.5
+    assert seen["shell_anchor"] == "adjacent"
+
+
 def make_gp_real():
     """Production grids get their origin from a pyproj transform, so it is
     never a round number.  The 2026-08-17 threshold calibration was wrong

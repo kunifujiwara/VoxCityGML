@@ -541,10 +541,15 @@ Append to `tests/test_inclusive_voxelization.py`:
 ```python
 # ── VoxelizerConfig mode resolution ───────────────────────────────────
 
-from voxcitygml.models import ResolvedVoxelParams, VoxelizerConfig
+# Imported inside each test, not at module level: until Step 3 lands,
+# `ResolvedVoxelParams` does not exist, and a module-level import would
+# turn the red step into a collection ERROR for the whole file — taking
+# the passing Task 1 / Task 2 tests down with it.  Same lazy-import
+# rationale as tests/test_voxelizer_alignment.py's `building_solid`.
 
 
 def test_default_mode_is_inclusive():
+    from voxcitygml.models import ResolvedVoxelParams, VoxelizerConfig
     p = VoxelizerConfig().resolved_voxel_params()
     assert p == ResolvedVoxelParams(
         building_shell_threshold=0.0,
@@ -554,6 +559,7 @@ def test_default_mode_is_inclusive():
 
 
 def test_tight_mode_reproduces_2026_08_11_defaults():
+    from voxcitygml.models import ResolvedVoxelParams, VoxelizerConfig
     p = VoxelizerConfig(voxelization_mode="tight").resolved_voxel_params()
     assert p == ResolvedVoxelParams(
         building_shell_threshold=0.5,
@@ -563,6 +569,7 @@ def test_tight_mode_reproduces_2026_08_11_defaults():
 
 
 def test_explicit_threshold_overrides_mode():
+    from voxcitygml.models import VoxelizerConfig
     p = VoxelizerConfig(
         building_shell_threshold=0.5).resolved_voxel_params()
     assert p.building_shell_threshold == 0.5
@@ -570,6 +577,7 @@ def test_explicit_threshold_overrides_mode():
 
 
 def test_unknown_mode_raises_at_construction():
+    from voxcitygml.models import VoxelizerConfig
     with pytest.raises(ValueError):
         VoxelizerConfig(voxelization_mode="loose")
 ```
@@ -577,7 +585,7 @@ def test_unknown_mode_raises_at_construction():
 - [ ] **Step 2: Run tests to verify they fail**
 
 Run: `& "C:\Users\kunih\miniconda3\Scripts\conda.exe" run -n voxcitygml python -m pytest tests/test_inclusive_voxelization.py -q`
-Expected: the 4 new tests fail with `ImportError: cannot import name 'ResolvedVoxelParams'`; all earlier tests pass.
+Expected: the 4 new tests fail — `ImportError: cannot import name 'ResolvedVoxelParams'` in the first two, `TypeError: __init__() got an unexpected keyword argument 'voxelization_mode'` in the last; `test_explicit_threshold_overrides_mode` fails with `AttributeError: 'VoxelizerConfig' object has no attribute 'resolved_voxel_params'`. All Task 1 / Task 2 tests still pass (the lazy imports keep collection working).
 
 - [ ] **Step 3: Implement mode field, validation, and resolver**
 

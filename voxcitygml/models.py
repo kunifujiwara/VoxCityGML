@@ -149,17 +149,16 @@ class CityGMLMeshCollection:
 
 
 #: Surface-contact occupancy threshold for the inclusive-mode surface
-#: shell.  A voxel is kept when this fraction of its 3x3x3 sub-cells
-#: touch mesh geometry.  Calibrated 2026-08-17: any value in
-#: [0.15, 0.33] reproduces the analytic ideal — exactly the voxels
-#: containing mesh volume — on all ten calibration geometries, so 0.25
-#: is the plateau midpoint.  Below ~0.15 the shell also marks the empty
-#: voxel outside every boundary face (solid buildings inflate 2-2.5x);
-#: above ~0.33 a lone flat face scores too low and thin walls vanish
-#: again.  See "Threshold calibration" in
-#: docs/superpowers/specs/2026-08-17-inclusive-voxelization-design.md.
-#: Retuning this single value retunes inclusive mode everywhere.
-INCLUSIVE_SHELL_THRESHOLD = 0.25
+#: shell.  Zero: the shell rasterizer already tests PENETRATION of the
+#: voxel interior (see the shrunk SAT box in ``_overlay_surface_shell``),
+#: so every cell it reports genuinely contains mesh volume and no further
+#: filtering is wanted.  Raising this above ~0.33 starts dropping
+#: single-face thin walls -- the comb bug this mode exists to fix.
+#: History: a 0.25 "calibrated plateau" was tried on 2026-08-17 and
+#: rejected -- it only looked exact on round grid origins; on a real
+#: pyproj origin every solid face still leaked one layer.  The fix
+#: belonged in the metric, not the threshold.
+INCLUSIVE_SHELL_THRESHOLD = 0.0
 
 
 # ---------------------------------------------------------------------------

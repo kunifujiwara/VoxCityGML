@@ -8,9 +8,14 @@ Pins the 2026-08-17 inclusive-voxelization design
   disconnected fragments, and keeps the whole shell when no anchor exists
   at all (per-category export grids contain no terrain to anchor on).
 - Building defaults are inclusive: shell threshold
-  ``INCLUSIVE_SHELL_THRESHOLD`` (0.25, calibrated to match the analytic
-  volume-containment ideal) + connected anchor produce gap-free thin walls
-  (the Plateau LOD2 "comb" bug) without inflating solid buildings.
+  ``INCLUSIVE_SHELL_THRESHOLD`` (0.0) + connected anchor produce gap-free
+  thin walls (the Plateau LOD2 "comb" bug) without inflating solid
+  buildings.  The threshold can stay at 0 because
+  ``_overlay_surface_shell``'s SAT test tests voxel-interior PENETRATION,
+  not boundary contact (2026-08-17 metric fix, after an earlier 0.25
+  "calibrated threshold" attempt was found to only mask the boundary-
+  contact bug on round grid origins -- see
+  ``test_inclusive_defaults_match_volume_exactly``'s real-origin grid).
 - ``VoxelizerConfig.voxelization_mode`` resolves mode -> mechanism knobs,
   with explicit threshold values overriding the mode.
 """
@@ -191,12 +196,30 @@ def test_shell_anchor_reaches_shell(monkeypatch):
     assert seen["occupancy_threshold"] == INCLUSIVE_SHELL_THRESHOLD
 
 
+def make_gp_real():
+    """Production grids get their origin from a pyproj transform, so it is
+    never a round number.  The 2026-08-17 threshold calibration was wrong
+    precisely because it was only ever measured on make_gp()'s round
+    origin: boundary-coincident faces cancelled by floating-point luck
+    there and leaked a full layer here."""
+    return Grid3DParams(n_rows=12, n_cols=12, n_z=10,
+                        min_x=-100.10367673553799, max_x=-76.10367673553799,
+                        min_y=75.402981512345, max_y=100.302981512345,
+                        min_z=-3.7071067811865475, max_z=16.2928932188,
+                        voxel_size=MS)
+
+
 # The calibration guard.  Inclusive mode must produce EXACTLY the set of
 # voxels containing mesh volume: no gaps (the comb bug) and no empty
-# voxels (the threshold-0.0 inflation).  Both failure directions are
-# pinned here, so retuning INCLUSIVE_SHELL_THRESHOLD outside the
-# [0.15, 0.33] plateau fails loudly instead of silently changing every
-# building envelope.  See "Threshold calibration" in the design spec.
+# voxels (the old boundary-contact metric's inflation).  Both failure
+# directions are pinned here, on TWO grid origins (see GRID_FIXTURES
+# below) -- the 2026-08-17 threshold-calibration bug slipped through
+# because every case was originally measured on make_gp()'s round origin
+# only, where a face lying exactly on a cell boundary cancelled by
+# floating-point luck.  The fix belongs in the SAT rasterizer's tolerance
+# (_overlay_surface_shell: shrink, not expand), which is why the threshold
+# itself is back to 0.0; these cases now guard that fix on a realistic
+# (non-round) origin too.  See "Threshold calibration" in the design spec.
 INCLUSIVE_CASES = [
     ("box exactly aligned",       (0.0,   0.0, 0.0, 12.0, 12.0, 10.0)),
     ("box +0.05 off aligned",     (0.05,  0.0, 0.0, 12.0, 12.0, 10.0)),
@@ -207,10 +230,27 @@ INCLUSIVE_CASES = [
     ("thin slab 0.3m horizontal", (0.3,   0.3, 4.85, 11.4, 11.4, 0.3)),
 ]
 
+# Every case above is written relative to make_gp()'s own anchors (min_x
+# for x, max_y for y, min_z for z -- see Grid3DParams.xyz_to_indices).
+# GRID_FIXTURES lets the same case table run against a second grid with a
+# non-round origin; _case_position() re-anchors a case's coordinates onto
+# whichever grid is under test, preserving each case's exact/fractional
+# alignment (an integer-voxel offset stays an integer-voxel offset; a
+# +0.05 m off-alignment stays +0.05 m off) regardless of that grid's own
+# origin.
+GRID_FIXTURES = [("clean-origin", make_gp), ("real-origin", make_gp_real)]
 
-def cells_containing_volume(x0, y0, z0, ex, ey, ez):
+
+def _case_position(gp, x0, y0, z0):
+    """Re-anchor a case position defined relative to make_gp() onto *gp*."""
+    ref = make_gp()
+    return (gp.min_x + (x0 - ref.min_x),
+            gp.max_y - (ref.max_y - y0),
+            gp.min_z + (z0 - ref.min_z))
+
+
+def cells_containing_volume(gp, x0, y0, z0, ex, ey, ez):
     """Voxels whose volume meets the box in a set of positive measure."""
-    gp = make_gp()
     out = set()
     for row in range(gp.n_rows):
         for col in range(gp.n_cols):
@@ -227,24 +267,28 @@ def cells_containing_volume(x0, y0, z0, ex, ey, ez):
 
 
 @pytest.mark.skipif(not _MESHLIB_VOXEL_AVAILABLE, reason="meshlib required")
+@pytest.mark.parametrize("grid_id,make_grid", GRID_FIXTURES,
+                         ids=[g[0] for g in GRID_FIXTURES])
 @pytest.mark.parametrize("label,args", INCLUSIVE_CASES,
                          ids=[c[0] for c in INCLUSIVE_CASES])
-def test_inclusive_defaults_match_volume_exactly(label, args):
+def test_inclusive_defaults_match_volume_exactly(label, args, grid_id, make_grid):
     from voxcitygml.voxelizer3d import _voxelize_building_solid
+    gp = make_grid()
     x0, y0, z0, ex, ey, ez = args
+    x0, y0, z0 = _case_position(gp, x0, y0, z0)
+
     b = trimesh.creation.box(extents=[ex, ey, ez])
     b.apply_translation([x0 + ex / 2, y0 + ey / 2, z0 + ez / 2])
     v = np.asarray(b.vertices, float)
     f = np.asarray(b.faces)
 
-    gp = make_gp()
-    grid = np.zeros((12, 12, 10), np.int16)
+    grid = np.zeros((gp.n_rows, gp.n_cols, gp.n_z), np.int16)
     grid[:, :, 0] = -1                     # terrain floor, well below
     _voxelize_building_solid(v, f, gp, grid, -3, True)
 
     got = filled(grid)
-    want = cells_containing_volume(*args)
+    want = cells_containing_volume(gp, x0, y0, z0, ex, ey, ez)
     assert got == want, (
-        f"{label}: {len(got)} cells vs ideal {len(want)} "
+        f"{grid_id}/{label}: {len(got)} cells vs ideal {len(want)} "
         f"({len(got - want)} empty voxels added, "
         f"{len(want - got)} solid voxels missed)")

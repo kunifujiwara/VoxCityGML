@@ -836,8 +836,17 @@ def _overlay_surface_shell(
     if r0 > r1 or c0 > c1 or z0 > z1:
         return
     nr, nc, nz = r1 - r0 + 1, c1 - c0 + 1, z1 - z0 + 1
+    # SHRINK, not expand.  A +eps box reports a cell whenever geometry
+    # touches its closure, so a face lying on a cell boundary registers in
+    # BOTH neighbours -- marking the empty cell outside every solid face
+    # and inflating buildings by a full layer.  On a round grid origin that
+    # cancelled by luck; on a real projected origin (min_x from pyproj) it
+    # does not.  A -eps box asks "does the mesh penetrate this cell's
+    # interior?", which is the volume question the inclusive mode means.
+    # The tolerance is ~2 microns at 2 m voxels: far above coordinate
+    # float noise (~1e-12), far below any real feature.
     half_eps = gp.voxel_size * 1e-6
-    half = np.array([gp.voxel_size / 2.0 + half_eps] * 3, dtype=np.float64)
+    half = np.array([gp.voxel_size / 2.0 - half_eps] * 3, dtype=np.float64)
     verts_f64 = np.ascontiguousarray(verts, dtype=np.float64)
     faces_ip = np.ascontiguousarray(faces, dtype=np.intp)
     surface = _surface_voxelize_numba(
@@ -903,12 +912,15 @@ def _voxelize_building_solid(
     instead; the two thresholds are not interchangeable.
 
     ``shell_threshold`` / ``shell_anchor`` default to the INCLUSIVE mode
-    (``INCLUSIVE_SHELL_THRESHOLD`` / "connected", 2026-08-17 design):
-    every voxel that CONTAINS part of the raw mesh becomes solid, and
-    thin features survive via the connectivity flood.  Note the shell
-    threshold is deliberately not 0: at 0 the surface-contact metric also
-    marks the empty voxel on the far side of every boundary face, which
-    inflates solid buildings 2-2.5x without adding any obstruction.  Pass
+    (``INCLUSIVE_SHELL_THRESHOLD`` = 0.0 / "connected", 2026-08-17 design):
+    every voxel that CONTAINS part of the raw mesh becomes solid, and thin
+    features survive via the connectivity flood.  The threshold can stay
+    at 0 because ``_overlay_surface_shell``'s SAT test already answers a
+    penetration question (does the mesh enter this cell's interior?), not
+    a boundary-contact one -- a face lying exactly on a cell wall no
+    longer marks the empty cell on its far side (2026-08-17 metric fix;
+    an earlier 0.25 "calibrated" threshold was tried and rejected because
+    it only masked that boundary-contact bug on round grid origins).  Pass
     0.5 / "adjacent" for the historic tight envelope
     (``voxelization_mode="tight"``).
     """

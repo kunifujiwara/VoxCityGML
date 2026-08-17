@@ -39,8 +39,8 @@ def box(min_corner, extents):
     return np.asarray(b.vertices, float), np.asarray(b.faces)
 
 
-def filled(grid, code=-3):
-    return set(zip(*np.nonzero(grid == code)))
+def filled(grid):
+    return set(zip(*np.nonzero(grid == -3)))
 
 
 # Thin wall used throughout: 0.5 m thick on a 2 m grid, crossing the cell
@@ -77,9 +77,9 @@ def test_connected_anchor_keeps_full_thin_wall():
     grid[:, :, 2] = -1
     v, f = box(*WALL)
     _overlay_surface_shell(v, f, gp, grid, -3, True, anchor="connected")
-    got = filled(grid)
-    for cell in wall_cells():
-        assert cell in got, f"gap at {cell}"
+    # Exact-set on purpose: a superset assertion would still pass even if
+    # the anchor filter were deleted from the function entirely.
+    assert filled(grid) == set(wall_cells())
 
 
 def test_connected_anchor_drops_disconnected_fragment():
@@ -105,9 +105,9 @@ def test_connected_anchor_without_any_seed_keeps_whole_shell():
     grid = np.zeros((12, 12, 10), np.int16)   # completely empty: no anchors
     v, f = box(*WALL)
     _overlay_surface_shell(v, f, gp, grid, -3, True, anchor="connected")
-    got = filled(grid)
-    for cell in wall_cells():
-        assert cell in got, f"gap at {cell}"
+    # Exact-set on purpose: a superset assertion would still pass even if
+    # the anchor filter were deleted from the function entirely.
+    assert filled(grid) == set(wall_cells())
 
 
 def test_adjacent_anchor_without_any_seed_keeps_nothing():

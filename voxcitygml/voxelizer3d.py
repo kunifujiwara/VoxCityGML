@@ -811,11 +811,14 @@ def _overlay_surface_shell(
         Flood (``scipy.ndimage.binary_propagation``, 6-connectivity) from
         the adjacent seeds through the shell itself: every shell voxel
         connected to an anchored voxel survives, disconnected floating
-        fragments are still discarded.  If NO seed exists anywhere — a
-        fully thin mesh whose winding fill produced nothing, e.g. buildings
-        in per-category export grids with no terrain — the whole shell is
-        kept: dropping an entire real feature is worse for obstruction than
-        keeping an unanchored one.
+        fragments are still discarded.  If no seed exists in THIS MESH's
+        bounding box (padded 1 voxel) — a fully thin mesh whose winding
+        fill produced nothing and which sits clear of any other filled
+        voxel, e.g. buildings in per-category export grids with no
+        terrain — the whole shell is kept: dropping an entire real
+        feature is worse for obstruction than keeping an unanchored one.
+        Note this is a per-mesh test, not a global one: an isolated mesh
+        keeps its shell unfiltered even when the wider grid is full.
     """
     if anchor not in ("adjacent", "connected"):
         raise ValueError(
@@ -850,7 +853,7 @@ def _overlay_surface_shell(
     seeds = surface & _dilate6(existing)
     if anchor == "adjacent":
         surface = seeds
-    elif seeds.any():
+    elif anchor == "connected" and seeds.any():
         surface = binary_propagation(seeds, mask=surface)
     # else: connected with no seed anywhere -> keep the whole shell
 

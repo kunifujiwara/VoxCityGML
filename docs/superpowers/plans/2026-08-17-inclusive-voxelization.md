@@ -6,7 +6,7 @@
 
 **Architecture:** Mode is policy resolved at the `VoxelizerConfig` boundary into three mechanism knobs (`building_shell_threshold`, `occupancy_threshold`, `shell_anchor`). The voxelizer keeps plain numeric/flag parameters, with defaults flipped to the inclusive values (shell threshold `INCLUSIVE_SHELL_THRESHOLD` = 0.25, connectivity-flood anchor). `"tight"` reproduces the 2026-08-11 behavior exactly.
 
-**Threshold revised 2026-08-17 after measurement — 0.25, not the originally-specced 0.0.** At 0.0 the shell also marks the *empty* voxel on the outside of every boundary face, inflating solid buildings 2–2.5× with voxels containing no material (aligned box 180 → 448). Any value in [0.15, 0.33] reproduces the analytic ideal — every voxel containing mesh volume, and no other — exactly on all ten calibration geometries; 0.25 is the plateau midpoint. Full table in the design spec under "Threshold calibration". The value is expected to be retuned against real PLATEAU data, so it lives in exactly one place: `INCLUSIVE_SHELL_THRESHOLD` in `models.py` (Task 3), imported by `voxelizer3d.py` for its defaults.
+**Shell metric corrected 2026-08-17 — see the design spec's "Shell metric calibration".** The inclusive threshold is **0.0**, as originally specced. What changed is the metric: `_overlay_surface_shell` now builds its SAT box *shrunk* (`voxel_size/2 - voxel_size*1e-6`) instead of expanded, so it tests whether the mesh **penetrates** a cell rather than whether it **touches the cell's boundary**. With the expanded box a face lying on a cell boundary marked both neighbours, inflating solid buildings 2–2.5× with empty voxels (aligned box 180 → 448). An intermediate "calibrated 0.25 threshold" was tried and rejected — it only looked exact on a round grid origin and leaked a full layer on a real pyproj origin. Tight mode is measurably unaffected by the shrink. Tasks 2 and 3 below still describe the constant `INCLUSIVE_SHELL_THRESHOLD` in `models.py`; its value is 0.0.
 
 **Tech Stack:** Python, numpy, scipy.ndimage (`binary_propagation`), numba, meshlib, trimesh (tests), pytest.
 
@@ -649,13 +649,14 @@ def test_default_mode_is_inclusive():
     )
 
 
-def test_inclusive_threshold_stays_on_the_calibrated_plateau():
-    """Guards the retuning contract: outside [0.15, 0.33] the mode stops
-    reproducing the analytic ideal (see the design spec's calibration
-    table), so a retune past either edge must be a deliberate, reviewed
-    change to this bound — not a silent drift."""
+def test_inclusive_threshold_is_zero():
+    """Inclusive mode does no occupancy filtering: the shell rasterizer's
+    shrunk SAT box already answers the volume question (see the design
+    spec's "Shell metric calibration").  Raising this above ~0.33 would
+    reintroduce the comb bug this mode exists to fix, so the value is
+    pinned rather than left as a tuning knob."""
     from voxcitygml.models import INCLUSIVE_SHELL_THRESHOLD
-    assert 0.15 <= INCLUSIVE_SHELL_THRESHOLD <= 0.33
+    assert INCLUSIVE_SHELL_THRESHOLD == 0.0
 
 
 def test_tight_mode_reproduces_2026_08_11_defaults():

@@ -78,6 +78,49 @@ def _bbox_to_index_range(gp: "Grid3DParams", bmin: np.ndarray, bmax: np.ndarray)
     return r0, r1, c0, c1, z0, z1
 
 
+def _boundary_epsilon(vs: float) -> float:
+    """SAT tolerance shared by ``_contact_half`` / ``_penetration_half``:
+    ``vs * 1e-6`` (~2 micron at 2 m voxels).  This is a fixed constant,
+    not a per-grid tuning knob, because two invariants hold regardless of
+    where the grid sits in space:
+
+    - It swamps coordinate rounding: ``vs * 1e-6 >> ulp(|x|)`` by at least
+      three decades for any coordinate magnitude this pipeline reaches,
+      from local metres up to raw ECEF, so the +/- choice below never
+      flips on floating-point noise alone -- only on real geometry.
+    - It is also the MINIMUM REPORTED PENETRATION DEPTH for
+      ``_penetration_half``: a cell is only marked once the mesh crosses
+      roughly 2 microns into its interior, not at first contact.
+    """
+    return vs * 1e-6
+
+
+def _contact_half(vs: float) -> np.ndarray:
+    """SAT half-extents for a BOUNDARY-CONTACT test: does geometry touch
+    this cell's closure?  Expanded by ``_boundary_epsilon``, so a face
+    lying exactly on a cell wall registers in BOTH neighbouring cells.
+    Deliberate for the legacy surface-stamp paths (``_voxelize_by_occupancy``,
+    ``_voxelize_single_mesh``): over-marking a thin or bridge feature is
+    the safer failure there.  See ``_penetration_half`` for the opposite
+    question, used by the inclusive shell.
+    """
+    return np.array([vs / 2.0 + _boundary_epsilon(vs)] * 3, dtype=np.float64)
+
+
+def _penetration_half(vs: float) -> np.ndarray:
+    """SAT half-extents for a VOXEL-PENETRATION test: does geometry enter
+    this cell's interior?  Shrunk by ``_boundary_epsilon``, so a face
+    lying exactly on a cell wall marks NEITHER neighbour -- the
+    boundary-contact box above marks BOTH neighbours of every
+    grid-aligned solid face, which inflated buildings by a full layer on
+    non-round grid origins (2026-08-17 metric fix; a round origin
+    cancelled the same bug by floating-point luck, which is how it first
+    shipped unnoticed).  Used by ``_overlay_surface_shell``'s inclusive
+    shell, where "does this cell contain mesh volume" is the question.
+    """
+    return np.array([vs / 2.0 - _boundary_epsilon(vs)] * 3, dtype=np.float64)
+
+
 def _dilate6(mask: np.ndarray) -> np.ndarray:
     if mask.size == 0:
         return mask
@@ -795,9 +838,14 @@ def _overlay_surface_shell(
 ) -> None:
     """Stamp the triangle surface shell onto the voxel grid via SAT.
 
-    This guarantees that every voxel touching an original mesh triangle
-    is marked, even when the SDF discretisation misses thin walls whose
-    thickness is smaller than the voxel size.
+    This guarantees that every voxel the mesh geometrically PENETRATES is
+    marked, even when the SDF discretisation misses thin walls whose
+    thickness is smaller than the voxel size.  A face exactly coplanar
+    with a cell wall is the edge of that guarantee, not inside it: it
+    marks NEITHER of the two cells it separates (``_penetration_half``,
+    2026-08-17 metric fix -- the previous boundary-contact box marked
+    BOTH neighbours of such a face, inflating solid buildings by a full
+    layer).
 
     When *occupancy_threshold* > 0, boundary voxels whose SURFACE-CONTACT
     occupancy is below the threshold are discarded.  This controls how
@@ -836,17 +884,11 @@ def _overlay_surface_shell(
     if r0 > r1 or c0 > c1 or z0 > z1:
         return
     nr, nc, nz = r1 - r0 + 1, c1 - c0 + 1, z1 - z0 + 1
-    # SHRINK, not expand.  A +eps box reports a cell whenever geometry
-    # touches its closure, so a face lying on a cell boundary registers in
-    # BOTH neighbours -- marking the empty cell outside every solid face
-    # and inflating buildings by a full layer.  On a round grid origin that
-    # cancelled by luck; on a real projected origin (min_x from pyproj) it
-    # does not.  A -eps box asks "does the mesh penetrate this cell's
-    # interior?", which is the volume question the inclusive mode means.
-    # The tolerance is ~2 microns at 2 m voxels: far above coordinate
-    # float noise (~1e-12), far below any real feature.
-    half_eps = gp.voxel_size * 1e-6
-    half = np.array([gp.voxel_size / 2.0 - half_eps] * 3, dtype=np.float64)
+    # Penetration test, not boundary contact: see _penetration_half's
+    # docstring for why (2026-08-17 metric fix) and _contact_half for the
+    # deliberately opposite semantics still used at the legacy / bridge
+    # surface-stamp paths.
+    half = _penetration_half(gp.voxel_size)
     verts_f64 = np.ascontiguousarray(verts, dtype=np.float64)
     faces_ip = np.ascontiguousarray(faces, dtype=np.intp)
     surface = _surface_voxelize_numba(
@@ -1126,8 +1168,11 @@ def _voxelize_by_occupancy(
     # Also compute surface shell via triangle-box overlap and union with
     # interior.  This guarantees boundary voxels are always present even
     # if ray-parity fails for some columns (edge/vertex degeneracy).
-    half_eps = vs * 1e-6
-    half = np.array([vs / 2.0 + half_eps] * 3, dtype=np.float64)
+    # Contact (expanded) box, deliberately: this is the legacy
+    # watertight-fallback surface stamp, not the inclusive shell -- see
+    # _overlay_surface_shell / _penetration_half for the 2026-08-17 metric
+    # fix and why that box is shrunk instead.
+    half = _contact_half(vs)
     surface = _surface_voxelize_numba(
         tri_verts, tri_faces,
         gp.min_x, gp.max_y, gp.min_z, vs,
@@ -1303,8 +1348,11 @@ def _voxelize_single_mesh(
     sub_cols = c1 - c0 + 1
     sub_z = z1 - z0 + 1
 
-    half_eps = gp.voxel_size * 1e-6
-    half = np.array([gp.voxel_size / 2.0 + half_eps] * 3, dtype=np.float64)
+    # Contact (expanded) box, deliberately: this is the legacy / bridge
+    # surface-stamp path, not the inclusive shell -- see
+    # _overlay_surface_shell / _penetration_half for the 2026-08-17 metric
+    # fix and why that box is shrunk instead.
+    half = _contact_half(gp.voxel_size)
 
     # Call the Numba-compiled surface voxelization kernel
     surface = _surface_voxelize_numba(

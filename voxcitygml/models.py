@@ -148,6 +148,10 @@ class CityGMLMeshCollection:
         self.vegetation.extend(other.vegetation)
 
 
+# ---------------------------------------------------------------------------
+# Pipeline configuration
+# ---------------------------------------------------------------------------
+
 #: Surface-contact occupancy threshold for the inclusive-mode surface
 #: shell.  Zero: the shell rasterizer already tests PENETRATION of the
 #: voxel interior (see the shrunk SAT box in ``_overlay_surface_shell``),
@@ -160,10 +164,6 @@ class CityGMLMeshCollection:
 #: belonged in the metric, not the threshold.
 INCLUSIVE_SHELL_THRESHOLD = 0.0
 
-
-# ---------------------------------------------------------------------------
-# Pipeline configuration
-# ---------------------------------------------------------------------------
 
 @dataclass
 class VoxelizerConfig:
@@ -215,8 +215,11 @@ class VoxelizerConfig:
             spanning two sub-slabs score >= 0.5 and are kept.  The interior
             fill independently keeps every centre-inside cell, so the shell
             only decides thin-feature and edge cells.  At 0 the shell keeps
-            every corner-grazed cell and visibly inflates the envelope
-            (2026-08-11 diagnosis).
+            every cell the mesh geometrically penetrates and no more: the
+            SAT rasterizer's tolerance was fixed (2026-08-17) to test voxel
+            interior penetration rather than boundary contact, so 0 no
+            longer inflates the envelope -- see ``INCLUSIVE_SHELL_THRESHOLD``
+            above, which is this value's calibrated inclusive-mode default.
         building_lod: Preferred CityGML building LOD (1–4) to voxelize.
                       If ``None``, the highest available LOD for each
                       building is selected automatically.

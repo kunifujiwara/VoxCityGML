@@ -18,7 +18,25 @@ Pins the 2026-08-17 inclusive-voxelization design
   ``test_inclusive_defaults_match_volume_exactly``'s real-origin grid).
 - ``VoxelizerConfig.voxelization_mode`` resolves mode -> mechanism knobs,
   with explicit threshold values overriding the mode.
+
+IMPORTANT -- a SKIPPED run of this module is a NON-RESULT, not a pass.
+Every test below that exercises the building path is ``skipif``'d on
+``_MESHLIB_VOXEL_AVAILABLE``, because the non-meshlib fallback in
+``_voxelize_building_solid`` never receives ``shell_threshold`` /
+``shell_anchor`` at all and its own surface stamp still uses the
+boundary-contact (expanded) SAT box -- i.e. without meshlib this module
+cannot verify the inclusive-mode fix even exists, let alone holds.  Two
+wrong calibrations (2026-08-17: threshold-0.0 inflation, then a 0.25
+"calibrated" threshold that only looked exact on round grid origins)
+shipped past a green suite before this was caught, so
+``test_meshlib_available_or_explicitly_opted_out`` below fails the run
+outright when meshlib is missing, unless
+``VOXCITYGML_ALLOW_NO_MESHLIB=1`` is set to explicitly accept an
+unverified run.  Even then, "0 failed" for this file means "opted out
+and skipped", never "the inclusive-mode contract was checked."
 """
+import os
+
 import numpy as np
 import pytest
 import trimesh
@@ -31,6 +49,31 @@ from voxcitygml.voxelizer3d import (
 )
 
 MS = 2.0
+
+
+def test_meshlib_available_or_explicitly_opted_out():
+    """The non-skippable guard (see the module docstring).  Every other
+    test in this file is skipif'd on meshlib and would happily vanish
+    into "skipped" if meshlib were missing -- exactly the configuration
+    where the inclusive-mode fix is entirely unverified.  This test has
+    no skipif: it fails the run unless meshlib is present or a human
+    explicitly opted out via VOXCITYGML_ALLOW_NO_MESHLIB=1."""
+    if _MESHLIB_VOXEL_AVAILABLE:
+        return
+    if os.environ.get("VOXCITYGML_ALLOW_NO_MESHLIB"):
+        pytest.skip(
+            "meshlib unavailable; VOXCITYGML_ALLOW_NO_MESHLIB=1 explicitly "
+            "accepts that every meshlib-dependent test in this module will "
+            "now skip too -- this file verifies nothing about inclusive "
+            "voxelization in this run.")
+    pytest.fail(
+        "meshlib is not installed, so every inclusive-mode test in "
+        "tests/test_inclusive_voxelization.py is about to SKIP rather "
+        "than run -- a green suite in that state does not mean the "
+        "inclusive-mode fix (2026-08-17) holds; it means it was never "
+        "checked.  Install meshlib, or set VOXCITYGML_ALLOW_NO_MESHLIB=1 "
+        "to explicitly accept an unverified run.",
+        pytrace=False)
 
 
 def make_gp():
@@ -242,7 +285,18 @@ GRID_FIXTURES = [("clean-origin", make_gp), ("real-origin", make_gp_real)]
 
 
 def _case_position(gp, x0, y0, z0):
-    """Re-anchor a case position defined relative to make_gp() onto *gp*."""
+    """Re-anchor a case position defined relative to make_gp() onto *gp*.
+
+    This deliberately holds each case's RELATIVE alignment fixed -- its
+    offset in voxel units (and fractional metres) from the grid's own
+    anchors (min_x / max_y / min_z) -- so that coordinate MAGNITUDE is the
+    only thing that changes between fixtures.  That isolation is the
+    entire point of testing a second, non-round-origin grid: if a case's
+    outcome differs between fixtures, it can only be float-noise at large
+    coordinate magnitude, never a different underlying geometry.  See
+    ``test_case_position_preserves_relative_alignment``, which checks this
+    invariant directly rather than leaving it implicit.
+    """
     ref = make_gp()
     return (gp.min_x + (x0 - ref.min_x),
             gp.max_y - (ref.max_y - y0),
@@ -250,20 +304,48 @@ def _case_position(gp, x0, y0, z0):
 
 
 def cells_containing_volume(gp, x0, y0, z0, ex, ey, ez):
-    """Voxels whose volume meets the box in a set of positive measure."""
+    """Voxels whose volume meets the box in a set of positive measure.
+
+    The inclusion tolerance matches the rasterizer's own SAT tolerance
+    (``_penetration_half`` / ``gp.voxel_size * 1e-6``), not an arbitrary
+    epsilon: this is the oracle for a penetration test, and using a
+    different tolerance would let the oracle and the contract quietly
+    drift apart in the zero-to-tol band.
+    """
+    tol = gp.voxel_size * 1e-6
     out = set()
     for row in range(gp.n_rows):
         for col in range(gp.n_cols):
             for zi in range(gp.n_z):
-                cx0 = gp.min_x + col * MS
-                cy1 = gp.max_y - row * MS
-                cz0 = gp.min_z + zi * MS
-                ox = min(cx0 + MS, x0 + ex) - max(cx0, x0)
-                oy = min(cy1, y0 + ey) - max(cy1 - MS, y0)
-                oz = min(cz0 + MS, z0 + ez) - max(cz0, z0)
-                if ox > 1e-9 and oy > 1e-9 and oz > 1e-9:
+                cx0 = gp.min_x + col * gp.voxel_size
+                cy1 = gp.max_y - row * gp.voxel_size
+                cz0 = gp.min_z + zi * gp.voxel_size
+                ox = min(cx0 + gp.voxel_size, x0 + ex) - max(cx0, x0)
+                oy = min(cy1, y0 + ey) - max(cy1 - gp.voxel_size, y0)
+                oz = min(cz0 + gp.voxel_size, z0 + ez) - max(cz0, z0)
+                if ox > tol and oy > tol and oz > tol:
                     out.add((row, col, zi))
     return out
+
+
+@pytest.mark.parametrize("label,args", INCLUSIVE_CASES,
+                         ids=[c[0] for c in INCLUSIVE_CASES])
+def test_case_position_preserves_relative_alignment(label, args):
+    """Locks down the invariant _case_position's docstring claims: the
+    ideal (volume-containment) cell SET for a case must be index-identical
+    across grid origins.  Pure geometry, no meshlib needed -- if this
+    ever fails, a mismatch in test_inclusive_defaults_match_volume_exactly
+    between fixtures would be an artifact of the re-anchoring transform,
+    not a real rasterizer bug."""
+    ideal_sets = []
+    for _, make_grid in GRID_FIXTURES:
+        gp = make_grid()
+        x0, y0, z0 = _case_position(gp, *args[:3])
+        ideal_sets.append(cells_containing_volume(gp, x0, y0, z0, *args[3:]))
+    assert ideal_sets[0] == ideal_sets[1], (
+        f"{label}: ideal cell set differs between grid origins "
+        f"({len(ideal_sets[0])} vs {len(ideal_sets[1])} cells) -- "
+        "_case_position should hold relative alignment fixed")
 
 
 @pytest.mark.skipif(not _MESHLIB_VOXEL_AVAILABLE, reason="meshlib required")

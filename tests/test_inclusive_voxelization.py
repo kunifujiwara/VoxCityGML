@@ -178,6 +178,55 @@ def test_unknown_anchor_raises():
         _overlay_surface_shell(v, f, gp, grid, -3, True, anchor="loose")
 
 
+def _flat_quad(z, x0=2.3, y0=2.3, ex=7.4, ey=7.4):
+    """Zero-thickness horizontal quad (two triangles), used to test the
+    whole-feature-lost fallback in ``_overlay_surface_shell``.  The
+    default footprint is deliberately NOT grid-aligned in x/y (2.3 / 9.7,
+    not on a cell boundary), so only *z* is under test -- an accidental
+    x/y boundary coincidence would confound the assertions below."""
+    verts = np.array([
+        [x0, y0, z], [x0 + ex, y0, z],
+        [x0 + ex, y0 + ey, z], [x0, y0 + ey, z],
+    ], dtype=float)
+    faces = np.array([[0, 1, 2], [0, 2, 3]], dtype=int)
+    return verts, faces
+
+
+def test_whole_feature_lost_fallback_saves_coincident_flat_quad():
+    """A standalone zero-thickness horizontal quad sitting exactly on a z
+    cell-plane penetrates NO voxel's interior under the penetration box
+    (2026-08-17 metric fix) and has nothing else in the grid to represent
+    it, so without the whole-feature-lost fallback it vanishes entirely.
+    This is reachable in production, not just a synthetic edge case: the
+    grid's z origin is derived from scene geometry (``scene_min_z -
+    meshsize``, not a pyproj projection), so with ``dem_source="Flat"``
+    at the default ``meshsize=1.0`` every integer elevation in the scene
+    sits exactly on a cell plane.
+    """
+    gp = make_gp()
+    z_on_plane = gp.min_z + 4 * MS         # exactly on a z cell boundary
+
+    grid_on = np.zeros((12, 12, 10), np.int16)
+    v, f = _flat_quad(z_on_plane)
+    _overlay_surface_shell(v, f, gp, grid_on, -3, True, anchor="connected")
+    assert filled(grid_on) != set(), (
+        "a flat feature exactly on a cell plane must not vanish entirely")
+
+    # The SAME quad, moved to the centre of a cell instead of its
+    # boundary: the penetration box already finds it unaided, so the
+    # fallback must never trigger here.  Confirmed by an exact-set
+    # assertion against the plain single-z-layer footprint a penetration
+    # test alone produces -- if the fallback (mistakenly) fired here too,
+    # the contact box's x/y expansion would add a surrounding ring of
+    # extra columns/rows, which this would catch.
+    z_mid = gp.min_z + 4.5 * MS
+    grid_mid = np.zeros((12, 12, 10), np.int16)
+    v2, f2 = _flat_quad(z_mid)
+    _overlay_surface_shell(v2, f2, gp, grid_mid, -3, True, anchor="connected")
+    want_mid = {(row, col, 4) for row in range(4, 8) for col in range(4, 8)}
+    assert filled(grid_mid) == want_mid
+
+
 # ── Inclusive defaults through the building path ──────────────────────
 
 @pytest.mark.skipif(not _MESHLIB_VOXEL_AVAILABLE, reason="meshlib required")
@@ -237,6 +286,61 @@ def test_shell_anchor_reaches_shell(monkeypatch):
                                 shell_anchor="adjacent")
     assert seen["anchor"] == "adjacent"
     assert seen["occupancy_threshold"] == INCLUSIVE_SHELL_THRESHOLD
+
+
+@pytest.mark.skipif(not _MESHLIB_VOXEL_AVAILABLE, reason="meshlib required")
+def test_vegetation_shell_anchor_reaches_shell(monkeypatch):
+    """_voxelize_mesh_group's vegetation branch must forward shell_anchor
+    to _overlay_surface_shell, matching test_shell_anchor_reaches_shell for
+    the building path.
+
+    This seam changed behaviour with the 2026-08-17 inclusive-voxelization
+    flip (voxelizer3d.py's vegetation branch now passes
+    anchor=shell_anchor, so the default moved from the historic "adjacent"
+    to "connected") but nobody asserted it directly.  Under "connected", a
+    thin canopy mesh with no filled voxel anywhere in its own bbox now
+    keeps its WHOLE shell (the per-mesh no-seed rule) instead of
+    contributing nothing under "adjacent" -- so tree voxel counts can only
+    move UP (more inclusive), never down, for any canopy that previously
+    lost material to the "adjacent" rule.
+    """
+    import voxcitygml.voxelizer3d as vx
+    from types import SimpleNamespace
+
+    seen = {}
+    real = vx._overlay_surface_shell
+
+    def spy(verts, faces, gp, grid, code, overwrite, **kw):
+        seen.update(kw)
+        return real(verts, faces, gp, grid, code, overwrite, **kw)
+
+    monkeypatch.setattr(vx, "_overlay_surface_shell", spy)
+
+    class _IdentityTransformer:
+        """Stands in for the real lon/lat -> local-metre Transformer:
+        _voxelize_mesh_group always reprojects mesh.vertices through one,
+        but this seam test only cares that shell_anchor reaches the shell
+        call, not real geodesy."""
+
+        def transform(self, x, y):
+            return np.asarray(x), np.asarray(y)
+
+    gp = make_gp()
+    grid = np.zeros((12, 12, 10), np.int16)
+    v, f = box((0.0, 0.3, 0.3), (12.0, 11.4, 9.4))
+    # mesh.vertices is stored (lat, lon, z); swap_coordinates_3d flips the
+    # first two columns to (lon, lat, z), and the identity transformer
+    # performs no further reprojection -- so feeding (y, x, z) here
+    # reproduces the desired local (x, y, z) = v exactly.
+    mesh = SimpleNamespace(vertices=np.column_stack([v[:, 1], v[:, 0], v[:, 2]]),
+                           faces=f)
+
+    vx._voxelize_mesh_group(
+        [mesh], _IdentityTransformer(), gp, grid,
+        class_code=vx.TREE_CODE, overwrite=False,
+        shell_anchor="adjacent",
+    )
+    assert seen["anchor"] == "adjacent"
 
 
 def make_gp_real():

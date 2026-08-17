@@ -874,6 +874,31 @@ def _overlay_surface_shell(
         feature is worse for obstruction than keeping an unanchored one.
         Note this is a per-mesh test, not a global one: an isolated mesh
         keeps its shell unfiltered even when the wider grid is full.
+
+    Whole-feature-lost fallback (2026-08-18): a mesh that is a single flat
+    surface exactly coincident with a cell-boundary plane penetrates NO
+    voxel's interior under the penetration box, so it would otherwise
+    vanish completely.  That is correct for a solid's own boundary face
+    (an adjacent wall or the winding fill already supplies that cell) but
+    wrong for a feature whose entire geometry IS that one coincident
+    plane -- exactly the failure class inclusive mode exists to fix.
+    Z-plane coincidence is reachable in production, not just a synthetic
+    edge case: the grid's z origin is derived from scene geometry
+    (``scene_min_z - meshsize``), not a pyproj projection, so with
+    ``dem_source="Flat"`` at the default ``meshsize=1.0`` every integer
+    elevation in the scene sits exactly on a cell plane.  When the
+    penetration-box rasterization comes back completely empty for a
+    non-degenerate mesh AND this mesh's own bbox has no existing
+    coverage in ``voxel_grid`` yet (the "AND" matters: an exactly
+    grid-aligned SOLID box also rasterizes to an empty penetration shell
+    on all six faces, but its interior is already filled by the winding
+    pass that runs before this function, so that emptiness is correct,
+    not lost), this function re-rasterizes that one mesh with the contact
+    (expanded) box instead, so it gets the cells its plane touches rather
+    than nothing.  This does not touch the exactness contract: every case
+    that already produces a non-empty penetration surface, or is covered
+    by prior voxel_grid content (typically the winding fill), is
+    unaffected.
     """
     if anchor not in ("adjacent", "connected"):
         raise ValueError(
@@ -897,6 +922,31 @@ def _overlay_surface_shell(
         r0, r1, c0, c1, z0, z1,
         nr, nc, nz, half,
     )
+    # Computed early (normally built just before the anchor filter below)
+    # so the whole-feature-lost fallback can see it: a mesh's own bbox
+    # already being non-empty means something upstream of this call
+    # (typically the winding fill for a proper solid) already represents
+    # it, so an empty penetration shell there is the CORRECT answer, not
+    # a lost feature -- see e.g. an exactly grid-aligned solid box, whose
+    # six faces are all coplanar with cell walls and whose penetration
+    # shell is genuinely empty, but whose interior is already filled.
+    subgrid = voxel_grid[r0:r1 + 1, c0:c1 + 1, z0:z1 + 1]
+    existing = subgrid != 0  # any non-empty voxel counts as anchor
+    if not surface.any() and not existing.any() and not np.allclose(vmin, vmax):
+        # Whole-feature-lost fallback (see the docstring above): the
+        # penetration box found nothing anywhere in this mesh's bbox, the
+        # mesh has real extent, AND nothing already fills this region --
+        # so this is not a solid whose boundary happens to be grid-
+        # aligned, it is a flat feature sitting exactly on a cell plane
+        # with no other geometry to represent it.  Re-rasterize with the
+        # contact box so it claims the cells its plane touches instead of
+        # disappearing entirely.
+        surface = _surface_voxelize_numba(
+            verts_f64, faces_ip,
+            gp.min_x, gp.max_y, gp.min_z, gp.voxel_size,
+            r0, r1, c0, c1, z0, z1,
+            nr, nc, nz, _contact_half(gp.voxel_size),
+        )
     if occupancy_threshold > 0.0:
         surface = _filter_surface_by_occupancy(
             surface, verts_f64, faces_ip, gp,
@@ -906,8 +956,6 @@ def _overlay_surface_shell(
 
     # Anchor filter: prevents stray / disconnected mesh fragments from
     # creating floating artifacts.  See the docstring for the two rules.
-    subgrid = voxel_grid[r0:r1 + 1, c0:c1 + 1, z0:z1 + 1]
-    existing = subgrid != 0  # any non-empty voxel counts as anchor
     seeds = surface & _dilate6(existing)
     if anchor == "adjacent":
         surface = seeds

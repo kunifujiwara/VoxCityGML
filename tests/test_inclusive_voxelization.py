@@ -7,8 +7,10 @@ Pins the 2026-08-17 inclusive-voxelization design
   connected *through the shell* to any filled voxel, still drops
   disconnected fragments, and keeps the whole shell when no anchor exists
   at all (per-category export grids contain no terrain to anchor on).
-- Building defaults are inclusive: shell threshold 0.0 + connected anchor
-  produce gap-free thin walls (the Plateau LOD2 "comb" bug).
+- Building defaults are inclusive: shell threshold
+  ``INCLUSIVE_SHELL_THRESHOLD`` (0.25, calibrated to match the analytic
+  volume-containment ideal) + connected anchor produce gap-free thin walls
+  (the Plateau LOD2 "comb" bug) without inflating solid buildings.
 - ``VoxelizerConfig.voxelization_mode`` resolves mode -> mechanism knobs,
   with explicit threshold values overriding the mode.
 """
@@ -16,6 +18,7 @@ import numpy as np
 import pytest
 import trimesh
 
+from voxcitygml.models import INCLUSIVE_SHELL_THRESHOLD
 from voxcitygml.voxelizer3d import (
     _MESHLIB_VOXEL_AVAILABLE,
     Grid3DParams,
@@ -185,4 +188,63 @@ def test_shell_anchor_reaches_shell(monkeypatch):
     vx._voxelize_building_solid(v, f, gp, grid, -3, True,
                                 shell_anchor="adjacent")
     assert seen["anchor"] == "adjacent"
-    assert seen["occupancy_threshold"] == 0.0   # inclusive shell default
+    assert seen["occupancy_threshold"] == INCLUSIVE_SHELL_THRESHOLD
+
+
+# The calibration guard.  Inclusive mode must produce EXACTLY the set of
+# voxels containing mesh volume: no gaps (the comb bug) and no empty
+# voxels (the threshold-0.0 inflation).  Both failure directions are
+# pinned here, so retuning INCLUSIVE_SHELL_THRESHOLD outside the
+# [0.15, 0.33] plateau fails loudly instead of silently changing every
+# building envelope.  See "Threshold calibration" in the design spec.
+INCLUSIVE_CASES = [
+    ("box exactly aligned",       (0.0,   0.0, 0.0, 12.0, 12.0, 10.0)),
+    ("box +0.05 off aligned",     (0.05,  0.0, 0.0, 12.0, 12.0, 10.0)),
+    ("box offset 0.7",            (0.7,   0.7, 0.0, 12.0, 12.0, 10.0)),
+    ("thin wall 0.5m mid-cell",   (3.9,   0.3, 0.3, 0.5, 11.4, 9.4)),
+    ("thin wall 0.5m on bound.",  (3.75,  0.3, 0.3, 0.5, 11.4, 9.4)),
+    ("very thin wall 0.1m",       (3.95,  0.3, 0.3, 0.1, 11.4, 9.4)),
+    ("thin slab 0.3m horizontal", (0.3,   0.3, 4.85, 11.4, 11.4, 0.3)),
+]
+
+
+def cells_containing_volume(x0, y0, z0, ex, ey, ez):
+    """Voxels whose volume meets the box in a set of positive measure."""
+    gp = make_gp()
+    out = set()
+    for row in range(gp.n_rows):
+        for col in range(gp.n_cols):
+            for zi in range(gp.n_z):
+                cx0 = gp.min_x + col * MS
+                cy1 = gp.max_y - row * MS
+                cz0 = gp.min_z + zi * MS
+                ox = min(cx0 + MS, x0 + ex) - max(cx0, x0)
+                oy = min(cy1, y0 + ey) - max(cy1 - MS, y0)
+                oz = min(cz0 + MS, z0 + ez) - max(cz0, z0)
+                if ox > 1e-9 and oy > 1e-9 and oz > 1e-9:
+                    out.add((row, col, zi))
+    return out
+
+
+@pytest.mark.skipif(not _MESHLIB_VOXEL_AVAILABLE, reason="meshlib required")
+@pytest.mark.parametrize("label,args", INCLUSIVE_CASES,
+                         ids=[c[0] for c in INCLUSIVE_CASES])
+def test_inclusive_defaults_match_volume_exactly(label, args):
+    from voxcitygml.voxelizer3d import _voxelize_building_solid
+    x0, y0, z0, ex, ey, ez = args
+    b = trimesh.creation.box(extents=[ex, ey, ez])
+    b.apply_translation([x0 + ex / 2, y0 + ey / 2, z0 + ez / 2])
+    v = np.asarray(b.vertices, float)
+    f = np.asarray(b.faces)
+
+    gp = make_gp()
+    grid = np.zeros((12, 12, 10), np.int16)
+    grid[:, :, 0] = -1                     # terrain floor, well below
+    _voxelize_building_solid(v, f, gp, grid, -3, True)
+
+    got = filled(grid)
+    want = cells_containing_volume(*args)
+    assert got == want, (
+        f"{label}: {len(got)} cells vs ideal {len(want)} "
+        f"({len(got - want)} empty voxels added, "
+        f"{len(want - got)} solid voxels missed)")

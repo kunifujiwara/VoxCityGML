@@ -15,7 +15,7 @@ import numpy as np
 from numba import njit, prange
 from scipy.ndimage import binary_fill_holes, binary_propagation, zoom
 
-from .models import Mesh3D, CityGMLMeshCollection
+from .models import Mesh3D, CityGMLMeshCollection, INCLUSIVE_SHELL_THRESHOLD
 from .citygml.coordinates import (
     swap_coordinates_3d,
     create_rectangle_frame_transformer,
@@ -132,7 +132,7 @@ def voxelize_citygml_meshes(
     max_voxel_ram_mb: Optional[float] = None,
     occupancy_threshold: float = 0.0,
     occupancy_subdivisions: int = 3,
-    building_shell_threshold: float = 0.0,
+    building_shell_threshold: float = INCLUSIVE_SHELL_THRESHOLD,
     shell_anchor: str = "connected",
     underground_depth: float = 0.0,
     *,
@@ -161,11 +161,12 @@ def voxelize_citygml_meshes(
             estimating surface-contact occupancy (default 3 → 27
             sub-samples).
         building_shell_threshold: Surface-contact occupancy threshold for
-            the building surface shell (default 0.0 — inclusive).  Same
-            metric as ``occupancy_threshold`` above, but applied where
-            buildings actually go: the raw-mesh shell overlaid on top of the
-            MeshLib winding fill.  See ``VoxelizerConfig.building_shell_threshold``
-            in ``models.py`` for the full explanation.
+            the building surface shell (default ``INCLUSIVE_SHELL_THRESHOLD``
+            — inclusive).  Same metric as ``occupancy_threshold`` above, but
+            applied where buildings actually go: the raw-mesh shell overlaid
+            on top of the MeshLib winding fill.  See
+            ``VoxelizerConfig.building_shell_threshold`` in ``models.py`` for
+            the full explanation.
         shell_anchor: Anchor rule for surface-shell overlays ("connected"
             default — inclusive; "adjacent" — tight).  See
             ``_overlay_surface_shell``.
@@ -880,7 +881,7 @@ def _voxelize_building_solid(
     overwrite: bool,
     occupancy_threshold: float = 0.0,
     occupancy_subdivisions: int = 3,
-    shell_threshold: float = 0.0,
+    shell_threshold: float = INCLUSIVE_SHELL_THRESHOLD,
     shell_anchor: str = "connected",
 ) -> None:
     """Voxelize one building solid.
@@ -902,9 +903,13 @@ def _voxelize_building_solid(
     instead; the two thresholds are not interchangeable.
 
     ``shell_threshold`` / ``shell_anchor`` default to the INCLUSIVE mode
-    (0.0 / "connected", 2026-08-17 design): every voxel the raw mesh
-    touches becomes solid and thin features survive via the connectivity
-    flood.  Pass 0.5 / "adjacent" for the historic tight envelope
+    (``INCLUSIVE_SHELL_THRESHOLD`` / "connected", 2026-08-17 design):
+    every voxel that CONTAINS part of the raw mesh becomes solid, and
+    thin features survive via the connectivity flood.  Note the shell
+    threshold is deliberately not 0: at 0 the surface-contact metric also
+    marks the empty voxel on the far side of every boundary face, which
+    inflates solid buildings 2-2.5x without adding any obstruction.  Pass
+    0.5 / "adjacent" for the historic tight envelope
     (``voxelization_mode="tight"``).
     """
     if _MESHLIB_VOXEL_AVAILABLE:
@@ -949,7 +954,7 @@ def _voxelize_mesh_group(
     overwrite: bool,
     occupancy_threshold: float = 0.0,
     occupancy_subdivisions: int = 3,
-    shell_threshold: float = 0.0,
+    shell_threshold: float = INCLUSIVE_SHELL_THRESHOLD,
     shell_anchor: str = "connected",
     force_surface: bool = False,
 ) -> None:

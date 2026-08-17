@@ -597,3 +597,23 @@ def test_unknown_mode_raises_at_construction():
     from voxcitygml.models import VoxelizerConfig
     with pytest.raises(ValueError):
         VoxelizerConfig(voxelization_mode="loose")
+
+
+def test_unknown_mode_set_after_construction_raises_valueerror():
+    """VoxelizerConfig is a plain mutable dataclass, so __post_init__ can be
+    bypassed.  resolved_voxel_params() is on the hot path at three
+    production call sites, and a bare KeyError('loose') from the mode table
+    is a far worse mid-pipeline diagnostic than the construction message."""
+    from voxcitygml.models import VoxelizerConfig
+    cfg = VoxelizerConfig()
+    cfg.voxelization_mode = "loose"
+    with pytest.raises(ValueError, match="voxelization_mode"):
+        cfg.resolved_voxel_params()
+
+
+def test_voxelization_modes_match_the_mode_table():
+    """VOXELIZATION_MODES is what validation accepts and _MODE_PARAMS is
+    what resolution can serve; a mode in one but not the other is either a
+    KeyError or an unreachable table entry."""
+    from voxcitygml.models import VOXELIZATION_MODES, _MODE_PARAMS
+    assert tuple(_MODE_PARAMS) == VOXELIZATION_MODES

@@ -48,6 +48,12 @@ GROUND_CODE = -1
 TREE_CODE = -2
 BUILDING_CODE = -3
 
+#: The anchor rules ``_overlay_surface_shell`` implements -- the single
+#: source of truth for the pair.  ``models._MODE_PARAMS`` picks one of
+#: these per voxelization mode; tests import this rather than restating
+#: the literals.
+SHELL_ANCHORS = ("adjacent", "connected")
+
 
 def _bbox_to_index_range(gp: "Grid3DParams", bmin: np.ndarray, bmax: np.ndarray) -> Tuple[int, int, int, int, int, int]:
     vs = gp.voxel_size
@@ -900,9 +906,9 @@ def _overlay_surface_shell(
     by prior voxel_grid content (typically the winding fill), is
     unaffected.
     """
-    if anchor not in ("adjacent", "connected"):
+    if anchor not in SHELL_ANCHORS:
         raise ValueError(
-            f"anchor must be 'adjacent' or 'connected', got {anchor!r}")
+            f"anchor must be one of {SHELL_ANCHORS}, got {anchor!r}")
     vmin = verts.min(axis=0)
     vmax = verts.max(axis=0)
     r0, r1, c0, c1, z0, z1 = _bbox_to_index_range(gp, vmin, vmax)
@@ -1047,6 +1053,14 @@ def _voxelize_building_solid(
 
 # ── Dispatcher ────────────────────────────────────────────────────────
 
+# Note for anyone revisiting the "this has too many pass-through knobs"
+# idea (2026-08-18): bundling the four into models.ResolvedVoxelParams was
+# proposed and declined, because that is a CONFIG-layer type -- its field
+# is named building_shell_threshold, which reads wrong in this function's
+# generic (vegetation-serving) body, and it carries occupancy_subdivisions
+# that no voxelization_mode influences.  If it is revisited, the right
+# shape is a MECHANISM-layer type -- ShellParams(threshold, anchor) --
+# defined here, which has neither problem.
 def _voxelize_mesh_group(
     meshes: List[Mesh3D],
     transformer,

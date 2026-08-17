@@ -962,6 +962,12 @@ def export_per_category_voxels_obj(
     center_lat: float,
     meshsize: float,
     output_dir: str,
+    # Keyword-only tail: this is an exported 14-parameter function whose
+    # optional block has already been inserted into once (2026-08-17, the
+    # two shell knobs below), silently shifting mesh_groups and
+    # underground_depth right.  The `*` makes the next such insertion
+    # structurally incapable of breaking a caller.
+    *,
     basename: str = "mesh_voxels",
     max_voxel_ram_mb: Optional[float] = None,
     occupancy_threshold: float = 0.0,

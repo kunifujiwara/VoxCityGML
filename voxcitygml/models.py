@@ -164,8 +164,6 @@ class CityGMLMeshCollection:
 #: belonged in the metric, not the threshold.
 INCLUSIVE_SHELL_THRESHOLD = 0.0
 
-VOXELIZATION_MODES = ("inclusive", "tight")
-
 
 class ResolvedVoxelParams(NamedTuple):
     """Concrete voxelizer knobs after applying ``voxelization_mode``.
@@ -179,7 +177,7 @@ class ResolvedVoxelParams(NamedTuple):
     shell_anchor: str
 
 
-_MODE_PARAMS = {
+_MODE_PARAMS: Dict[str, ResolvedVoxelParams] = {
     # Every voxel CONTAINING mesh volume becomes solid; thin features
     # survive via the connectivity-flood anchor.  Right semantics for
     # obstruction (sunlight / wind): nothing leaks through a voxel the
@@ -197,6 +195,17 @@ _MODE_PARAMS = {
         shell_anchor="adjacent",
     ),
 }
+
+#: Derived from ``_MODE_PARAMS`` rather than restated: a mode the table
+#: cannot resolve must never be accepted by validation.
+VOXELIZATION_MODES = tuple(_MODE_PARAMS)
+
+
+def _invalid_mode_error(mode) -> ValueError:
+    """The single message both validation seams report for a bad mode."""
+    return ValueError(
+        f"voxelization_mode must be one of {VOXELIZATION_MODES}, "
+        f"got {mode!r}")
 
 
 @dataclass
@@ -335,9 +344,10 @@ class VoxelizerConfig:
 
     def __post_init__(self):
         if self.voxelization_mode not in VOXELIZATION_MODES:
+            raise _invalid_mode_error(self.voxelization_mode)
+        if self.buffer_meters < 0:
             raise ValueError(
-                f"voxelization_mode must be one of {VOXELIZATION_MODES}, "
-                f"got {self.voxelization_mode!r}")
+                f"buffer_meters must be >= 0, got {self.buffer_meters}")
 
     def resolved_voxel_params(self) -> ResolvedVoxelParams:
         """Mode defaults with explicit threshold overrides applied.
@@ -347,7 +357,15 @@ class VoxelizerConfig:
         mode.  ``shell_anchor`` has no per-field override — it follows the
         mode.
         """
-        base = _MODE_PARAMS[self.voxelization_mode]
+        # Re-validated, not just trusted from __post_init__: this is a
+        # plain mutable dataclass, so `cfg.voxelization_mode = "loose"`
+        # after construction reaches here unchecked.  This method is on
+        # the hot path at three production call sites; a bare
+        # KeyError('loose') mid-pipeline is a much worse diagnostic than
+        # the construction-time message.
+        base = _MODE_PARAMS.get(self.voxelization_mode)
+        if base is None:
+            raise _invalid_mode_error(self.voxelization_mode)
         overrides = {
             key: value
             for key, value in (
@@ -398,6 +416,13 @@ def resolve_rectangles(
     """
     from .citygml.coordinates import create_rectangle
 
+    # Primary validation is now in VoxelizerConfig.__post_init__, which
+    # fails at the user's construction site instead of here, deep in the
+    # pipeline.  This copy stays as the mutation guard, for the same
+    # reason resolved_voxel_params() re-checks its mode: the dataclass is
+    # mutable, so `cfg.buffer_meters = -1` after construction reaches here
+    # unvalidated and would otherwise shrink the buffered rectangle
+    # INSIDE the target one.
     if cfg.buffer_meters < 0:
         raise ValueError(
             f"buffer_meters must be >= 0, got {cfg.buffer_meters}")

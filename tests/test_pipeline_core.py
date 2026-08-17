@@ -8,14 +8,13 @@ import voxcitygml.pipeline as pl
 from voxcitygml.models import (
     VoxelizerConfig, CityGMLMeshCollection, Mesh3D,
 )
+#: The anchors the shell rasterizer actually implements -- imported, not
+#: restated, so this stays a real check rather than a second opinion.
+from voxcitygml.voxelizer3d import SHELL_ANCHORS
 
 #: Centre coordinates only ``run_core`` can supply, so a caller that used
 #: ``cfg``'s instead is caught.
 _SENTINEL_LON, _SENTINEL_LAT = 12345.0, 6789.0
-
-#: Anchors ``_overlay_surface_shell`` knows how to honour.  Anything else
-#: reaching it is a config-seam bug, not a tuning choice.
-_VALID_SHELL_ANCHORS = ("adjacent", "connected")
 
 
 def _assert_concrete_voxel_kwargs(kwargs, where):
@@ -28,6 +27,10 @@ def _assert_concrete_voxel_kwargs(kwargs, where):
     into ``if occupancy_threshold > 0.0:`` and dies with a ``TypeError`` on
     the first real run — invisible to any test whose stub merely tolerates
     whatever it is handed.  So the stubs assert here instead.
+
+    Both are documented 0–1 occupancy fractions, so the range is checked
+    too: type alone would wave through an argument-order slip that landed
+    ``occupancy_subdivisions=3`` in a threshold slot.
     """
     for name in ("occupancy_threshold", "building_shell_threshold"):
         assert name in kwargs, f"{where} did not pass {name}"
@@ -36,9 +39,13 @@ def _assert_concrete_voxel_kwargs(kwargs, where):
             f"{where} passed {name}={value!r}; it must resolve the config "
             f"through cfg.resolved_voxel_params() rather than forward the "
             f"raw Optional attribute")
-    assert kwargs.get("shell_anchor") in _VALID_SHELL_ANCHORS, (
+        assert 0.0 <= value <= 1.0, (
+            f"{where} passed {name}={value!r}; occupancy is a 0-1 fraction, "
+            f"so this is a wrong value in the right slot (or the right "
+            f"value in the wrong slot)")
+    assert kwargs.get("shell_anchor") in SHELL_ANCHORS, (
         f"{where} passed shell_anchor={kwargs.get('shell_anchor')!r}; "
-        f"expected one of {_VALID_SHELL_ANCHORS}")
+        f"expected one of {SHELL_ANCHORS}")
 
 
 @pytest.fixture
@@ -137,12 +144,21 @@ def test_run_core_passes_resolved_voxel_params(stub_pipeline, tmp_path, mode):
 
 
 def test_run_core_forwards_explicit_threshold_override(stub_pipeline, tmp_path):
-    """An explicit threshold must survive the plumbing, beating the mode."""
-    cfg = replace(_config(tmp_path), building_shell_threshold=0.5)
+    """Explicit thresholds must survive the plumbing, beating the mode.
+
+    ``occupancy_threshold`` is covered here as well as
+    ``building_shell_threshold``: both modes resolve it to 0.0, so a user
+    override is the ONLY way it is ever non-zero — and
+    examples/run_building_gvi.py depends on exactly that.  A plumbing bug
+    that pinned it to the mode value would be invisible otherwise.
+    """
+    cfg = replace(_config(tmp_path),
+                  building_shell_threshold=0.5, occupancy_threshold=0.25)
     assert cfg.voxelization_mode == 'inclusive'
     pl.run_core(cfg)
     kwargs = stub_pipeline['voxelize_kwargs']
     assert kwargs['building_shell_threshold'] == 0.5
+    assert kwargs['occupancy_threshold'] == 0.25
     # The anchor has no per-field override; it still follows the mode.
     assert kwargs['shell_anchor'] == 'connected'
 
@@ -263,8 +279,10 @@ def test_run_and_export_forwards_explicit_threshold_override(stub_export,
                                                              tmp_path):
     import voxcitygml.pipeline_export as pe
 
-    cfg = replace(_config(tmp_path), building_shell_threshold=0.5)
+    cfg = replace(_config(tmp_path),
+                  building_shell_threshold=0.5, occupancy_threshold=0.25)
     pe.run_and_export(cfg)
     kwargs = stub_export['per_cat_kwargs']
     assert kwargs['building_shell_threshold'] == 0.5
+    assert kwargs['occupancy_threshold'] == 0.25
     assert kwargs['shell_anchor'] == 'connected'

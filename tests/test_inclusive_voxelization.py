@@ -125,3 +125,64 @@ def test_unknown_anchor_raises():
     v, f = box(*WALL)
     with pytest.raises(ValueError):
         _overlay_surface_shell(v, f, gp, grid, -3, True, anchor="loose")
+
+
+# ── Inclusive defaults through the building path ──────────────────────
+
+@pytest.mark.skipif(not _MESHLIB_VOXEL_AVAILABLE, reason="meshlib required")
+def test_thin_wall_voxelizes_gap_free_by_default():
+    """The Plateau LOD2 comb bug: a wall thinner than a voxel, crossing a
+    cell boundary so each cell sees a single face (~0.33 surface contact),
+    must voxelize with NO gaps under the default (inclusive) settings."""
+    from voxcitygml.voxelizer3d import _voxelize_building_solid
+    gp = make_gp()
+    grid = np.zeros((12, 12, 10), np.int16)
+    grid[:, :, 2] = -1                     # terrain under the wall
+    v, f = box(*WALL)
+    _voxelize_building_solid(v, f, gp, grid, -3, True)
+    got = filled(grid)
+    for cell in wall_cells():
+        assert cell in got, f"gap at {cell}"
+
+
+@pytest.mark.skipif(not _MESHLIB_VOXEL_AVAILABLE, reason="meshlib required")
+def test_tight_settings_reproduce_2026_08_11_behavior():
+    """Explicit tight knobs (shell 0.5, adjacent anchor) keep the same wall
+    sparse — the behavior 'voxelization_mode="tight"' resolves to."""
+    from voxcitygml.voxelizer3d import _voxelize_building_solid
+    gp = make_gp()
+    grid = np.zeros((12, 12, 10), np.int16)
+    grid[:, :, 2] = -1
+    v, f = box(*WALL)
+    _voxelize_building_solid(v, f, gp, grid, -3, True,
+                             shell_threshold=0.5, shell_anchor="adjacent")
+    got = filled(grid)
+    assert (5, 4, 6) not in got            # single-face cell dropped at 0.5
+
+
+@pytest.mark.skipif(not _MESHLIB_VOXEL_AVAILABLE, reason="meshlib required")
+def test_shell_anchor_reaches_shell(monkeypatch):
+    """_voxelize_building_solid must forward shell_anchor (and the new 0.0
+    shell default) to _overlay_surface_shell.
+
+    Covers seam -> shell only.  The upper plumbing (VoxelizerConfig ->
+    pipeline / export) is single-line pass-throughs left to review, matching
+    test_voxelizer_alignment.py::test_building_shell_threshold_reaches_shell.
+    """
+    import voxcitygml.voxelizer3d as vx
+
+    seen = {}
+    real = vx._overlay_surface_shell
+
+    def spy(verts, faces, gp, grid, code, overwrite, **kw):
+        seen.update(kw)
+        return real(verts, faces, gp, grid, code, overwrite, **kw)
+
+    monkeypatch.setattr(vx, "_overlay_surface_shell", spy)
+    gp = make_gp()
+    grid = np.zeros((12, 12, 10), np.int16)
+    v, f = box((0.0, 0.3, 0.3), (12.0, 11.4, 9.4))
+    vx._voxelize_building_solid(v, f, gp, grid, -3, True,
+                                shell_anchor="adjacent")
+    assert seen["anchor"] == "adjacent"
+    assert seen["occupancy_threshold"] == 0.0   # inclusive shell default

@@ -4,6 +4,12 @@ An axis-aligned box whose faces lie exactly on the 2 m grid must voxelize to
 exactly its analytic cell set -- no displacement, no dilation.  These tests
 pin the 2026-08-11 diagnosis: the old levelset path filled 294 cells where
 the answer is 180 (corner-sampled SDF stamped as centre-sampled).
+
+Since the 2026-08-17 inclusive-voxelization change the production DEFAULTS
+are shell_threshold=0.0 / shell_anchor="connected"
+(voxelization_mode="inclusive"); these tests pass the tight settings
+explicitly because they pin the tight envelope contract that
+voxelization_mode="tight" resolves to.
 """
 import numpy as np
 import pytest
@@ -89,7 +95,7 @@ def test_building_path_box_exact(off):
     building_solid(v, f, gp, grid, -3, True,
                    occupancy_threshold=0.0,
                    occupancy_subdivisions=3,
-                   shell_threshold=0.5)
+                   shell_threshold=0.5, shell_anchor="adjacent")
     got = filled(grid)
     want = expected_box_cells(gp, dx=off, dy=off)
     # The aligned winding fill supplies every centre-inside cell.  (Volume
@@ -126,7 +132,7 @@ def test_aligned_box_no_dilation():
     building_solid(v, f, gp, grid, -3, True,
                    occupancy_threshold=0.0,
                    occupancy_subdivisions=3,
-                   shell_threshold=0.5)
+                   shell_threshold=0.5, shell_anchor="adjacent")
     assert filled(grid) == expected_box_cells(gp)
     assert len(filled(grid)) == 180
 
@@ -145,14 +151,16 @@ def test_shell_threshold_discriminates_surface_contact():
         gp = make_gp()
         grid = np.zeros((12, 12, 10), np.int32)
         grid[:, :, 2] = -1                 # anchor layer under the sliver
-        building_solid(v, f, gp, grid, -3, True, shell_threshold=thr)
+        building_solid(v, f, gp, grid, -3, True, shell_threshold=thr,
+                       shell_anchor="adjacent")
         assert (len(filled(grid)) > 0) == expect_cells, f"threshold {thr}"
     # A >= half-voxel slab (1.2 m) survives threshold 0.5 regardless: its
     # centre-inside cells come from the winding fill, not the shell.
     gp = make_gp()
     grid = np.zeros((12, 12, 10), np.int32)
     v2, f2 = box_mesh(extents=(12.0, 12.0, 1.2))
-    building_solid(v2, f2, gp, grid, -3, True, shell_threshold=0.5)
+    building_solid(v2, f2, gp, grid, -3, True, shell_threshold=0.5,
+                   shell_anchor="adjacent")
     assert len(filled(grid)) > 0
 
 

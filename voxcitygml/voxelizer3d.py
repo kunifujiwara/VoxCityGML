@@ -132,7 +132,8 @@ def voxelize_citygml_meshes(
     max_voxel_ram_mb: Optional[float] = None,
     occupancy_threshold: float = 0.0,
     occupancy_subdivisions: int = 3,
-    building_shell_threshold: float = 0.5,
+    building_shell_threshold: float = 0.0,
+    shell_anchor: str = "connected",
     underground_depth: float = 0.0,
     *,
     info_out: Optional[dict] = None,
@@ -160,11 +161,14 @@ def voxelize_citygml_meshes(
             estimating surface-contact occupancy (default 3 → 27
             sub-samples).
         building_shell_threshold: Surface-contact occupancy threshold for
-            the building surface shell (default 0.5).  Same metric as
-            ``occupancy_threshold`` above, but applied where buildings
-            actually go: the raw-mesh shell overlaid on top of the MeshLib
-            winding fill.  See ``VoxelizerConfig.building_shell_threshold``
+            the building surface shell (default 0.0 — inclusive).  Same
+            metric as ``occupancy_threshold`` above, but applied where
+            buildings actually go: the raw-mesh shell overlaid on top of the
+            MeshLib winding fill.  See ``VoxelizerConfig.building_shell_threshold``
             in ``models.py`` for the full explanation.
+        shell_anchor: Anchor rule for surface-shell overlays ("connected"
+            default — inclusive; "adjacent" — tight).  See
+            ``_overlay_surface_shell``.
         info_out: Optional dict filled with facts about the voxel grid that
             the return value cannot carry, for callers that need to overlay
             revised layers onto the finished grid later:
@@ -241,6 +245,7 @@ def voxelize_citygml_meshes(
         occupancy_threshold=occupancy_threshold,
         occupancy_subdivisions=occupancy_subdivisions,
         shell_threshold=building_shell_threshold,
+        shell_anchor=shell_anchor,
     )
 
     # Bridges – thin shell structures; always use surface + dilation + fill
@@ -267,6 +272,7 @@ def voxelize_citygml_meshes(
         overwrite=False,
         occupancy_threshold=occupancy_threshold,
         occupancy_subdivisions=occupancy_subdivisions,
+        shell_anchor=shell_anchor,
     )
 
     # Land cover overlay (topmost terrain voxel)
@@ -874,7 +880,8 @@ def _voxelize_building_solid(
     overwrite: bool,
     occupancy_threshold: float = 0.0,
     occupancy_subdivisions: int = 3,
-    shell_threshold: float = 0.5,
+    shell_threshold: float = 0.0,
+    shell_anchor: str = "connected",
 ) -> None:
     """Voxelize one building solid.
 
@@ -893,6 +900,12 @@ def _voxelize_building_solid(
     succeeds — it only governs the fallback cascade below.  The shell
     overlaid on the winding fill is controlled by ``shell_threshold``
     instead; the two thresholds are not interchangeable.
+
+    ``shell_threshold`` / ``shell_anchor`` default to the INCLUSIVE mode
+    (0.0 / "connected", 2026-08-17 design): every voxel the raw mesh
+    touches becomes solid and thin features survive via the connectivity
+    flood.  Pass 0.5 / "adjacent" for the historic tight envelope
+    (``voxelization_mode="tight"``).
     """
     if _MESHLIB_VOXEL_AVAILABLE:
         ok = _voxelize_meshlib_winding(
@@ -904,6 +917,7 @@ def _voxelize_building_solid(
                 verts, faces, gp, voxel_grid, class_code, overwrite,
                 occupancy_threshold=shell_threshold,
                 occupancy_subdivisions=occupancy_subdivisions,
+                anchor=shell_anchor,
             )
             return
 
@@ -935,7 +949,8 @@ def _voxelize_mesh_group(
     overwrite: bool,
     occupancy_threshold: float = 0.0,
     occupancy_subdivisions: int = 3,
-    shell_threshold: float = 0.5,
+    shell_threshold: float = 0.0,
+    shell_anchor: str = "connected",
     force_surface: bool = False,
 ) -> None:
     """Voxelize a group of meshes (buildings, bridges, or vegetation).
@@ -976,6 +991,10 @@ def _voxelize_mesh_group(
             from ``occupancy_threshold``: the shell is unioned on top of the
             winding fill and is reached even when ``occupancy_threshold``
             is not (see the buildings branch above).
+        shell_anchor: Anchor rule for every ``_overlay_surface_shell``
+            call this group makes (building shell and vegetation shell):
+            "connected" (default, inclusive) or "adjacent" (tight).  See
+            ``_overlay_surface_shell``.
         force_surface: If True, always use surface + dilation + fill
             (legacy) or winding-number (MeshLib) instead of the closed-
             mesh path.  Recommended for thin shell structures (bridges).
@@ -999,6 +1018,7 @@ def _voxelize_mesh_group(
                 occupancy_threshold=occupancy_threshold,
                 occupancy_subdivisions=occupancy_subdivisions,
                 shell_threshold=shell_threshold,
+                shell_anchor=shell_anchor,
             )
 
         # ── Bridges (force_surface) ──────────────────────────────────
@@ -1030,6 +1050,7 @@ def _voxelize_mesh_group(
                         class_code, overwrite,
                         occupancy_threshold=occupancy_threshold,
                         occupancy_subdivisions=occupancy_subdivisions,
+                        anchor=shell_anchor,
                     )
                     continue
             _voxelize_single_mesh(

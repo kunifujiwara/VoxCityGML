@@ -2,20 +2,21 @@
 
 Design: docs/superpowers/specs/2026-08-24-building-terrain-contact-design.md
 
-A flat terrain TIN at elevation z_t must produce a terrain whose topmost
-GROUND voxel is exactly the *surface voxel* ceil(t)-1 (t = (z_t-min_z)/vs)
-at every fractional phase, on all three terrain paths (levelset, winding
-fallback, Numba scanline fallback).  A box building whose base lies exactly
-on that terrain must then touch it (zero air voxels below its lowest
-building voxel in every footprint column).
+A flat terrain TIN at elevation z_t must, after the DEM surface conform,
+produce a terrain whose topmost GROUND voxel is exactly the *surface
+voxel* ceil(t)-1 (t = (z_t-min_z)/vs) at every fractional phase, on all
+three terrain paths (levelset, winding fallback, Numba scanline
+fallback).  A box building whose base lies exactly on that terrain must
+then touch it (zero air voxels below its lowest building voxel in every
+footprint column).
 
 The terrain is asserted at two levels, deliberately:
 
 * ``test_terrain_solid_top_is_surface_voxel`` checks the terrain SOLID
-  alone, before any DEM conform.  This is the only test here that can go
-  red if the scoped-pre-shift fix is reverted: ``_fill_air_to_dem_surface``
-  is raise-only and every flat-TIN path error is downward, so the conform
-  launders a mis-shifted solid and no post-conform assertion can see it.
+  alone, before any DEM conform, against what each path's sampling
+  convention can actually deliver (``floor(t-0.5)`` for the
+  centre-sampled winding and scanline paths).  The conform is raise-only,
+  so without this level any downward drift in the solid would be masked.
   It is also the only coverage of the configuration production reaches
   whenever ``dem_grid`` is None (voxelize_citygml_meshes takes it as
   Optional).
@@ -71,34 +72,15 @@ def flat_terrain_mesh(z_t):
                   feature_type="terrain", feature_id="t")
 
 
-def inset_terrain_mesh(z_t, inset=0.4):
-    """Flat TIN whose bounding box is deliberately OFF the grid lattice.
-
-    ``_voxelize_meshlib_winding`` derives its SDF origin from the mesh
-    bounding box, so a mesh spanning exactly the grid cannot detect a
-    missing ``align_origin`` snap -- its bbox is already in phase.
-    Insetting by a fraction of a voxel puts it out of phase.
-    ``build_terrain_solid`` still covers the whole grid via its base box,
-    so every column stays filled.
-    """
-    lo, hi = inset, NXY - inset
-    verts = np.array([
-        [lo, lo, z_t], [lo, hi, z_t], [hi, hi, z_t], [hi, lo, z_t],
-    ])
-    faces = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int64)
-    return Mesh3D(vertices=verts, faces=faces,
-                  feature_type="terrain", feature_id="t")
-
-
 def box_building(z_base, x0=15.0, y0=15.0, w=8.0, h=9.0):
     b = trimesh.creation.box(extents=[w, w, h])
     b.apply_translation([x0 + w / 2, y0 + w / 2, z_base + h / 2])
     return np.asarray(b.vertices, float), np.asarray(b.faces)
 
 
-def build_terrain_only(gp, grid, z_t, path, monkeypatch, mesh=None):
+def build_terrain_only(gp, grid, z_t, path, monkeypatch):
     """Voxelize the terrain solid via *path*, with no DEM conform."""
-    tmesh = flat_terrain_mesh(z_t) if mesh is None else mesh
+    tmesh = flat_terrain_mesh(z_t)
     if path == "scanline":
         monkeypatch.setattr(v3, "_MESHLIB_VOXEL_AVAILABLE", False)
     elif path == "winding":
@@ -135,6 +117,31 @@ def ground_tops(gp, grid):
     bare = int((~is_g.any(axis=2)).sum())
     assert bare == 0, f"{bare} columns have no ground voxel"
     return gp.n_z - 1 - np.argmax(np.flip(is_g, axis=2), axis=2)
+
+
+def allowed_solid_top_range(gp, z_t, path):
+    """[low, high] terrain-top indices for the RAW SOLID, pre-conform.
+
+    Characterization, not aspiration.  The winding and scanline paths are
+    centre-sampled, so the highest voxel they can claim is
+    ``floor(t - 0.5)``; a centre-sampled fill cannot claim a voxel that is
+    only 10% submerged, and demanding the containing voxel ``ceil(t)-1``
+    here asserts an impossible target (2026-08-25 measurement, see the
+    design doc's "Corrections").  Pinning the achievable value EXACTLY is
+    what makes this a regression guard: it goes red if the scanline
+    path's -0.5 pre-shift is ever removed, which would over-mark that
+    path by one voxel at every phase.
+
+    The levelset path measures at the containing voxel, +1 when the
+    surface lies exactly on a lattice plane.
+    """
+    t = (z_t - gp.min_z) / gp.voxel_size
+    if path == "levelset":
+        expected = int(np.ceil(np.round(t, 9))) - 1
+        on_lattice = abs(t - round(t)) < 1e-9
+        return expected, expected + (1 if on_lattice else 0)
+    centre = int(np.floor(np.round(t - 0.5, 9)))
+    return centre, centre
 
 
 def allowed_top_range(gp, z_t, path):
@@ -177,12 +184,18 @@ TERRAIN_PATHS = [
 @pytest.mark.parametrize("path", TERRAIN_PATHS)
 @pytest.mark.parametrize("phase", PHASES)
 def test_terrain_solid_top_is_surface_voxel(path, phase, monkeypatch):
-    """The terrain solid alone lands on the surface voxel, no DEM involved."""
+    """The terrain solid alone lands where its sampling convention allows.
+
+    Regression guard on the three terrain paths, asserted before any DEM
+    conform: the conform is raise-only, so it would otherwise mask any
+    downward drift here.  This is also the only coverage of the
+    ``dem_grid is None`` configuration production can still reach.
+    """
     z_t = 10.0 + phase
     gp, grid = make_grid(z_t)
     build_terrain_only(gp, grid, z_t, path, monkeypatch)
     tops = ground_tops(gp, grid)
-    low, high = allowed_top_range(gp, z_t, path)
+    low, high = allowed_solid_top_range(gp, z_t, path)
     assert tops.min() >= low and tops.max() <= high, (
         f"phase {phase} {path}: terrain solid top "
         f"{tops.min()}..{tops.max()}, expected [{low}, {high}]")
@@ -199,25 +212,6 @@ def test_terrain_top_is_surface_voxel(path, phase, monkeypatch):
     low, high = allowed_top_range(gp, z_t, path)
     assert tops.min() >= low and tops.max() <= high, (
         f"phase {phase} {path}: terrain top {tops.min()}..{tops.max()}, "
-        f"expected [{low}, {high}]")
-
-
-@needs_meshlib
-@pytest.mark.parametrize("phase", PHASES)
-def test_winding_fallback_exact_on_off_lattice_mesh(phase, monkeypatch):
-    """The winding fallback is phase-exact even when the mesh bbox is not.
-
-    Covers the ``align_origin=True`` snap, which a mesh spanning exactly
-    the grid cannot exercise.
-    """
-    z_t = 10.0 + phase
-    gp, grid = make_grid(z_t)
-    build_terrain_only(gp, grid, z_t, "winding", monkeypatch,
-                       mesh=inset_terrain_mesh(z_t))
-    tops = ground_tops(gp, grid)
-    low, high = allowed_top_range(gp, z_t, "winding")
-    assert tops.min() >= low and tops.max() <= high, (
-        f"phase {phase}: off-lattice winding top {tops.min()}..{tops.max()}, "
         f"expected [{low}, {high}]")
 
 

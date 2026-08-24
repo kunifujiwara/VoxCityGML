@@ -793,3 +793,82 @@ def test_parse_cache_round_trip_on_real_dataset(tmp_path):
     # margin absorbs CI noise while still failing if caching regresses.
     assert t_warm < t_cold / 2, (
         f"cache gave no speedup: {t_cold:.2f}s -> {t_warm:.2f}s")
+
+
+# ---------------------------------------------------------------------------
+# Building/terrain contact (2026-08-25)
+# ---------------------------------------------------------------------------
+
+@requires_dataset
+@pytest.mark.slow
+def test_lod2_buildings_sit_on_the_terrain(tmp_path):
+    """No unintentional air gap between a building bottom and the ground.
+
+    The bug this guards (docs/superpowers/specs/
+    2026-08-24-building-terrain-contact-design.md): terrain was voxelized
+    systematically low -- 47.6% of open columns a full voxel below centre
+    sampling on the reference area -- so buildings whose base sits at
+    ground level in the source data still floated.  Only 1.4% of open
+    columns landed within [0, vs) of the DEM before the fix; the conform
+    raised that to 99.8%.
+
+    Two assertions, both on real geometry rather than on a fixed count:
+
+    * every column the terrain conform reached carries its ground within
+      one voxel of the DEM;
+    * a building column may only have air beneath it when the building's
+      OWN base is genuinely elevated -- more than a voxel above ground in
+      the source mesh.  That is the pilotis / podium case, which must be
+      preserved, not closed (user constraint, 2026-08-24).  Anything
+      floating with its base at ground level is the defect.
+    """
+    from voxcitygml import VoxelizerConfig
+    from voxcitygml.pipeline import run_core
+    from voxcitygml.citygml.coordinates import create_rectangle
+
+    meshsize = 2.0
+    cfg = VoxelizerConfig(
+        citygml_path=DATASET,
+        rectangle_vertices=create_rectangle(139.7725, 35.6481, 200),
+        meshsize=meshsize,
+        building_lod=2,
+        land_cover_source="CityGML",
+        canopy_height_source="Static",
+        output_dir=str(tmp_path),
+        save_output=False,
+        use_parse_cache=False,
+    )
+    art = run_core(cfg)
+    grid, dem, bmh = art.voxel_grid, art.dem_grid, art.building_min_height_grid
+    min_z, n_z = art.voxel_min_z, grid.shape[2]
+
+    is_b = grid == BUILDING_CODE
+    has_b = is_b.any(axis=2)
+
+    # -- terrain conformance on open (non-building) columns --------------
+    solid = (grid != 0) & ~is_b & (grid != TREE_CODE)
+    open_cols = solid.any(axis=2) & ~has_b
+    tops = n_z - 1 - np.argmax(np.flip(solid, axis=2), axis=2)
+    delta = (min_z + (tops[open_cols] + 1) * meshsize) - dem[open_cols]
+    within = float(((delta >= 0) & (delta < meshsize)).mean())
+    assert within > 0.95, (
+        f"only {within:.1%} of open columns carry ground within "
+        f"[0, {meshsize}) m of the DEM (was 1.1% pre-fix, 99.9% post-fix); "
+        f"terrain placement has regressed")
+
+    # -- no building floats unless its own base is elevated --------------
+    floating = []
+    for r, c in zip(*np.nonzero(has_b)):
+        bottom = int(np.argmax(is_b[r, c]))
+        below = np.nonzero(grid[r, c, :bottom] != 0)[0]
+        if bottom - (int(below[-1]) if len(below) else -1) - 1 <= 0:
+            continue
+        # h_min is metres of real mesh geometry above the DEM, so this
+        # discriminates a pilotis from a misalignment at any voxel size.
+        h_min = min((s[0] for s in bmh[r, c]), default=None)
+        if h_min is None or h_min <= meshsize:
+            floating.append((int(r), int(c), None if h_min is None
+                             else round(float(h_min), 2)))
+    assert not floating, (
+        f"{len(floating)} building column(s) float with their base at "
+        f"ground level (r, c, h_min): {floating[:10]}")

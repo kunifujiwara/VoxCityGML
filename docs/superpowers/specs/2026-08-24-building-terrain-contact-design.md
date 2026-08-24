@@ -1,119 +1,160 @@
 # Building–Terrain Contact Fix — Design
 
-**Date:** 2026-08-24
+**Date:** 2026-08-24 (substantially revised 2026-08-25 after measurement
+refuted the original D1 — see "Corrections" below)
 **Scope:** `voxcitygml` terrain voxelization + building ground contact
-(voxelizer3d.py, pipeline.py, models.py, cli.py)
+(voxelizer3d.py, pipeline.py)
 **Symptom (VoxCityApp, PLATEAU LOD2):** unintentional air gaps between
 building bottoms and the terrain surface below, for some buildings.
 **Constraint (user, 2026-08-24):** pilotis — intentional open ground
 floors — must NOT be closed by the fix.
 
-## Investigation summary
+## Conventions
 
-Reproduction/diagnosis scripts: session scratchpad
-`diagnose_floating_buildings.py` (real-data per-column gap measurement)
-and `phase_sweep.py` (synthetic flat-TIN + box-building phase sweep).
+`t = (z − gp.min_z) / voxel_size` is an elevation in voxel units.
 
-A gap appears in a column when
+* **containing voxel** — `ceil(t) − 1`: the voxel whose interior holds
+  `z`. For a surface exactly on a lattice plane this is the voxel below,
+  matching `_penetration_half` semantics.
+* **centre-sampled voxel** — `floor(t − 0.5)`: the topmost voxel whose
+  *centre* lies at or below `z`. This is what any centre-sampled solid
+  voxelizer produces.
 
-```
-(terrain placement error) + (building base − terrain surface) ≥ 1 voxel
-```
+The two differ exactly when `frac(t) ∈ (0, 0.5)`, where the centre-sampled
+result is one lower. This distinction is load-bearing throughout.
 
-Both terms were measured on real PLATEAU data:
+## Measured facts
 
-1. **Terrain fallback double-shift (deterministic bug).**
-   `_voxelize_terrain_solid` pre-shifts the terrain solid down by
-   0.5·voxel to compensate the *levelset* stamp's corner-sampling bias —
-   but the same pre-shifted vertices are also fed to the **winding
-   fallback** (non-watertight solids) and the **Numba scanline
-   fallback**, which are centre-sampled and need no compensation.
-   Synthetic sweep result (base exactly on terrain, winding fallback):
-   **1-voxel air gap under the whole building at ~40 % of fractional
-   phases** (0.1, 0.2, 0.6, 0.7 of a voxel). The fallback winding call
-   also omits `align_origin=True`, so its lattice phase is per-mesh
-   (bbox-dependent) — the same class of bug fixed for buildings on
-   2026-08-11.
+Tools: session scratchpad `acceptance_contact.py` (per-column gaps,
+classified by mesh-accurate bottom height) and `mechanism.py` (per-gap-column
+attribution). Site: Ochanomizu 500 m @ 2 m (139.7592, 35.6989, Chiyoda
+dataset), 37 807 building columns, plus Chuo 200 m @ 2 m.
 
-2. **Levelset terrain path is phase-dependent even when watertight.**
-   Measured `terrain_top_face − DEM` on real TINs (expected `[0, vs)`):
-   Chuo 2 m: median **−1.48 m**; Ochanomizu 500 m 2 m: median −0.97 m;
-   same site 1 m: +0.49 m; Kudanzaka 2 m: +0.79 m. The sign flips with
-   the grid's z-phase (`min_z` is derived from scene geometry, so moving
-   the target rectangle changes it). On an adverse phase the terrain
-   sits up to a voxel low **district-wide**.
+1. **The building term is correct.** For gap columns,
+   `building_bottom − floor(t + h_min/vs)` has mean −0.20 and range
+   [−1, +1]. Buildings land where the model predicts. The building path
+   is not implicated.
 
-3. **No ground-contact invariant + source-data offsets.** Buildings are
-   voxelized at absolute elevation. In PLATEAU LOD2, building bases sit
-   slightly above the local TIN for a meaningful minority (Kudanzaka: 8
-   of 70 up to +0.7 m; Ochanomizu: 53 of 870, max +3.0 m; Sumida: median
-   −0.01 m — i.e. entire districts sit *exactly at* the surface, one bad
-   phase away from floating). The legacy 2.5-D voxelizer guaranteed
-   contact by construction; the 3-D voxelizer has no equivalent.
+2. **The terrain term is systematically low.** Across all open terrain
+   columns, `terrain_top − floor(t − 0.5)` is **−1 for 47.6%** and 0 for
+   50.8%, with a thin tail to −4 and only 0.4% above 0. A ~50/50 split
+   between −1 and 0 is the signature of a **half-voxel downward
+   displacement**: terrain is landing near `floor(t − 1)` rather than
+   `floor(t − 0.5)`. On the 26 gap columns specifically the offset is
+   worse — mean −1.38, reaching −3.
 
-4. **Replacement-DEM path.** `_fill_terrain_from_dem` uses
-   `np.rint` (over/under-fills by up to half a voxel, phase-dependent),
-   and `anchor_meshes_to_dem` seats each mesh rigidly from one centroid
-   cell (documented limitation).
+3. **The error is one-sided.** 48.6% of columns are placed too low;
+   0.4% too high. Whatever the precise cause, a *raise-only* correction
+   addresses essentially the entire defect and risks nothing in the
+   over-fill direction.
 
-Why it reproduces only sometimes: flat districts share one fractional
-phase, so a generation either has no gaps at all or floats whole blocks;
-the phase changes with the drawn rectangle (via `min_z`), which matches
-the "some buildings / some runs" symptom from the app.
+4. **Source-data offsets are real but small.** PLATEAU LOD2 bases sit
+   above the local TIN for a minority of buildings (Kudanzaka: 8 of 70,
+   max +0.71 m; Ochanomizu: 53 of 870, max +3.0 m). Every one of the 26
+   observed gap columns had `h_min ≤ 1.12 m` — i.e. **less than one voxel
+   at 2 m**. Data offset alone did not cause a single observed gap.
 
-Also observed, out of scope here (flagged to the user):
-`dem_source="GSI DEM Japan"` silently returns an all-zero DEM when Earth
-Engine is not initialized.
+5. **Pre-fix gap counts** (2 m voxels): Chuo 200 m — 0 gap columns (its
+   terrain is low enough that buildings are *buried* rather than
+   floating); Ochanomizu 500 m — 15 sub-tolerance gap columns plus 11
+   "fringe" columns that have building voxels but no
+   `building_min_height_grid` segments. Several gap columns report
+   `h_min = 0.00 m`: the base sits exactly at ground in the source data
+   and the column still floats. Those are pure voxelizer placement error
+   with no data offset component at all.
+
+## Corrections to the original (2026-08-24) design
+
+The original design attributed the bug primarily to **D1**: a
+−0.5·voxel pre-shift, intended for the MeshLib levelset stamp, leaking
+into the centre-sampled winding and Numba scanline fallbacks. That
+premise is **withdrawn**. It rested on a synthetic sweep
+(`phase_sweep.py`) whose grid phase never actually varied: it set
+`z_min = z_t − 4.0 − VS` while sweeping `z_t`, so `min_z` tracked `z_t`
+and `t` stayed pinned at exactly 5.0 at every "phase". The apparent
+phase-dependent failures were floating-point tie-breaking around an
+integral `t`, not a real phase sweep.
+
+Measurement on a correct sweep (grid phase genuinely varied) shows:
+
+* the −0.5 pre-shift has **no effect at all** on the winding path — that
+  path derives its SDF origin from the mesh bounding box, so a uniform
+  z-translation of the whole solid moves the bbox with it and cancels;
+* the pre-shift **is currently a correct compensation** on the Numba
+  scanline path, which over-marks by one voxel without it (it stamps
+  with the inclusive `_contact_half` box). Removing it regresses that
+  path by +1 at every phase;
+* consequently the planned D1 change would have fixed nothing on winding
+  and introduced a scanline regression.
+
+**D1 is dropped. The three terrain paths are left exactly as they are.**
+
+Two further consequences of the corrected model, both verified
+analytically:
+
+* With centre-sampled terrain (`floor(t−0.5)`) and a penetration-shelled
+  building (bottom = `floor(t)` for fractional `t`), the gap is
+  `floor(t) − floor(t−0.5) − 1 ∈ {−1, 0}` — **never positive**. A
+  synthetic flat case therefore cannot reproduce the bug at all, which
+  is why the real-data measurement above was necessary.
+* `ceil(t) − 1` is **unachievable** by a centre-sampled path: such a path
+  cannot claim a voxel that is only 10% submerged. Any test asserting it
+  against the raw terrain solid is asserting an impossible target.
 
 ## Decisions
 
 | # | decision |
 |---|----------|
-| D1 | **Scope the −0.5·voxel pre-shift to the levelset call only.** The winding fallback gets raw vertices and `align_origin=True`; the Numba scanline fallback gets raw vertices. This kills the deterministic fallback bias and makes the fallback phase-exact, mirroring the 2026-08-11 building fix. |
-| D2 | **Conform terrain to the DEM surface voxel (raise-only).** One new function `_fill_air_to_dem_surface(voxel_grid, gp, dem_grid)` fills every AIR cell at or below the *surface voxel index* `floor((dem − min_z)/vs − ε)` with `GROUND_CODE`. It runs after terrain-solid voxelization whenever a DEM exists and **replaces both** `_fill_terrain_from_dem` (no-terrain case: fills whole columns) and `_fill_terrain_gaps_from_dem` (river/failed-union gaps), and additionally tops up columns the solid left low. `rint` → `floor(−ε)` fixes the half-voxel overfill and establishes the penetration-consistent convention: the terrain surface voxel is the voxel *containing* the surface (half-open upward; a surface exactly on a lattice plane belongs to the voxel below, matching `_penetration_half` semantics). No carving: overfill from the levelset path is left in place (pre-existing, benign, out of scope). |
-| D3 | **Pilotis-safe bounded ground-contact closure.** New `close_building_ground_gaps(voxel_grid, building_min_height_grid, tolerance_m)` in voxelizer3d.py, called from `run_core` after `voxelize_citygml_meshes`. For each column containing building voxels, take the **mesh-accurate** bottom height above ground `h_min = min(seg[0] for seg in building_min_height_grid[r, c])` (fringe columns with voxels but no segments get the nearest claimed column's value via `distance_transform_edt`, the `fill_building_id_gaps` precedent). If `0 ≤ h_min ≤ tolerance_m` and air separates the lowest building voxel from the support below, fill that air with `GROUND_CODE`. Pilotis columns have `h_min` ≈ slab clearance (≥ ~2.2 m) and are never touched — the discrimination is in metres of real geometry, so it works at any voxel size (a voxel-count rule cannot distinguish a 2.5 m pilotis from a 0.3 m misalignment at 2 m voxels). |
-| D4 | **Config knob** `VoxelizerConfig.ground_contact_tolerance: float = 1.5` (metres; `0` disables closure), exposed in the CLI as `--ground-contact-tolerance`. Default 1.5 sits between observed data offsets (p95 < 1 m) and minimum plausible pilotis clearance (~2.2 m). |
-
-## Contact invariant achieved
-
-With D1+D2, terrain and buildings share penetration semantics: a
-building whose base coincides with the terrain surface claims (or is
-adjacent above) the same voxel the terrain surface claims — contact at
-every phase, proven by the phase-sweep tests across all three terrain
-paths. In fact any base offset smaller than one voxel can no longer
-gap at all (a gap now requires the offset to span a second lattice
-plane), so D3 only ever acts on genuine source-data offsets in the
-`(voxel_size, tolerance]` band; anything larger (pilotis, podiums,
-genuine overhangs) is preserved.
-
-## Consequences accepted
-
-- Flat/named-DEM ground drops by up to one voxel versus the old `rint`
-  fill (the old behaviour over-filled; re-anchored buildings sit exactly
-  on the surface voxel under the new convention, and D3 covers sub-
-  tolerance offsets). Dataset-gated integration numbers may shift.
-- The levelset path keeps its compensated corner-sampling stamp and its
-  occasional +1 overfill; fixing `_stamp_meshlib_mask`'s convention
-  remains out of scope (as documented on 2026-08-11) and D2 makes the
-  fix insensitive to it in the gap direction.
-- Closure writes plain `GROUND_CODE` under buildings; it does not
-  re-run the land-cover overlay for those hidden cells.
-- A pilotis thinner than one voxel (stilts at coarse mesh) may still
-  leave its slab visually floating — correct per the constraint: we do
-  not fabricate ground there.
+| **D2** (the fix) | **Conform terrain to the DEM surface voxel, raise-only.** One new `_fill_air_to_dem_surface(voxel_grid, gp, dem_grid)` fills every AIR cell at or below the containing voxel `ceil(t)−1` with `GROUND_CODE`. It runs after terrain-solid voxelization whenever a DEM exists, and **replaces both** `_fill_terrain_from_dem` (no-terrain case) and `_fill_terrain_gaps_from_dem` (river / failed-union gaps), additionally raising columns the solid left low. Two defects die together: the old helpers' `np.rint` level (round-half-up, up to half a voxel off in *either* direction), and the one-sided terrain displacement measured above. Raise-only and air-only: nothing is ever carved down, so the 0.4% of columns placed high are untouched and the levelset path's occasional overfill is preserved as-is (pre-existing, out of scope). |
+| **D2 gives the contact invariant** | After the conform, `terrain_top ≥ ceil(t_dem)−1`, while a building based at the DEM has `bottom = floor(t_dem)`, which equals `ceil(t_dem)−1` for fractional `t` and `t−1+1` at integral `t`. Contact (or overlap) is guaranteed at **every** grid phase, independent of which path placed the solid and independent of its bias. This is why the fix works without needing to diagnose MeshLib's stamp convention. |
+| **D3** (deferred, not implemented) | A pilotis-safe, tolerance-bounded ground-contact closure was designed for residual source-data offsets. Analysis now shows its useful band is only `(voxel_size, tolerance]` metres: any base offset below one voxel cannot produce a gap once D2 holds. At the app's 2 m default with a 1.5 m tolerance **that band is empty**, and every one of the 26 observed gap columns had `h_min ≤ 1.12 m` — all closed by D2 alone. D3 is therefore **not implemented**: it would add a config field, a CLI flag, pipeline wiring and a closure pass to address a case not observed. It is revisited only if acceptance measurement leaves residual gaps. Not fabricating ground also honours the pilotis constraint in the strongest possible way — nothing is ever invented under a building. |
 
 ## Testing
 
-New `tests/test_terrain_building_contact.py`: synthetic flat-TIN phase
-sweeps (10 phases × {levelset, forced-winding-fallback, forced-scanline})
-asserting (a) terrain top voxel == surface voxel (exact for winding /
-scanline; levelset may over-fill +1, accepted), (b) zero air gap for a
-box building with base on the terrain, (c) +1.45 m base offset (the
-smallest that floats once terrain is exact at 1 m voxels, still ≤
-tolerance) closed by D3, (d) 3 m slab (pilotis) NOT closed. Dataset-
-gated addition to `test_integration_plateau.py`:
-zero sub-tolerance gap columns on the reference rectangle.
+`tests/test_terrain_building_contact.py` asserts at two levels:
 
-Acceptance: rerun the scratchpad diagnostic on Chuo 2 m / Kudanzaka 1 m &
-2 m / Ochanomizu 500 m 2 m — expect `terrain_top_face − dem` median
-within `[0, vs)` on every run and zero gap columns with `h_min ≤ 1.5`.
+* **Pre-conform** (`test_terrain_solid_top_is_surface_voxel`) — the
+  terrain solid alone must be exactly `floor(t − 0.5)` on the
+  centre-sampled winding and scanline paths, at every phase. This is a
+  characterization/regression guard, not a target: it goes red if the
+  scanline pre-shift is ever removed (the regression the withdrawn D1
+  would have caused), and it is the only coverage of the
+  `dem_grid is None` configuration production can still reach. The
+  levelset path is asserted separately with its measured tolerance.
+* **Post-conform** (`test_terrain_top_is_surface_voxel`,
+  `test_building_on_terrain_touches`) — solid + conform together, which
+  is what the pipeline ships. `ceil(t)−1` is the right expectation here
+  because the conform can achieve it.
+
+`test_winding_fallback_exact_on_off_lattice_mesh` was **removed**: the
+inset mesh it relied on does not put the solid's bbox off-lattice,
+because `build_terrain_solid` unions the TIN with a base box spanning
+`grid_bounds` (terrain_solid.py) and the union's bbox spans the whole
+grid regardless. It produced byte-identical results to the on-lattice
+case at all phases — duplicate coverage at 8× the cost.
+
+Dataset-gated addition to `test_integration_plateau.py`: zero gap
+columns on the reference rectangle.
+
+**Acceptance** (pre-fix numbers recorded for comparison): Ochanomizu
+500 m @ 2 m must go from 15 sub-tolerance + 11 fringe gap columns to
+**0**, and the share of open columns whose `terrain_top_face − dem` lies
+in `[0, vs)` must rise from **1.4%** toward 100%. Chuo 200 m @ 2 m must
+stay at 0 gap columns and rise from **1.1%**.
+
+## Open, deliberately not chased
+
+The precise reason the levelset path lands half a voxel low on real TINs
+while measuring exact on a synthetic flat plane is unresolved. Candidates:
+the documented `_stamp_meshlib_mask` truncation-instead-of-floor defect
+combined with a non-grid-aligned SDF lattice (the levelset path passes no
+`align_origin`), and possible registration differences between the
+lon/lat DEM grid and the rotated metric voxel grid. D2's raise-only
+conform corrects the low direction whatever the cause, so this is
+recorded rather than pursued. A future fix of `_stamp_meshlib_mask`'s
+convention must still remove the levelset branch's −0.5 compensation in
+the same change, or terrain will double-correct.
+
+Separately: `dem_source="GSI DEM Japan"` silently returns an all-zero DEM
+when Earth Engine is not initialized, and the pipeline proceeds on that
+flat plane. Reported, not fixed here.

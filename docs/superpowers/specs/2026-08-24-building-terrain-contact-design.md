@@ -107,7 +107,7 @@ analytically:
 |---|----------|
 | **D2** (the fix) | **Conform terrain to the DEM surface voxel, raise-only.** One new `_fill_air_to_dem_surface(voxel_grid, gp, dem_grid)` fills every AIR cell at or below the containing voxel `ceil(t)−1` with `GROUND_CODE`. It runs after terrain-solid voxelization whenever a DEM exists, and **replaces both** `_fill_terrain_from_dem` (no-terrain case) and `_fill_terrain_gaps_from_dem` (river / failed-union gaps), additionally raising columns the solid left low. Two defects die together: the old helpers' `np.rint` level (round-half-up, up to half a voxel off in *either* direction), and the one-sided terrain displacement measured above. Raise-only and air-only: nothing is ever carved down, so the 0.4% of columns placed high are untouched and the levelset path's occasional overfill is preserved as-is (pre-existing, out of scope). |
 | **D2 gives the contact invariant** | After the conform, `terrain_top ≥ ceil(t_dem)−1`, while a building based at the DEM has `bottom = floor(t_dem)`, which equals `ceil(t_dem)−1` for fractional `t` and `t−1+1` at integral `t`. Contact (or overlap) is guaranteed at **every** grid phase, independent of which path placed the solid and independent of its bias. This is why the fix works without needing to diagnose MeshLib's stamp convention. |
-| **D3** (deferred, not implemented) | A pilotis-safe, tolerance-bounded ground-contact closure was designed for residual source-data offsets. Analysis now shows its useful band is only `(voxel_size, tolerance]` metres: any base offset below one voxel cannot produce a gap once D2 holds. At the app's 2 m default with a 1.5 m tolerance **that band is empty**, and every one of the 26 observed gap columns had `h_min ≤ 1.12 m` — all closed by D2 alone. D3 is therefore **not implemented**: it would add a config field, a CLI flag, pipeline wiring and a closure pass to address a case not observed. It is revisited only if acceptance measurement leaves residual gaps. Not fabricating ground also honours the pilotis constraint in the strongest possible way — nothing is ever invented under a building. |
+| **D3** (deferred, not implemented) | A pilotis-safe, tolerance-bounded ground-contact closure was designed for residual source-data offsets. Measured directly at both resolutions on Ochanomizu 500 m (same site): at 2 m, **zero** gap columns have `h_min ≤ 1.5 m` (the app's default tolerance) — the closure would fire on nothing. At 1 m — where the naive `(voxel_size, tolerance]` band argument does *not* predict an empty band, since `1 < 1.5` — measurement still finds **zero** sub-tolerance gap columns; the only residual gaps are 4 columns forming one contiguous feature (rows 67–68, cols 184–186) with `h_min` of 1.63 m, 1.74 m and 3.16 m, plus one adjacent fringe column with no `building_min_height_grid` segments. That is precisely the elevated-structure class — bottom well above ground — the pilotis constraint requires be left alone, not closed. D3 is therefore **not implemented**: both resolutions agree it would address a case not observed, and it would add a config field, a CLI flag, pipeline wiring and a closure pass for that. Not fabricating ground also honours the pilotis constraint in the strongest possible way — nothing is ever invented under a building. It is revisited only if a future measurement finds a genuine sub-tolerance gap. |
 
 ## Testing
 
@@ -141,6 +141,27 @@ columns on the reference rectangle.
 **0**, and the share of open columns whose `terrain_top_face − dem` lies
 in `[0, vs)` must rise from **1.4%** toward 100%. Chuo 200 m @ 2 m must
 stay at 0 gap columns and rise from **1.1%**.
+
+## Consequences accepted
+
+* **The ground surface now sits about one voxel higher on real data than
+  before.** Median `terrain_top_face − dem` moved from **−0.97 m** to
+  **+1.09 m** at 2 m on Ochanomizu. This is a correction, not a
+  regression: the old placement was demonstrably too low (see "Measured
+  facts" above), and every consumer that locates the surface dynamically
+  — `_apply_land_cover`, `_apply_canopy` via `_ground_surface_index`,
+  and building placement — follows the corrected surface, not a stale
+  index.
+* **At on-lattice DEM elevations the fill is one voxel lower than the
+  old `np.rint` level.** `t` exactly integral used to round to `t`
+  itself; it now resolves to the containing voxel `ceil(t)−1 = t−1`.
+  This is why `test_fill_terrain` (`tests/test_optimized.py`) moved its
+  expected level from 10 to 9.
+* **voxcity's legacy 2.5-D voxelizer is untouched and stays on its own
+  `round(t)`-style ground level.** The 3-D path's containing-voxel
+  convention now differs from that separate product path by up to a
+  voxel. Accepted: nothing cross-reads voxel indices between the two
+  paths, so the divergence has no observable effect.
 
 ## Open, deliberately not chased
 

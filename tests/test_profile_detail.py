@@ -10,7 +10,7 @@ from voxcitygml.watertight import make_watertight_mesh
 from voxcitygml.voxelizer3d import (
     _compute_grid_params_3d,
     _allocate_voxel_grid,
-    _fill_terrain_from_dem,
+    _fill_air_to_dem_surface,
     _resize_float_grid,
     _bbox_to_index_range,
     BUILDING_CODE,

@@ -8,7 +8,7 @@ from voxcitygml.terrain.processor import terrain_meshes_to_dem_grid
 from voxcitygml.voxelizer3d import (
     _compute_grid_params_3d,
     _allocate_voxel_grid,
-    _fill_terrain_from_dem,
+    _fill_air_to_dem_surface,
     _voxelize_mesh_group,
     _resize_float_grid,
     BUILDING_CODE, TREE_CODE,
@@ -44,7 +44,7 @@ print(f"  Allocate grid:   {time.perf_counter()-t0:.3f}s")
 
 dem_resized = _resize_float_grid(dem_grid, gp.n_rows, gp.n_cols)
 t0 = time.perf_counter()
-_fill_terrain_from_dem(voxel_grid, gp, dem_resized)
+_fill_air_to_dem_surface(voxel_grid, gp, dem_resized)
 print(f"  Fill terrain:    {time.perf_counter()-t0:.3f}s")
 
 # Buildings - the big one

@@ -5,7 +5,7 @@ import numpy as np
 
 from voxcitygml.voxelizer3d import (
     Grid3DParams,
-    _fill_terrain_from_dem,
+    _fill_air_to_dem_surface,
     _fill_interior,
     _apply_land_cover,
     _apply_canopy,
@@ -27,7 +27,7 @@ def make_gp(n_rows=50, n_cols=50, n_z=40, voxel_size=2.0):
     )
 
 
-# ── Test 1: _fill_terrain_from_dem ──────────────────────────────────
+# ── Test 1: _fill_air_to_dem_surface ─────────────────────────────────
 
 def test_fill_terrain():
     gp = make_gp()
@@ -35,14 +35,14 @@ def test_fill_terrain():
     grid = np.zeros((gp.n_rows, gp.n_cols, gp.n_z), dtype=np.int16)
 
     t0 = time.perf_counter()
-    _fill_terrain_from_dem(grid, gp, dem)
+    _fill_air_to_dem_surface(grid, gp, dem)
     dt = time.perf_counter() - t0
 
-    expected_level = int(round(20.0 / gp.voxel_size))  # 10
+    expected_level = 9  # t = 10.0 on-lattice: containing voxel is ceil(10)-1
     # All cells below ground_level should be GROUND_CODE
     assert np.all(grid[:, :, :expected_level + 1] == GROUND_CODE), "Terrain fill below DEM failed"
     assert np.all(grid[:, :, expected_level + 1:] == 0), "Terrain fill above DEM should be empty"
-    print(f"  [PASS] _fill_terrain_from_dem  ({dt*1000:.1f} ms)")
+    print(f"  [PASS] _fill_air_to_dem_surface  ({dt*1000:.1f} ms)")
 
 
 # ── Test 2: _fill_interior (scipy) ──────────────────────────────────
@@ -75,7 +75,7 @@ def test_apply_land_cover():
     gp = make_gp(n_rows=20, n_cols=20, n_z=30)
     dem = np.full((gp.n_rows, gp.n_cols), 10.0)
     grid = np.zeros((gp.n_rows, gp.n_cols, gp.n_z), dtype=np.int16)
-    _fill_terrain_from_dem(grid, gp, dem)
+    _fill_air_to_dem_surface(grid, gp, dem)
 
     lc = np.ones((gp.n_rows, gp.n_cols), dtype=np.int16) * 3  # some land cover code
 
@@ -83,7 +83,7 @@ def test_apply_land_cover():
     _apply_land_cover(grid, gp, lc, dem, "OpenStreetMap")
     dt = time.perf_counter() - t0
 
-    ground_level = int(round(10.0 / gp.voxel_size))
+    ground_level = 4  # t = 5.0 on-lattice: containing voxel is ceil(5)-1
     # The ground level should now have the land cover code (3+1=4 for OSM)
     assert np.all(grid[:, :, ground_level] == 4), f"Land cover not applied correctly at z={ground_level}"
     print(f"  [PASS] _apply_land_cover       ({dt*1000:.1f} ms)")
@@ -194,7 +194,7 @@ def test_perf_terrain_large():
     grid = np.zeros((gp.n_rows, gp.n_cols, gp.n_z), dtype=np.int16)
 
     t0 = time.perf_counter()
-    _fill_terrain_from_dem(grid, gp, dem)
+    _fill_air_to_dem_surface(grid, gp, dem)
     dt = time.perf_counter() - t0
 
     assert np.any(grid == GROUND_CODE), "No terrain filled"

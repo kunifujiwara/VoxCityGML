@@ -215,6 +215,29 @@ def test_terrain_top_is_surface_voxel(path, phase, monkeypatch):
         f"expected [{low}, {high}]")
 
 
+def test_conform_skips_nonfinite_dem_cells():
+    """A NaN DEM cell must not silently empty its column.
+
+    np.ceil(nan) cast to intp is INT64_MIN, which the clip would turn
+    into -1 -- filling nothing -- so the guard is what keeps a hole from
+    appearing under a building.
+    """
+    gp, grid = make_grid(10.5)
+    dem = np.full((gp.n_rows, gp.n_cols), 10.5, dtype=np.float64)
+    dem[3, 4] = np.nan
+    dem[5, 6] = np.inf
+    v3._fill_air_to_dem_surface(grid, gp, dem)
+    is_g = grid == v3.GROUND_CODE
+    assert not is_g[3, 4].any(), "NaN column should be left unfilled"
+    assert not is_g[5, 6].any(), "inf column should be left unfilled"
+    # Every finite column still conforms normally.
+    low, high = allowed_top_range(gp, 10.5, "levelset")
+    tops = gp.n_z - 1 - np.argmax(np.flip(is_g, axis=2), axis=2)
+    ok = np.ones((gp.n_rows, gp.n_cols), dtype=bool)
+    ok[3, 4] = ok[5, 6] = False
+    assert tops[ok].min() >= low and tops[ok].max() <= high
+
+
 @pytest.mark.parametrize("path", TERRAIN_PATHS)
 @pytest.mark.parametrize("phase", PHASES)
 def test_building_on_terrain_touches(path, phase, monkeypatch):

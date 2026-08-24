@@ -573,15 +573,43 @@ def _fill_air_to_dem_surface(
     sat a full voxel below centre sampling and only 0.4% above -- a
     one-sided error, which is why raising is sufficient and carving is
     neither needed nor done.
+
+    Non-finite DEM cells (NaN / inf) are excluded explicitly rather than
+    left to the cast: a GeoTIFF terrain whose no-data is NaN, or a named
+    source interpolated with cubic ``griddata`` outside its convex hull,
+    can deliver them, and ``_resize_float_grid``'s linear zoom spreads
+    one such cell across its neighbours.  Their columns are left as the
+    terrain solid made them and the count is logged.
     """
-    t = (np.asarray(dem_grid, dtype=np.float64) - gp.min_z) / gp.voxel_size
+    dem = np.asarray(dem_grid, dtype=np.float64)
+    finite = np.isfinite(dem)
+    # Compute on a sanitised copy: np.ceil(nan) cast to an integer is
+    # INT64_MIN, and because the clip below runs after the cast it would
+    # land on -1 and leave the column entirely bare -- a silent hole in
+    # the ground, which is the exact defect this function exists to
+    # prevent.  Non-finite cells are excluded explicitly instead.
+    t = (np.where(finite, dem, gp.min_z) - gp.min_z) / gp.voxel_size
     surface = (np.ceil(np.round(t, 9)) - 1).astype(np.intp)
     # -1 keeps a DEM below the grid floor from filling anything.
     surface = np.clip(surface, -1, gp.n_z - 1)
+    surface = np.where(finite, surface, -1)
     z_indices = np.arange(gp.n_z, dtype=np.intp)
     fill = (z_indices[np.newaxis, np.newaxis, :] <= surface[:, :, np.newaxis])
     fill &= (voxel_grid == 0)
     voxel_grid[fill] = GROUND_CODE
+
+    n_nonfinite = int((~finite).sum())
+    if n_nonfinite:
+        _log.warning(
+            "  Terrain conform: %d DEM cell(s) are not finite; their columns "
+            "were left unfilled", n_nonfinite)
+    n_raised = int(fill.any(axis=2).sum())
+    n_bare = int((~(voxel_grid != 0).any(axis=2)).sum())
+    _log.info("  Terrain conform: raised %d column(s) to the DEM surface",
+              n_raised)
+    if n_bare:
+        _log.warning("  Terrain conform: %d column(s) still have no ground",
+                     n_bare)
 
 
 # ── MeshLib-based voxelization ────────────────────────────────────────

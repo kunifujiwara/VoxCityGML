@@ -1,5 +1,29 @@
 # Building–Terrain Contact Fix Implementation Plan
 
+> ## ⚠️ SUPERSEDED IN PART — read the design doc first
+>
+> This plan was written before the mechanism was measured, and execution
+> refuted two of its premises. It is kept as the record of what was
+> attempted and why it changed. **The current truth is
+> `docs/superpowers/specs/2026-08-24-building-terrain-contact-design.md`**
+> (revised 2026-08-25, see its "Corrections" section).
+>
+> What actually shipped:
+>
+> | plan task | outcome |
+> |---|---|
+> | Task 1 — failing contact tests | **done**, then corrected twice. The pre-conform assertion had to change from `ceil(t)-1` to `floor(t-0.5)`: the original target is unachievable by a centre-sampled path. |
+> | Task 2 — D2 `_fill_air_to_dem_surface` | **done**, and it is the entire fix. Extended with a non-finite-DEM guard and conform logging. |
+> | Task 3 — D1 scope the −0.5 pre-shift | **CANCELLED.** Premise refuted: the shift is a no-op on the winding path and a *correct compensation* on the scanline path. The planned change would have fixed nothing and regressed scanline. `_voxelize_terrain_solid` was left untouched. |
+> | Task 4 — D3 pilotis-safe closure | **CANCELLED.** Measured at 1 m and 2 m: zero gap columns have `h_min ≤ 1.5 m`, so it would fire on nothing. `close_building_ground_gaps`, `ground_contact_tolerance` and the CLI flag were never built. |
+> | Task 5 — CLI flag + doc cleanup | **CANCELLED** with Task 4. The levelset docstring needed no change once D1 was dropped. |
+> | Task 6 — integration test | **done**, as `test_lod2_buildings_sit_on_the_terrain`. |
+>
+> Not anticipated by the plan and required by the fix: `_apply_canopy` and
+> `_apply_land_cover` were consolidated onto one `_ground_surface_index`
+> helper, because moving the terrain left the canopy anchored on the old
+> `np.rint` convention.
+>
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Eliminate unintentional air gaps between PLATEAU LOD2 building bottoms and the voxelized terrain, while never filling intentional pilotis voids.

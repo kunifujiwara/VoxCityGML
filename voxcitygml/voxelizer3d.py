@@ -266,22 +266,20 @@ def voxelize_citygml_meshes(
     # Terrain: build watertight extrusion solid from terrain meshes, then
     # voxelize via the same MeshLib / Numba paths used for buildings.
     # Falls back to per-column DEM fill when no terrain meshes exist.
-    terrain_filled = False
     if collection.terrain:
-        terrain_filled = _voxelize_terrain_solid(
+        _voxelize_terrain_solid(
             collection.terrain,
             transformer,
             gp,
             voxel_grid,
         )
 
-    if not terrain_filled and dem_grid is not None:
-        _fill_terrain_from_dem(voxel_grid, gp, dem_grid)
-    elif terrain_filled and dem_grid is not None:
-        # The terrain solid may leave gaps (rivers, missing tiles, failed
-        # Boolean union).  Fill columns that are still empty using the DEM
-        # as a safety-net — only writes to cells that are currently AIR (0).
-        _fill_terrain_gaps_from_dem(voxel_grid, gp, dem_grid)
+    if dem_grid is not None:
+        # Conform the ground to the DEM's containing voxel: builds the
+        # whole ground when there is no terrain solid, fills river /
+        # failed-union gap columns, and raises columns the solid placed
+        # low.  Raise-only and air-only — it never carves the solid down.
+        _fill_air_to_dem_surface(voxel_grid, gp, dem_grid)
 
     # Buildings (grid-aligned winding fill on the raw mesh, unioned with a
     # raw-mesh surface shell at building_shell_threshold)
@@ -547,46 +545,71 @@ def _voxelize_terrain_solid(
     return True
 
 
-def _fill_terrain_from_dem(voxel_grid: np.ndarray, gp: Grid3DParams, dem_grid: np.ndarray) -> None:
-    ground_levels = np.rint((dem_grid - gp.min_z) / gp.voxel_size).astype(np.intp)
-    ground_levels = np.clip(ground_levels, -1, gp.n_z - 1)
-    # Build a z-index array and compare against ground_levels via broadcasting
-    z_indices = np.arange(gp.n_z, dtype=np.intp)
-    mask = z_indices[np.newaxis, np.newaxis, :] <= ground_levels[:, :, np.newaxis]
-    # Only fill where ground_level >= 0
-    valid = ground_levels >= 0
-    mask &= valid[:, :, np.newaxis]
-    voxel_grid[mask] = GROUND_CODE
-
-
-def _fill_terrain_gaps_from_dem(
+def _fill_air_to_dem_surface(
     voxel_grid: np.ndarray, gp: Grid3DParams, dem_grid: np.ndarray,
 ) -> None:
-    """Fill columns that have no ground voxels using DEM elevation.
+    """Fill AIR cells up to the DEM *containing voxel* with GROUND_CODE.
 
-    After terrain-solid voxelization, some columns may remain empty due
-    to river channels, missing tiles, or a failed Boolean union with the
-    base box.  This function identifies those gap columns and fills them
-    up to the DEM surface, leaving columns already populated by the
-    terrain solid untouched.
+    The containing voxel of elevation ``z`` is ``ceil(t) - 1`` with
+    ``t = (z - min_z)/vs``.  An elevation exactly on a lattice plane
+    belongs to the voxel below (its top face IS the surface), matching
+    ``_penetration_half`` semantics -- so a building based on the terrain
+    surface lands in, or directly above, the terrain's top voxel at every
+    grid phase.  That is the contact invariant this function exists to
+    establish, and it holds regardless of which path placed the terrain
+    solid or how that path is biased.
+
+    Raise-only and air-only: cells already claimed by the terrain solid
+    (or anything else) are never lowered or overwritten.  Running after
+    the terrain solid, it simultaneously (a) builds the whole ground when
+    no terrain meshes exist, (b) fills river / failed-union gap columns,
+    and (c) raises columns the solid placed below the surface.
+
+    It replaces the pre-2026-08-25 pair of ``np.rint``-based helpers
+    (``_fill_terrain_from_dem`` / ``_fill_terrain_gaps_from_dem``), whose
+    round-half-up level sat up to half a voxel off the surface in EITHER
+    direction depending on grid phase.  Measured on real PLATEAU LOD2
+    (Ochanomizu 500 m @ 2 m): before this, 47.6% of open terrain columns
+    sat a full voxel below centre sampling and only 0.4% above -- a
+    one-sided error, which is why raising is sufficient and carving is
+    neither needed nor done.
+
+    Non-finite DEM cells (NaN / inf) are excluded explicitly rather than
+    left to the cast: a GeoTIFF terrain whose no-data is NaN, or a named
+    source interpolated with cubic ``griddata`` outside its convex hull,
+    can deliver them, and ``_resize_float_grid``'s linear zoom spreads
+    one such cell across its neighbours.  Their columns are left as the
+    terrain solid made them and the count is logged.
     """
-    has_ground = np.any(voxel_grid == GROUND_CODE, axis=2)
-    n_gaps = int((~has_ground).sum())
-    if n_gaps == 0:
-        return
-
-    ground_levels = np.rint((dem_grid - gp.min_z) / gp.voxel_size).astype(np.intp)
-    ground_levels = np.clip(ground_levels, -1, gp.n_z - 1)
-
+    dem = np.asarray(dem_grid, dtype=np.float64)
+    finite = np.isfinite(dem)
+    # Compute on a sanitised copy: np.ceil(nan) cast to an integer is
+    # INT64_MIN, and because the clip below runs after the cast it would
+    # land on -1 and leave the column entirely bare -- a silent hole in
+    # the ground, which is the exact defect this function exists to
+    # prevent.  Non-finite cells are excluded explicitly instead.
+    t = (np.where(finite, dem, gp.min_z) - gp.min_z) / gp.voxel_size
+    surface = (np.ceil(np.round(t, 9)) - 1).astype(np.intp)
+    # -1 keeps a DEM below the grid floor from filling anything.
+    surface = np.clip(surface, -1, gp.n_z - 1)
+    surface = np.where(finite, surface, -1)
     z_indices = np.arange(gp.n_z, dtype=np.intp)
-    fill_mask = z_indices[np.newaxis, np.newaxis, :] <= ground_levels[:, :, np.newaxis]
-    valid = ground_levels >= 0
-    fill_mask &= valid[:, :, np.newaxis]
-    # Only fill columns that have NO existing ground voxels
-    fill_mask &= (~has_ground)[:, :, np.newaxis]
+    fill = (z_indices[np.newaxis, np.newaxis, :] <= surface[:, :, np.newaxis])
+    fill &= (voxel_grid == 0)
+    voxel_grid[fill] = GROUND_CODE
 
-    voxel_grid[fill_mask] = GROUND_CODE
-    _log.info("  Terrain DEM gap-fill: filled %d empty columns", n_gaps)
+    n_nonfinite = int((~finite).sum())
+    if n_nonfinite:
+        _log.warning(
+            "  Terrain conform: %d DEM cell(s) are not finite; their columns "
+            "were left unfilled", n_nonfinite)
+    n_raised = int(fill.any(axis=2).sum())
+    n_bare = int((~(voxel_grid != 0).any(axis=2)).sum())
+    _log.info("  Terrain conform: raised %d column(s) to the DEM surface",
+              n_raised)
+    if n_bare:
+        _log.warning("  Terrain conform: %d column(s) still have no ground",
+                     n_bare)
 
 
 # ── MeshLib-based voxelization ────────────────────────────────────────
@@ -1709,6 +1732,36 @@ def _fill_interior(surface: np.ndarray) -> np.ndarray:
     return binary_fill_holes(surface)
 
 
+def _ground_surface_index(
+    voxel_grid: np.ndarray, gp: Grid3DParams, dem_grid: np.ndarray,
+) -> np.ndarray:
+    """Index of the topmost ground-surface voxel in each column.
+
+    Scans the grid rather than recomputing a level from the DEM, so it
+    follows the surface that was actually voxelized -- the terrain solid,
+    ``_fill_air_to_dem_surface``'s fill, or the gap-filled base box --
+    rather than an idealised one.
+
+    ``_apply_land_cover`` recolours that voxel from GROUND_CODE to a
+    positive land-cover code, so positive codes count as surface too:
+    this helper is called once BEFORE land cover (to choose the voxel to
+    recolour) and again AFTER it (to seat the canopy), and must return
+    the same index both times.
+
+    Columns with no surface at all fall back to the DEM's containing
+    voxel ``ceil(t)-1`` -- the same convention ``_fill_air_to_dem_surface``
+    fills to, so every consumer of "where is the ground" shares one
+    definition (2026-08-25 contact fix; the previous ``np.rint`` levels
+    disagreed with it by up to a voxel depending on grid phase).
+    """
+    is_surface = (voxel_grid == GROUND_CODE) | (voxel_grid > 0)
+    has_surface = is_surface.any(axis=2)
+    top = gp.n_z - 1 - np.argmax(np.flip(is_surface, axis=2), axis=2)
+    t = (np.asarray(dem_grid, dtype=np.float64) - gp.min_z) / gp.voxel_size
+    fallback = (np.ceil(np.round(np.where(np.isfinite(t), t, 0.0), 9)) - 1)
+    return np.where(has_surface, top, fallback.astype(np.intp)).astype(np.intp)
+
+
 def _apply_land_cover(
     voxel_grid: np.ndarray,
     gp: Grid3DParams,
@@ -1718,20 +1771,8 @@ def _apply_land_cover(
 ) -> None:
     land_cover = np.flipud(_convert_land_cover(land_cover_grid, land_cover_source))
 
-    # Find the actual topmost GROUND_CODE voxel in each column so that
-    # land cover follows the real voxelized surface (e.g. the flat base-
-    # box surface in gap-filled areas) rather than the interpolated DEM.
-    is_ground = (voxel_grid == GROUND_CODE)
-    has_ground = is_ground.any(axis=2)
-    # argmax on reversed Z gives index-from-top of first ground voxel
-    rev = np.flip(is_ground, axis=2)
-    first_from_top = np.argmax(rev, axis=2)
-    actual_z = (gp.n_z - 1 - first_from_top).astype(np.intp)
-
-    # Fall back to DEM height for columns without ground voxels
-    dem_levels = np.rint((dem_grid - gp.min_z) / gp.voxel_size).astype(np.intp)
-    ground_levels = np.where(has_ground, actual_z, dem_levels)
-    ground_levels = np.clip(ground_levels, 0, gp.n_z - 1)
+    ground_levels = np.clip(
+        _ground_surface_index(voxel_grid, gp, dem_grid), 0, gp.n_z - 1)
 
     # Skip cells with code 0 — they would otherwise overwrite the ground
     # voxel below (only OpenStreetMap codes are pre-shifted by +1; CityGML
@@ -1829,7 +1870,10 @@ def _apply_canopy(
 
     base_arr = _canopy_base_heights(top_arr, canopy_bottom, trunk_height_ratio)
 
-    ground_levels = np.rint((dem_grid - gp.min_z) / gp.voxel_size).astype(np.intp)
+    # Seat crowns on the first free voxel above the actual ground surface.
+    # Recomputing a level from the DEM here would disagree with the
+    # voxelized terrain by up to a voxel depending on grid phase.
+    ground_levels = _ground_surface_index(voxel_grid, gp, dem_grid) + 1
     z_starts = np.clip(ground_levels + np.rint(base_arr / gp.voxel_size).astype(np.intp), 0, gp.n_z)
     z_ends = np.clip(ground_levels + np.rint(top_arr / gp.voxel_size).astype(np.intp), 0, gp.n_z)
 

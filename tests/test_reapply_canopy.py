@@ -294,12 +294,23 @@ def test_extras_sane_without_3d_voxelizer(monkeypatch, tmp_path):
 # =====================================================================
 #
 # Every fixture below uses voxel_size 2.0 m, min_z 0.0 and a flat DEM at
-# 0.0 m, so the z arithmetic of ``_apply_canopy`` reduces to
-# ``z = rint(height / 2)`` over the half-open interval [z_start, z_end):
+# 0.0 m, and ``_seeded_grid`` puts a real GROUND_CODE voxel at z=0 in every
+# column.  ``_apply_canopy`` seats crowns on the first free voxel ABOVE the
+# scanned ground surface (``_ground_surface_index(...) + 1``, 2026-08-25
+# contact fix), so with surface z=0 the anchor is 1 and the z arithmetic is
+# ``z = 1 + rint(height / 2)`` over the half-open interval [z_start, z_end):
 #
-#   canopy_bottom=0.0, canopy_top=6.0  ->  z 0,1,2   (z_end = 3, excluded)
-#   canopy_bottom=0.0, canopy_top=18.0 ->  z 0..8    (z_end = 9, excluded)
-#   canopy_bottom=0.0, canopy_top=4.0  ->  z 0,1     (z_end = 2, excluded)
+#   canopy_bottom=0.0, canopy_top=6.0  ->  z 1,2,3   (z_end = 4, excluded)
+#   canopy_bottom=0.0, canopy_top=18.0 ->  z 1..9    (z_end = 10, excluded)
+#   canopy_bottom=0.0, canopy_top=4.0  ->  z 1,2     (z_end = 3, excluded)
+#
+# The one exception is column [3,3], which carries a positive land-cover
+# code at z=1.  Land cover marks the topmost ground voxel, so the helper
+# counts it as surface and that column's anchor is 2, one higher than its
+# neighbours.  Before the contact fix the anchor was ``rint(dem/vs)`` = 0
+# everywhere, which collided with the ground voxel; the crown's bottom
+# voxel was then silently eaten by the ``== 0`` air mask, leaving every
+# crown one voxel short.
 #
 # canopy_bottom is passed explicitly throughout so the crowns do not depend
 # on the trunk-height-ratio default.
@@ -380,9 +391,10 @@ def test_reapply_canopy_adds_trees_without_touching_other_classes():
     assert np.array_equal(grid == BUILDING_CODE, before_building)
     assert np.array_equal(grid == 6, before_lc)
     assert np.any(grid == TREE_CODE), "no canopy was written at all"
-    # z 0,1,2 -- z 0 is ground, so an ordinary column keeps 1 and 2 only.
+    # z 0 is ground; the crown anchors on the first free voxel above it
+    # (z=1) and spans 6m/2m = 3 voxels, so z=1,2,3 are all TREE_CODE.
     assert grid[2, 2, 0] == GROUND_CODE
-    assert list(grid[2, 2, 1:4]) == [TREE_CODE, TREE_CODE, 0]
+    assert list(grid[2, 2, 1:4]) == [TREE_CODE, TREE_CODE, TREE_CODE]
     # The building column is occupied at z 1..4: canopy is AIR-only, so it
     # must not have displaced a single building voxel.
     assert list(grid[0, 0, 1:5]) == [BUILDING_CODE] * 4
@@ -426,9 +438,19 @@ def test_reapply_canopy_clears_stale_canopy_outside_the_mask():
     assert grid[2, 2, 8] == TREE_CODE, "tall canopy did not reach z=8"
 
     reapply_canopy(city, np.full((4, 4), 4.0), np.zeros((4, 4)))
+    # Ground at z=0; first free voxel above it is z=1.  4m/2m = 2 voxels,
+    # so an ordinary column's new crown is z=1,2.  Column [3,3] carries a
+    # land-cover voxel (code 6) at z=1, which _ground_surface_index also
+    # counts as surface, so its crown seats one voxel higher: z=2,3.
     assert grid[2, 2, 1] == TREE_CODE
-    assert not np.any(grid[:, :, 2:] == TREE_CODE), \
+    assert grid[2, 2, 2] == TREE_CODE
+    ordinary = np.ones((4, 4), dtype=bool)
+    ordinary[3, 3] = False
+    assert not np.any(grid[ordinary][:, 3:] == TREE_CODE), \
         "stale canopy above the new crown was not cleared"
+    assert grid[3, 3, 3] == TREE_CODE
+    assert not np.any(grid[3, 3, 4:] == TREE_CODE), \
+        "stale canopy above the new crown was not cleared (land-cover column)"
 
 
 def test_reapply_canopy_is_idempotent_and_path_independent():
@@ -495,11 +517,12 @@ def test_reapply_canopy_derives_bottom_from_the_trunk_ratio():
     reapply_canopy(city, np.full((4, 4), 20.0), trunk_height_ratio=0.5)
 
     assert np.allclose(city.tree_canopy.bottom, 10.0)
-    # rint(10/2)=5 .. rint(20/2)=10, half-open -> z 5..9.
+    # Ground at z=0; first free voxel above it is z=1.  Trunk base voxel =
+    # 1 + rint(10/2) = 6; crown top voxel (exclusive) = 1 + rint(20/2) = 11.
     column = city.voxels.classes[2, 2, :]
-    assert not np.any(column[1:5] == TREE_CODE)
-    assert np.all(column[5:10] == TREE_CODE)
-    assert column[10] == 0
+    assert not np.any(column[1:6] == TREE_CODE)
+    assert np.all(column[6:11] == TREE_CODE)
+    assert column[11] == 0
 
 
 def test_reapply_canopy_without_mask_warns_and_still_applies():
@@ -641,11 +664,12 @@ def test_reapply_canopy_default_trunk_ratio_matches_the_voxelizer():
 
     expected_base = 20.0 * 11.76 / 19.98          # 11.7718 m
     assert np.allclose(city.tree_canopy.bottom, expected_base)
-    # rint(11.7718/2) = 6 .. rint(20/2) = 10, half-open -> z 6..9.
+    # Ground at z=0; first free voxel above it is z=1.  Trunk base voxel =
+    # 1 + rint(11.7718/2) = 7; crown top voxel (exclusive) = 1 + rint(20/2) = 11.
     column = city.voxels.classes[2, 2, :]
-    assert not np.any(column[1:6] == TREE_CODE)
-    assert np.all(column[6:10] == TREE_CODE)
-    assert column[10] == 0
+    assert not np.any(column[1:7] == TREE_CODE)
+    assert np.all(column[7:11] == TREE_CODE)
+    assert column[11] == 0
 
 
 def test_reapply_canopy_resamples_a_coarser_dem():

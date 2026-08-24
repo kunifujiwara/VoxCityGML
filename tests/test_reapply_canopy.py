@@ -294,12 +294,23 @@ def test_extras_sane_without_3d_voxelizer(monkeypatch, tmp_path):
 # =====================================================================
 #
 # Every fixture below uses voxel_size 2.0 m, min_z 0.0 and a flat DEM at
-# 0.0 m, so the z arithmetic of ``_apply_canopy`` reduces to
-# ``z = rint(height / 2)`` over the half-open interval [z_start, z_end):
+# 0.0 m, and ``_seeded_grid`` puts a real GROUND_CODE voxel at z=0 in every
+# column.  ``_apply_canopy`` seats crowns on the first free voxel ABOVE the
+# scanned ground surface (``_ground_surface_index(...) + 1``, 2026-08-25
+# contact fix), so with surface z=0 the anchor is 1 and the z arithmetic is
+# ``z = 1 + rint(height / 2)`` over the half-open interval [z_start, z_end):
 #
-#   canopy_bottom=0.0, canopy_top=6.0  ->  z 0,1,2   (z_end = 3, excluded)
-#   canopy_bottom=0.0, canopy_top=18.0 ->  z 0..8    (z_end = 9, excluded)
-#   canopy_bottom=0.0, canopy_top=4.0  ->  z 0,1     (z_end = 2, excluded)
+#   canopy_bottom=0.0, canopy_top=6.0  ->  z 1,2,3   (z_end = 4, excluded)
+#   canopy_bottom=0.0, canopy_top=18.0 ->  z 1..9    (z_end = 10, excluded)
+#   canopy_bottom=0.0, canopy_top=4.0  ->  z 1,2     (z_end = 3, excluded)
+#
+# The one exception is column [3,3], which carries a positive land-cover
+# code at z=1.  Land cover marks the topmost ground voxel, so the helper
+# counts it as surface and that column's anchor is 2, one higher than its
+# neighbours.  Before the contact fix the anchor was ``rint(dem/vs)`` = 0
+# everywhere, which collided with the ground voxel; the crown's bottom
+# voxel was then silently eaten by the ``== 0`` air mask, leaving every
+# crown one voxel short.
 #
 # canopy_bottom is passed explicitly throughout so the crowns do not depend
 # on the trunk-height-ratio default.

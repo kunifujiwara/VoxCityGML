@@ -29,6 +29,9 @@ BUILDING voxelizer as well as the Numba terrain path.  That is deliberate
 extra coverage, not an oversight -- for that test the parameter names a
 (terrain path, building path) pair.
 """
+import logging
+import warnings
+
 import numpy as np
 import pytest
 import trimesh
@@ -215,18 +218,35 @@ def test_terrain_top_is_surface_voxel(path, phase, monkeypatch):
         f"expected [{low}, {high}]")
 
 
-def test_conform_skips_nonfinite_dem_cells():
-    """A NaN DEM cell must not silently empty its column.
+def test_conform_skips_nonfinite_dem_cells(caplog):
+    """A non-finite DEM cell must not be fed to the integer cast.
 
-    np.ceil(nan) cast to intp is INT64_MIN, which the clip would turn
-    into -1 -- filling nothing -- so the guard is what keeps a hole from
-    appearing under a building.
+    Asserting the grid alone does NOT pin this guard: ``np.ceil(nan)``
+    cast to an integer is undefined behaviour, and on this platform it
+    lands on INT64_MIN, which the clip turns into -1 -- so the unguarded
+    code also merely leaves the column bare, and a grid-only assertion
+    passes against it.  What the guard actually buys is independence from
+    that UB: on a platform where the cast lands positive, the same clip
+    yields ``n_z - 1`` and buries every building in the column under a
+    full stack of ground.
+
+    So this pins the two observables that exist only once the cells are
+    excluded explicitly -- no cast warning escapes, and the skip is
+    reported -- alongside the grid outcome.
     """
     gp, grid = make_grid(10.5)
     dem = np.full((gp.n_rows, gp.n_cols), 10.5, dtype=np.float64)
     dem[3, 4] = np.nan
     dem[5, 6] = np.inf
-    v3._fill_air_to_dem_surface(grid, gp, dem)
+    with warnings.catch_warnings():
+        # The unguarded cast emits "invalid value encountered in cast";
+        # promoting it to an error is what makes this test fail if
+        # non-finite cells are ever handed to astype() again.
+        warnings.simplefilter("error", RuntimeWarning)
+        with caplog.at_level(logging.WARNING, logger=v3._log.name):
+            v3._fill_air_to_dem_surface(grid, gp, dem)
+    assert "not finite" in caplog.text, (
+        "the conform must report the cells it skipped")
     is_g = grid == v3.GROUND_CODE
     assert not is_g[3, 4].any(), "NaN column should be left unfilled"
     assert not is_g[5, 6].any(), "inf column should be left unfilled"

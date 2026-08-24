@@ -105,7 +105,13 @@ def test_apply_canopy():
 
     # Check some tree voxels exist
     assert np.any(grid == TREE_CODE), "No canopy voxels placed"
-    ground_level = int(round(10.0 / gp.voxel_size))
+    # grid is a bare np.zeros array -- no ground voxel was ever written --
+    # so _ground_surface_index falls back to the DEM's containing voxel
+    # ceil(t)-1, and _apply_canopy anchors the crown one above that:
+    # ceil(t)-1+1 == ceil(t).  t = 10.0/2.0 = 5.0 lands exactly on-lattice,
+    # so this still evaluates to 5, the same as the old round(t) -- by
+    # coincidence of the on-lattice case, not because the formula is round().
+    ground_level = int(np.ceil(round(10.0 / gp.voxel_size, 9)))
     # Tree canopy should be above trunk height
     z_start = ground_level + int(round(4.0 / gp.voxel_size))
     z_end = ground_level + int(round(12.0 / gp.voxel_size))

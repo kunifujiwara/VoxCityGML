@@ -1704,6 +1704,36 @@ def _fill_interior(surface: np.ndarray) -> np.ndarray:
     return binary_fill_holes(surface)
 
 
+def _ground_surface_index(
+    voxel_grid: np.ndarray, gp: Grid3DParams, dem_grid: np.ndarray,
+) -> np.ndarray:
+    """Index of the topmost ground-surface voxel in each column.
+
+    Scans the grid rather than recomputing a level from the DEM, so it
+    follows the surface that was actually voxelized -- the terrain solid,
+    ``_fill_air_to_dem_surface``'s fill, or the gap-filled base box --
+    rather than an idealised one.
+
+    ``_apply_land_cover`` recolours that voxel from GROUND_CODE to a
+    positive land-cover code, so positive codes count as surface too:
+    this helper is called once BEFORE land cover (to choose the voxel to
+    recolour) and again AFTER it (to seat the canopy), and must return
+    the same index both times.
+
+    Columns with no surface at all fall back to the DEM's containing
+    voxel ``ceil(t)-1`` -- the same convention ``_fill_air_to_dem_surface``
+    fills to, so every consumer of "where is the ground" shares one
+    definition (2026-08-25 contact fix; the previous ``np.rint`` levels
+    disagreed with it by up to a voxel depending on grid phase).
+    """
+    is_surface = (voxel_grid == GROUND_CODE) | (voxel_grid > 0)
+    has_surface = is_surface.any(axis=2)
+    top = gp.n_z - 1 - np.argmax(np.flip(is_surface, axis=2), axis=2)
+    t = (np.asarray(dem_grid, dtype=np.float64) - gp.min_z) / gp.voxel_size
+    fallback = (np.ceil(np.round(np.where(np.isfinite(t), t, 0.0), 9)) - 1)
+    return np.where(has_surface, top, fallback.astype(np.intp)).astype(np.intp)
+
+
 def _apply_land_cover(
     voxel_grid: np.ndarray,
     gp: Grid3DParams,
@@ -1713,20 +1743,8 @@ def _apply_land_cover(
 ) -> None:
     land_cover = np.flipud(_convert_land_cover(land_cover_grid, land_cover_source))
 
-    # Find the actual topmost GROUND_CODE voxel in each column so that
-    # land cover follows the real voxelized surface (e.g. the flat base-
-    # box surface in gap-filled areas) rather than the interpolated DEM.
-    is_ground = (voxel_grid == GROUND_CODE)
-    has_ground = is_ground.any(axis=2)
-    # argmax on reversed Z gives index-from-top of first ground voxel
-    rev = np.flip(is_ground, axis=2)
-    first_from_top = np.argmax(rev, axis=2)
-    actual_z = (gp.n_z - 1 - first_from_top).astype(np.intp)
-
-    # Fall back to DEM height for columns without ground voxels
-    dem_levels = np.rint((dem_grid - gp.min_z) / gp.voxel_size).astype(np.intp)
-    ground_levels = np.where(has_ground, actual_z, dem_levels)
-    ground_levels = np.clip(ground_levels, 0, gp.n_z - 1)
+    ground_levels = np.clip(
+        _ground_surface_index(voxel_grid, gp, dem_grid), 0, gp.n_z - 1)
 
     # Skip cells with code 0 — they would otherwise overwrite the ground
     # voxel below (only OpenStreetMap codes are pre-shifted by +1; CityGML
@@ -1824,7 +1842,10 @@ def _apply_canopy(
 
     base_arr = _canopy_base_heights(top_arr, canopy_bottom, trunk_height_ratio)
 
-    ground_levels = np.rint((dem_grid - gp.min_z) / gp.voxel_size).astype(np.intp)
+    # Seat crowns on the first free voxel above the actual ground surface.
+    # Recomputing a level from the DEM here would disagree with the
+    # voxelized terrain by up to a voxel depending on grid phase.
+    ground_levels = _ground_surface_index(voxel_grid, gp, dem_grid) + 1
     z_starts = np.clip(ground_levels + np.rint(base_arr / gp.voxel_size).astype(np.intp), 0, gp.n_z)
     z_ends = np.clip(ground_levels + np.rint(top_arr / gp.voxel_size).astype(np.intp), 0, gp.n_z)
 

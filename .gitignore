@@ -49,3 +49,5 @@ htmlcov/
 
 # Distribution
 *.tar.gz
+# Git worktrees (subagent-driven development workspaces)
+.worktrees/

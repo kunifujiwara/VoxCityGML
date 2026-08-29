@@ -81,9 +81,12 @@ def box_building(z_base, x0=15.0, y0=15.0, w=8.0, h=9.0):
     return np.asarray(b.vertices, float), np.asarray(b.faces)
 
 
-def build_terrain_only(gp, grid, z_t, path, monkeypatch):
-    """Voxelize the terrain solid via *path*, with no DEM conform."""
-    tmesh = flat_terrain_mesh(z_t)
+def select_terrain_path(path, monkeypatch):
+    """Force the module down one of the three terrain voxelization paths.
+
+    Module-level patching, so it steers ``voxelize_citygml_meshes`` just
+    as it steers a direct ``_voxelize_terrain_solid`` call.
+    """
     if path == "scanline":
         monkeypatch.setattr(v3, "_MESHLIB_VOXEL_AVAILABLE", False)
     elif path == "winding":
@@ -95,6 +98,12 @@ def build_terrain_only(gp, grid, z_t, path, monkeypatch):
                 stats.is_watertight = False
             return solid, stats
         monkeypatch.setattr(v3, "build_terrain_solid", not_watertight)
+
+
+def build_terrain_only(gp, grid, z_t, path, monkeypatch):
+    """Voxelize the terrain solid via *path*, with no DEM conform."""
+    tmesh = flat_terrain_mesh(z_t)
+    select_terrain_path(path, monkeypatch)
     assert v3._voxelize_terrain_solid([tmesh], IdentityTransformer(), gp, grid)
 
 
@@ -273,3 +282,108 @@ def test_building_on_terrain_touches(path, phase, monkeypatch):
     v3._voxelize_building_solid(bverts, bfaces, gp, grid,
                                 v3.BUILDING_CODE, True)
     assert max_air_gap_below_buildings(grid) == 0, f"phase {phase} {path}"
+
+
+# ── Water carve: the conform's counterpart ──────────────────────────
+#
+# The DEM conform is raise-only by design, so a terrain TIN that plants
+# ground ABOVE a flattened water DEM stays there -- that is the 5 m cliff
+# inside the river measured on real PLATEAU LOD2.  These run the whole
+# `voxelize_citygml_meshes` so the carve is asserted where it actually
+# has to hold: after the conform, before the land-cover stamp.
+
+WATER_TIN_Z = 6.0        # terrain TIN, well above the water DEM
+WATER_DEM_Z = 3.0        # the flattened water surface
+WATER_CODE = 9           # standard land-cover code for water
+UNDERGROUND = 4.0        # drops the grid floor so the carve level isn't z=0
+
+
+def water_rect():
+    """Rectangle vertices (sw, nw, ne, se) that IdentityTransformer maps
+    straight onto the [0, NXY]^2 local frame the terrain mesh lives in."""
+    return [(0.0, 0.0), (0.0, NXY), (NXY, NXY), (NXY, 0.0)]
+
+
+def run_water_pipeline(path, monkeypatch, flatten_water_dem):
+    """Full voxelization of a flat TIN over an all-water land cover."""
+    select_terrain_path(path, monkeypatch)
+    monkeypatch.setattr(v3, "create_rectangle_frame_transformer",
+                        lambda *a, **k: IdentityTransformer())
+    n = int(round(NXY / VS))
+    collection = v3.CityGMLMeshCollection(
+        terrain=[flat_terrain_mesh(WATER_TIN_Z)])
+    grid = v3.voxelize_citygml_meshes(
+        collection,
+        water_rect(),
+        0.0, 0.0,
+        VS,
+        dem_grid=np.full((n, n), WATER_DEM_Z, dtype=np.float64),
+        land_cover_grid=np.full((n, n), WATER_CODE, dtype=np.int16),
+        land_cover_source="CityGML",
+        underground_depth=UNDERGROUND,
+        flatten_water_dem=flatten_water_dem,
+    )
+    gp, _ = v3._compute_grid_params_3d(
+        water_rect(), 0.0, 0.0, VS, collection,
+        underground_depth=UNDERGROUND,
+        dem_grid=np.full((n, n), WATER_DEM_Z, dtype=np.float64),
+    )
+    return gp, grid
+
+
+def surface_tops(gp, grid):
+    """Topmost ground-surface voxel per column, land-cover codes included.
+
+    ``ground_tops`` above looks for GROUND_CODE only; after the land-cover
+    stamp the surface voxel is a positive code, so this mirrors
+    ``_ground_surface_index``'s definition instead.
+    """
+    is_s = (grid == v3.GROUND_CODE) | (grid > 0)
+    bare = int((~is_s.any(axis=2)).sum())
+    assert bare == 0, f"{bare} columns have no ground surface"
+    return gp.n_z - 1 - np.argmax(np.flip(is_s, axis=2), axis=2)
+
+
+def containing_voxel(gp, z):
+    return int(np.ceil(np.round((z - gp.min_z) / gp.voxel_size, 9))) - 1
+
+
+@pytest.mark.parametrize("path", TERRAIN_PATHS)
+def test_water_columns_carve_down_to_the_dem_surface(path, monkeypatch):
+    """Ground above the flattened water DEM is removed, and the land-cover
+    water voxel is stamped on the CARVED surface.
+
+    The second half is the ordering pin: run the carve after
+    ``_apply_land_cover`` instead and the water voxel is left orphaned in
+    mid-air above the carved ground, because ``_ground_surface_index``'s
+    two-call same-answer contract is broken between the land-cover stamp
+    and the canopy seat.
+    """
+    gp, grid = run_water_pipeline(path, monkeypatch, flatten_water_dem=True)
+    surface = containing_voxel(gp, WATER_DEM_Z)
+    assert surface > 0, "fixture must not put the water surface on the floor"
+
+    tops = surface_tops(gp, grid)
+    assert tops.min() == surface and tops.max() == surface, (
+        f"{path}: carved water tops {tops.min()}..{tops.max()}, "
+        f"expected {surface}")
+    assert not (grid[:, :, surface + 1:] == v3.GROUND_CODE).any(), (
+        f"{path}: ground left standing above the flattened water surface")
+    assert np.all(grid[:, :, surface] == WATER_CODE), (
+        f"{path}: the water land-cover voxel must sit on the carved "
+        f"surface, not on the uncarved terrain top")
+    assert np.all(grid[:, :, :surface] == v3.GROUND_CODE), (
+        f"{path}: the carve must not hollow out the ground below the DEM")
+
+
+@pytest.mark.parametrize("path", TERRAIN_PATHS)
+def test_water_carve_opt_out_leaves_the_tin(path, monkeypatch):
+    """``flatten_water_dem=False`` restores the pre-carve behaviour."""
+    gp, grid = run_water_pipeline(path, monkeypatch, flatten_water_dem=False)
+    tops = surface_tops(gp, grid)
+    low, high = allowed_solid_top_range(gp, WATER_TIN_Z, path)
+    assert tops.min() >= low and tops.max() <= high, (
+        f"{path}: opted-out tops {tops.min()}..{tops.max()}, "
+        f"expected the TIN's [{low}, {high}]")
+    assert tops.min() > containing_voxel(gp, WATER_DEM_Z), (
+        f"{path}: opting out must leave the water columns high")

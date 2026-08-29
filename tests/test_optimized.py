@@ -6,12 +6,14 @@ import numpy as np
 from voxcitygml.voxelizer3d import (
     Grid3DParams,
     _fill_air_to_dem_surface,
+    _carve_water_to_dem_surface,
     _fill_interior,
     _apply_land_cover,
     _apply_canopy,
     _surface_voxelize_numba,
     _triangle_box_overlap_nb,
     _dilate6,
+    BUILDING_CODE,
     GROUND_CODE,
     TREE_CODE,
 )
@@ -205,6 +207,156 @@ def test_perf_terrain_large():
 
     assert np.any(grid == GROUND_CODE), "No terrain filled"
     print(f"  [PASS] terrain 200x200x100     ({dt*1000:.1f} ms)")
+
+
+# ── Test 8: _carve_water_to_dem_surface ─────────────────────────────
+#
+# The counterpart of _fill_air_to_dem_surface for water columns: that
+# conform is raise-only by design, so nothing else in the pipeline can
+# lower ground the terrain solid planted above a flattened water DEM.
+#
+# ``land_cover_source="CityGML"`` is used wherever the conversion itself
+# is not what is under test: its codes are already the standard 1-based
+# ones (water == 9), so the fixtures say what they mean.  The conversion
+# path gets its own test below.
+
+CARVE_VS = 1.0
+CARVE_DEM_Z = 3.0
+#: Containing voxel of CARVE_DEM_Z at voxel_size 1.0 / min_z 0.0:
+#: ceil(3.0) - 1 == 2, the one rounding rule the module uses everywhere.
+CARVE_SURFACE = 2
+WATER = 9
+NOT_WATER = 3
+
+
+def carve_gp(n_rows=6, n_cols=6, n_z=10):
+    return make_gp(n_rows=n_rows, n_cols=n_cols, n_z=n_z,
+                   voxel_size=CARVE_VS)
+
+
+def carve_fixture(n_rows=6, n_cols=6, n_z=10, ground_top=7):
+    """Grid with GROUND up to ``ground_top`` and a flat DEM at 3.0 m."""
+    gp = carve_gp(n_rows, n_cols, n_z)
+    grid = np.zeros((gp.n_rows, gp.n_cols, gp.n_z), dtype=np.int16)
+    grid[:, :, :ground_top + 1] = GROUND_CODE
+    dem = np.full((gp.n_rows, gp.n_cols), CARVE_DEM_Z)
+    return gp, grid, dem
+
+
+def test_carve_water_lowers_ground_to_dem_surface():
+    gp, grid, dem = carve_fixture()
+    lc = np.full((gp.n_rows, gp.n_cols), WATER, dtype=np.int16)
+
+    _carve_water_to_dem_surface(grid, gp, dem, lc, "CityGML")
+
+    assert np.all(grid[:, :, :CARVE_SURFACE + 1] == GROUND_CODE), (
+        "ground at and below the DEM surface must survive the carve")
+    assert np.all(grid[:, :, CARVE_SURFACE + 1:] == 0), (
+        "every ground voxel above the DEM surface must be carved to air")
+
+
+def test_carve_leaves_non_water_columns_alone():
+    gp, grid, dem = carve_fixture()
+    before = grid.copy()
+    lc = np.full((gp.n_rows, gp.n_cols), NOT_WATER, dtype=np.int16)
+
+    _carve_water_to_dem_surface(grid, gp, dem, lc, "CityGML")
+
+    assert np.array_equal(grid, before), (
+        "a grid with no water land cover must come back byte-identical")
+
+
+def test_carve_never_touches_building_or_tree_voxels():
+    """Bridge piers and tree voxels stand in the carved water.
+
+    Bridges voxelize as BUILDING_CODE with overwrite=True and their piers
+    legitimately punch through the ground in water columns; carving
+    anything but GROUND_CODE would strand that geometry.
+    """
+    gp, grid, dem = carve_fixture()
+    grid[2, 2, 4:8] = BUILDING_CODE   # pier through the carve zone
+    grid[3, 3, 6] = TREE_CODE
+    lc = np.full((gp.n_rows, gp.n_cols), WATER, dtype=np.int16)
+
+    _carve_water_to_dem_surface(grid, gp, dem, lc, "CityGML")
+
+    assert np.all(grid[2, 2, 4:8] == BUILDING_CODE), "pier was carved away"
+    assert grid[3, 3, 6] == TREE_CODE, "tree voxel was carved away"
+    # ...and the GROUND around them is still carved.
+    assert np.all(grid[2, 2, 3:4] == 0)
+    assert np.all(grid[3, 3, 3:6] == 0) and grid[3, 3, 7] == 0
+    assert np.all(grid[:, :, :CARVE_SURFACE + 1] == GROUND_CODE)
+
+
+def test_carve_skips_nonfinite_dem_cells():
+    """A NaN DEM cell leaves its column exactly as the solid made it."""
+    gp, grid, dem = carve_fixture()
+    dem[1, 4] = np.nan
+    lc = np.full((gp.n_rows, gp.n_cols), WATER, dtype=np.int16)
+    before_col = grid[1, 4].copy()
+
+    _carve_water_to_dem_surface(grid, gp, dem, lc, "CityGML")
+
+    assert np.array_equal(grid[1, 4], before_col), (
+        "the NaN column must be left untouched")
+    assert np.all(grid[0, :, CARVE_SURFACE + 1:] == 0), (
+        "finite columns must still be carved")
+
+
+def test_carve_reads_land_cover_south_up():
+    """The land cover arrives SOUTH-up and must be flipped internally.
+
+    ``dem_grid`` and ``voxel_grid`` are north-up; ``land_cover_grid`` is
+    the lone south-up array, exactly as ``_apply_land_cover`` receives it.
+    A uniform water grid cannot see a missing ``np.flipud``; this
+    asymmetric one can.
+    """
+    gp, grid, dem = carve_fixture()
+    lc = np.full((gp.n_rows, gp.n_cols), NOT_WATER, dtype=np.int16)
+    lc[:3, :] = WATER          # south-up rows 0..2 == north-up rows 3..5
+
+    _carve_water_to_dem_surface(grid, gp, dem, lc, "CityGML")
+
+    assert np.all(grid[3:, :, CARVE_SURFACE + 1:] == 0), (
+        "north-up rows 3..5 are the water half and must be carved")
+    assert np.all(grid[:3, :, :8] == GROUND_CODE), (
+        "north-up rows 0..2 are dry land and must be untouched -- "
+        "carving them means the south-up flip is missing")
+
+
+def test_carve_converts_source_specific_land_cover_codes():
+    """A 0-based source's raw water code reaches the carve as water.
+
+    The raw index is derived by inverting ``convert_land_cover`` for the
+    source rather than hardcoded, so this stays honest if the upstream
+    mapping is renumbered.
+    """
+    from voxcity.utils.lc import convert_land_cover
+
+    source = "OpenEarthMapJapan"
+    # 0..8 are the source's own classes; convert_land_cover passes
+    # anything outside its mapping through unchanged, so probing wider
+    # would "find" standard code 9 sitting at raw 9 and mean nothing.
+    probe = np.arange(0, 9, dtype=np.int32)
+    raw_water = [int(c) for c, std in
+                 zip(probe, convert_land_cover(probe, land_cover_source=source))
+                 if int(std) == WATER]
+    assert len(raw_water) == 1, (
+        f"expected exactly one {source} code to mean water, got {raw_water}")
+    raw_dry = next(int(c) for c, std in
+                   zip(probe, convert_land_cover(probe, land_cover_source=source))
+                   if int(std) not in (WATER, 0))
+
+    gp, grid, dem = carve_fixture()
+    lc = np.full((gp.n_rows, gp.n_cols), raw_dry, dtype=np.int32)
+    lc[:, 2] = raw_water[0]
+
+    _carve_water_to_dem_surface(grid, gp, dem, lc, source)
+
+    assert np.all(grid[:, 2, CARVE_SURFACE + 1:] == 0), (
+        f"{source} raw code {raw_water[0]} must convert to water and carve")
+    assert np.all(grid[:, 0, :8] == GROUND_CODE), (
+        f"{source} raw code {raw_dry} is not water and must not carve")
 
 
 # ── Run all ─────────────────────────────────────────────────────────

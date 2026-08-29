@@ -184,6 +184,7 @@ def voxelize_citygml_meshes(
     building_shell_threshold: float = INCLUSIVE_SHELL_THRESHOLD,
     shell_anchor: str = "connected",
     underground_depth: float = 0.0,
+    flatten_water_dem: bool = True,
     *,
     info_out: Optional[dict] = None,
 ) -> np.ndarray:
@@ -219,6 +220,12 @@ def voxelize_citygml_meshes(
         shell_anchor: Anchor rule for surface-shell overlays ("connected"
             default — inclusive; "adjacent" — tight).  See
             ``_overlay_surface_shell``.
+        flatten_water_dem: When True (default), water columns' ground is
+            carved down to the DEM's containing voxel after the terrain
+            conform (``_carve_water_to_dem_surface``).  The conform
+            itself is raise-only, so without this a terrain solid that
+            planted ground above the water DEM leaves a cliff inside the
+            river.  Set False to keep the pre-carve behaviour.
         info_out: Optional dict filled with facts about the voxel grid that
             the return value cannot carry, for callers that need to overlay
             revised layers onto the finished grid later:
@@ -323,9 +330,23 @@ def voxelize_citygml_meshes(
         shell_anchor=shell_anchor,
     )
 
-    # Land cover overlay (topmost terrain voxel)
+    # Land cover is resized once, here: the water carve below and
+    # `_apply_land_cover` must both read the SAME array, at the voxel
+    # grid's (n_rows, n_cols) — a shape disagreement with dem_grid /
+    # voxel_grid would broadcast wrongly in the carve rather than error.
     if land_cover_grid is not None and dem_grid is not None:
         land_cover_grid = _resize_int_grid(land_cover_grid, gp.n_rows, gp.n_cols)
+
+        # Water carve — the raise-only conform's counterpart.  Must run
+        # AFTER `_fill_air_to_dem_surface` (it lowers what the conform and
+        # the solid placed) and BEFORE `_apply_land_cover` (which calls
+        # `_ground_surface_index`; `_apply_canopy` calls it again and the
+        # two must agree, so ground cannot move between them).
+        if flatten_water_dem:
+            _carve_water_to_dem_surface(voxel_grid, gp, dem_grid,
+                                        land_cover_grid, land_cover_source)
+
+        # Land cover overlay (topmost terrain voxel)
         _apply_land_cover(voxel_grid, gp, land_cover_grid, dem_grid, land_cover_source)
 
     # Canopy overlay
@@ -610,6 +631,65 @@ def _fill_air_to_dem_surface(
     if n_bare:
         _log.warning("  Terrain conform: %d column(s) still have no ground",
                      n_bare)
+
+
+def _carve_water_to_dem_surface(
+    voxel_grid: np.ndarray,
+    gp: Grid3DParams,
+    dem_grid: np.ndarray,
+    land_cover_grid: np.ndarray,
+    land_cover_source: str,
+) -> None:
+    """Lower water columns' GROUND voxels to the DEM's containing voxel.
+
+    The counterpart of ``_fill_air_to_dem_surface`` for water: that
+    conform is raise-only by design (its one-sided-error measurement
+    holds for open TERRAIN), but water columns inherit bank noise from
+    the terrain solid and from the TIN-interpolated DEM, and the
+    flattened water DEM can sit BELOW what the solid planted.  Measured
+    on a real Tokyo LOD2 model, 594 water columns split across three
+    voxel ground levels -- a 5 m cliff inside the river, which PALM then
+    faithfully simulates as a warm soil wall.
+
+    Carving is water-only and GROUND_CODE-only: building/bridge (-3) and
+    tree (-2) voxels are never touched, so bridge piers keep standing in
+    the carved water (they voxelize with ``overwrite=True`` and
+    legitimately punch through the ground there).
+
+    ``land_cover_grid`` is SOUTH-up source-specific codes -- the same
+    contract as ``_apply_land_cover``, flipped and converted here the
+    same way, and at the same (n_rows, n_cols) shape as ``dem_grid`` and
+    ``voxel_grid``.  Non-finite DEM cells are skipped, mirroring the
+    conform.
+
+    Runs after the conform and BEFORE ``_apply_land_cover``, so the
+    land-cover stamp and the canopy both see the carved ground:
+    ``_ground_surface_index`` is called once by each and must return the
+    same index both times, so moving ground between them would leave an
+    orphaned land-cover voxel floating above the carved surface.
+    """
+    lc = np.flipud(_convert_land_cover(np.asarray(land_cover_grid),
+                                       land_cover_source))
+    water = lc == 9
+    if not water.any():
+        return
+    dem = np.asarray(dem_grid, dtype=np.float64)
+    finite = np.isfinite(dem)
+    # Sanitised copy before the cast, for the same reason the conform
+    # does it: np.ceil(nan) cast to an integer is undefined behaviour.
+    t = (np.where(finite, dem, gp.min_z) - gp.min_z) / gp.voxel_size
+    surface = (np.ceil(np.round(t, 9)) - 1).astype(np.intp)
+    surface = np.clip(surface, -1, gp.n_z - 1)
+    z_indices = np.arange(gp.n_z, dtype=np.intp)
+    above = z_indices[np.newaxis, np.newaxis, :] > surface[:, :, np.newaxis]
+    carve = (above & water[:, :, np.newaxis] & finite[:, :, np.newaxis]
+             & (voxel_grid == GROUND_CODE))
+    n = int(carve.sum())
+    voxel_grid[carve] = 0
+    if n:
+        _log.info("  Water carve: removed %d ground voxel(s) above the "
+                  "flattened water surface in %d column(s)",
+                  n, int(carve.any(axis=2).sum()))
 
 
 # ── MeshLib-based voxelization ────────────────────────────────────────

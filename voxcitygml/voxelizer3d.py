@@ -660,7 +660,10 @@ def _carve_water_to_dem_surface(
     contract as ``_apply_land_cover``, flipped and converted here the
     same way, and at the same (n_rows, n_cols) shape as ``dem_grid`` and
     ``voxel_grid``.  Non-finite DEM cells are skipped, mirroring the
-    conform.
+    conform -- but deliberately WITHOUT re-warning about them: the
+    conform ran one step earlier over the same ``dem_grid`` and already
+    reported that exact set of cells, so a second warning would only
+    double-count them.  The asymmetry is intentional.
 
     Runs after the conform and BEFORE ``_apply_land_cover``, so the
     land-cover stamp and the canopy both see the carved ground:
@@ -679,7 +682,13 @@ def _carve_water_to_dem_surface(
     # does it: np.ceil(nan) cast to an integer is undefined behaviour.
     t = (np.where(finite, dem, gp.min_z) - gp.min_z) / gp.voxel_size
     surface = (np.ceil(np.round(t, 9)) - 1).astype(np.intp)
-    surface = np.clip(surface, -1, gp.n_z - 1)
+    # Clamp at 0, NOT at the conform's -1.  There, -1 means "the DEM is
+    # below the grid floor, so fill nothing"; here the same value would
+    # INVERT -- `z > -1` is every voxel -- and carve the column bare,
+    # a hole in the world that lands AFTER the conform's n_bare alarm has
+    # already passed, so nothing would warn.  `_compute_grid_params_3d`
+    # keeps t >= 1 today, but that guarantee lives 200 lines away.
+    surface = np.clip(surface, 0, gp.n_z - 1)
     z_indices = np.arange(gp.n_z, dtype=np.intp)
     above = z_indices[np.newaxis, np.newaxis, :] > surface[:, :, np.newaxis]
     carve = (above & water[:, :, np.newaxis] & finite[:, :, np.newaxis]

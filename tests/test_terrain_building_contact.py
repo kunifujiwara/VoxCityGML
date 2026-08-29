@@ -304,31 +304,68 @@ def water_rect():
     return [(0.0, 0.0), (0.0, NXY), (NXY, NXY), (NXY, 0.0)]
 
 
+#: A bridge pier standing in the water, spanning the carve zone.  The
+#: constraint that the carve touches GROUND_CODE only exists for real
+#: piers in real rivers, so the pipeline fixture -- where the ORDERING is
+#: also under test -- carries one rather than leaving that to unit scope.
+PIER_X0 = PIER_Y0 = 18.0
+PIER_W = 4.0
+
+
+def pier_mesh():
+    """A BRIDGE mesh punching from below the water DEM up through the TIN.
+
+    Bridges voxelize as BUILDING_CODE with ``overwrite=True``, so this
+    also puts BUILDING voxels where the terrain solid had put ground.
+    """
+    b = trimesh.creation.box(extents=[PIER_W, PIER_W, 3.0])
+    b.apply_translation([PIER_X0 + PIER_W / 2, PIER_Y0 + PIER_W / 2,
+                         WATER_DEM_Z + 2.0])
+    # Mesh3D vertices are (lat, lon, z); the local frame is (x, y, z) and
+    # swap_coordinates_3d + IdentityTransformer undo the swap.
+    verts = np.asarray(b.vertices, float)[:, [1, 0, 2]]
+    return Mesh3D(vertices=verts, faces=np.asarray(b.faces),
+                  feature_type="bridge", feature_id="pier")
+
+
 def run_water_pipeline(path, monkeypatch, flatten_water_dem):
-    """Full voxelization of a flat TIN over an all-water land cover."""
+    """Full voxelization of a flat TIN + bridge pier over all-water cover."""
     select_terrain_path(path, monkeypatch)
     monkeypatch.setattr(v3, "create_rectangle_frame_transformer",
                         lambda *a, **k: IdentityTransformer())
     n = int(round(NXY / VS))
+    dem = np.full((n, n), WATER_DEM_Z, dtype=np.float64)
     collection = v3.CityGMLMeshCollection(
-        terrain=[flat_terrain_mesh(WATER_TIN_Z)])
+        terrain=[flat_terrain_mesh(WATER_TIN_Z)], bridges=[pier_mesh()])
+    info = {}
     grid = v3.voxelize_citygml_meshes(
         collection,
         water_rect(),
         0.0, 0.0,
         VS,
-        dem_grid=np.full((n, n), WATER_DEM_Z, dtype=np.float64),
+        dem_grid=dem,
         land_cover_grid=np.full((n, n), WATER_CODE, dtype=np.int16),
         land_cover_source="CityGML",
         underground_depth=UNDERGROUND,
         flatten_water_dem=flatten_water_dem,
+        info_out=info,
     )
     gp, _ = v3._compute_grid_params_3d(
         water_rect(), 0.0, 0.0, VS, collection,
-        underground_depth=UNDERGROUND,
-        dem_grid=np.full((n, n), WATER_DEM_Z, dtype=np.float64),
+        underground_depth=UNDERGROUND, dem_grid=dem,
     )
+    # The recomputed gp must describe the grid that came back, or every
+    # index this module asserts is measured against the wrong frame.
+    assert float(info["voxel_min_z"]) == gp.min_z
+    assert grid.shape == (gp.n_rows, gp.n_cols, gp.n_z)
     return gp, grid
+
+
+def pier_columns(grid):
+    """Boolean (n_rows, n_cols) mask of columns holding BUILDING voxels."""
+    mask = (grid == v3.BUILDING_CODE).any(axis=2)
+    assert mask.any(), "the bridge pier produced no BUILDING voxels"
+    return mask
 
 
 def surface_tops(gp, grid):
@@ -362,17 +399,19 @@ def test_water_columns_carve_down_to_the_dem_surface(path, monkeypatch):
     gp, grid = run_water_pipeline(path, monkeypatch, flatten_water_dem=True)
     surface = containing_voxel(gp, WATER_DEM_Z)
     assert surface > 0, "fixture must not put the water surface on the floor"
+    open_water = ~pier_columns(grid)
 
-    tops = surface_tops(gp, grid)
+    assert not (grid[:, :, surface + 1:] == v3.GROUND_CODE).any(), (
+        f"{path}: ground left standing above the flattened water surface")
+
+    tops = surface_tops(gp, grid)[open_water]
     assert tops.min() == surface and tops.max() == surface, (
         f"{path}: carved water tops {tops.min()}..{tops.max()}, "
         f"expected {surface}")
-    assert not (grid[:, :, surface + 1:] == v3.GROUND_CODE).any(), (
-        f"{path}: ground left standing above the flattened water surface")
-    assert np.all(grid[:, :, surface] == WATER_CODE), (
+    assert np.all(grid[:, :, surface][open_water] == WATER_CODE), (
         f"{path}: the water land-cover voxel must sit on the carved "
         f"surface, not on the uncarved terrain top")
-    assert np.all(grid[:, :, :surface] == v3.GROUND_CODE), (
+    assert np.all(grid[:, :, :surface][open_water] == v3.GROUND_CODE), (
         f"{path}: the carve must not hollow out the ground below the DEM")
 
 
@@ -380,10 +419,34 @@ def test_water_columns_carve_down_to_the_dem_surface(path, monkeypatch):
 def test_water_carve_opt_out_leaves_the_tin(path, monkeypatch):
     """``flatten_water_dem=False`` restores the pre-carve behaviour."""
     gp, grid = run_water_pipeline(path, monkeypatch, flatten_water_dem=False)
-    tops = surface_tops(gp, grid)
+    open_water = ~pier_columns(grid)
+    tops = surface_tops(gp, grid)[open_water]
     low, high = allowed_solid_top_range(gp, WATER_TIN_Z, path)
     assert tops.min() >= low and tops.max() <= high, (
         f"{path}: opted-out tops {tops.min()}..{tops.max()}, "
         f"expected the TIN's [{low}, {high}]")
     assert tops.min() > containing_voxel(gp, WATER_DEM_Z), (
         f"{path}: opting out must leave the water columns high")
+
+
+@pytest.mark.parametrize("path", TERRAIN_PATHS)
+def test_water_carve_leaves_the_bridge_pier_standing(path, monkeypatch):
+    """The carve is GROUND_CODE-only: every BUILDING voxel is preserved.
+
+    Comparing the two runs voxel-for-voxel is the exact statement of the
+    constraint -- a pier in a river must come out of the carved grid
+    identical to the one in the uncarved grid, or the carve stranded
+    real bridge geometry.
+    """
+    _, carved = run_water_pipeline(path, monkeypatch, flatten_water_dem=True)
+    monkeypatch.undo()
+    gp, uncarved = run_water_pipeline(path, monkeypatch,
+                                      flatten_water_dem=False)
+
+    assert np.array_equal(carved == v3.BUILDING_CODE,
+                          uncarved == v3.BUILDING_CODE), (
+        f"{path}: the carve changed the BUILDING voxel set")
+    surface = containing_voxel(gp, WATER_DEM_Z)
+    assert (carved[:, :, surface + 1:] == v3.BUILDING_CODE).any(), (
+        f"{path}: the fixture's pier must reach above the carve surface, "
+        f"or this test proves nothing")

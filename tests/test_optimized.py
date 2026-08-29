@@ -1,6 +1,8 @@
 """Functional tests for the optimized voxelizer3d module."""
 
 import time
+import warnings
+
 import numpy as np
 
 from voxcitygml.voxelizer3d import (
@@ -289,18 +291,54 @@ def test_carve_never_touches_building_or_tree_voxels():
 
 
 def test_carve_skips_nonfinite_dem_cells():
-    """A NaN DEM cell leaves its column exactly as the solid made it."""
+    """A non-finite DEM cell leaves its column exactly as the solid made it.
+
+    The grid outcome ALONE does not pin the sanitisation: ``finite`` masks
+    the cell out of ``carve`` regardless of what garbage the integer cast
+    produced from ``np.ceil(nan)``, so feeding the raw DEM to the cast
+    gives a byte-identical grid.  Promoting RuntimeWarning to an error is
+    what makes this test fail if the non-finite cells are ever handed to
+    ``astype()`` again -- the same reason
+    ``test_conform_skips_nonfinite_dem_cells`` does it for the conform.
+    """
     gp, grid, dem = carve_fixture()
     dem[1, 4] = np.nan
+    dem[2, 5] = np.inf
     lc = np.full((gp.n_rows, gp.n_cols), WATER, dtype=np.int16)
-    before_col = grid[1, 4].copy()
+    before_nan = grid[1, 4].copy()
+    before_inf = grid[2, 5].copy()
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        _carve_water_to_dem_surface(grid, gp, dem, lc, "CityGML")
+
+    assert np.array_equal(grid[1, 4], before_nan), (
+        "the NaN column must be left untouched")
+    assert np.array_equal(grid[2, 5], before_inf), (
+        "the inf column must be left untouched")
+    assert np.all(grid[0, :, CARVE_SURFACE + 1:] == 0), (
+        "finite columns must still be carved")
+
+
+def test_carve_never_empties_a_column():
+    """A DEM sitting exactly on the grid floor must not wipe the column.
+
+    ``ceil(0) - 1 == -1`` -- the conform's "below the floor, fill
+    nothing" sentinel.  Reused unclamped here it INVERTS, because
+    ``z > -1`` selects every voxel, and the whole water column is carved
+    to air.  That hole would appear after ``_fill_air_to_dem_surface``'s
+    bare-column warning has already run, so nothing would report it.
+    """
+    gp, grid, _ = carve_fixture()
+    dem = np.full((gp.n_rows, gp.n_cols), gp.min_z)
+    lc = np.full((gp.n_rows, gp.n_cols), WATER, dtype=np.int16)
 
     _carve_water_to_dem_surface(grid, gp, dem, lc, "CityGML")
 
-    assert np.array_equal(grid[1, 4], before_col), (
-        "the NaN column must be left untouched")
-    assert np.all(grid[0, :, CARVE_SURFACE + 1:] == 0), (
-        "finite columns must still be carved")
+    bare = int((~(grid != 0).any(axis=2)).sum())
+    assert bare == 0, f"{bare} column(s) were carved bare"
+    assert np.all(grid[:, :, 0] == GROUND_CODE), (
+        "the floor voxel must survive a DEM clamped to the grid floor")
 
 
 def test_carve_reads_land_cover_south_up():
@@ -310,18 +348,26 @@ def test_carve_reads_land_cover_south_up():
     the lone south-up array, exactly as ``_apply_land_cover`` receives it.
     A uniform water grid cannot see a missing ``np.flipud``; this
     asymmetric one can.
+
+    The water patch is asymmetric on BOTH axes, so it separates ``flipud``
+    from the identity *and* from ``fliplr`` / a transpose -- a row-only
+    patch would pass under any of those.
     """
     gp, grid, dem = carve_fixture()
     lc = np.full((gp.n_rows, gp.n_cols), NOT_WATER, dtype=np.int16)
-    lc[:3, :] = WATER          # south-up rows 0..2 == north-up rows 3..5
+    # South-up rows 0..2 == north-up rows 3..5; columns are not flipped.
+    lc[:3, :2] = WATER
 
     _carve_water_to_dem_surface(grid, gp, dem, lc, "CityGML")
 
-    assert np.all(grid[3:, :, CARVE_SURFACE + 1:] == 0), (
-        "north-up rows 3..5 are the water half and must be carved")
+    assert np.all(grid[3:, :2, CARVE_SURFACE + 1:] == 0), (
+        "north-up rows 3..5, cols 0..1 are the water patch and must carve")
     assert np.all(grid[:3, :, :8] == GROUND_CODE), (
         "north-up rows 0..2 are dry land and must be untouched -- "
         "carving them means the south-up flip is missing")
+    assert np.all(grid[3:, 2:, :8] == GROUND_CODE), (
+        "columns 2.. are dry in every row -- carving them means the flip "
+        "hit the wrong axis")
 
 
 def test_carve_converts_source_specific_land_cover_codes():

@@ -294,6 +294,20 @@ def test_voxelizer_config_water_flatten_fields_default_on():
     assert cfg.water_dem_connectivity == 4
 
 
+@pytest.mark.parametrize('flatten', [True, False])
+def test_run_core_forwards_flatten_water_dem(stub_pipeline, tmp_path, flatten):
+    """``cfg.flatten_water_dem`` must actually reach the voxelizer.
+
+    The field's default and validation are pinned above, but neither
+    notices if ``run_core`` simply never forwards it -- and the voxelizer
+    defaults the kwarg to True, so an unwired opt-out carves anyway and
+    every test still passes.  Assert the value on the call itself.
+    """
+    cfg = replace(_config(tmp_path), flatten_water_dem=flatten)
+    pl.run_core(cfg)
+    assert stub_pipeline['voxelize_kwargs']['flatten_water_dem'] is flatten
+
+
 def test_voxelizer_config_rejects_bad_connectivity():
     with pytest.raises(ValueError, match="water_dem_connectivity"):
         VoxelizerConfig(citygml_path="x", water_dem_connectivity=6)

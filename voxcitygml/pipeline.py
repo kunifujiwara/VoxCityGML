@@ -408,6 +408,7 @@ def run_core(cfg: VoxelizerConfig) -> PipelineArtifacts:
             building_shell_threshold=vox_params.building_shell_threshold,
             shell_anchor=vox_params.shell_anchor,
             underground_depth=cfg.terrain_underground_depth,
+            flatten_water_dem=cfg.flatten_water_dem,
             info_out=vox_info,
         )
         # Both keys are part of voxelize_citygml_meshes' info_out contract.

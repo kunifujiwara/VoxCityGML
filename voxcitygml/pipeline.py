@@ -67,6 +67,44 @@ def _to_south_up(arr):
     return None if arr is None else np.ascontiguousarray(np.flipud(arr))
 
 
+def _flatten_water_dem(dem_grid, land_cover_grid, land_cover_source, *,
+                       enabled, connectivity):
+    """Flatten each connected water body's DEM to one level.
+
+    Reuses voxcity's shared rule so voxcitygml and voxcity cannot drift on
+    what "flat water" means.
+
+    The two grids are in OPPOSITE row frames and the shared rule assumes
+    they are not: it labels the water mask and indexes ``dem_grid`` with
+    the result directly.  ``dem_grid`` is NORTH-up
+    (``terrain/processor.py``) while ``land_cover_grid`` is SOUTH-up
+    (``landcover/processor.py``), so the mask is flipud'd here --
+    once, on the land-cover side only -- and the returned DEM stays
+    north-up for the rest of the pipeline.  Passing the pair through
+    unflipped raises nothing and yields a plausible grid; it just flattens
+    the vertically mirrored set of cells.  Same conversion, same reason, as
+    ``_apply_land_cover`` and ``_carve_water_to_dem_surface`` in
+    ``voxelizer3d``.
+
+    ``pyproject`` pins ``voxcity>=1.3.2``, which does not guarantee the
+    public name, so an older install degrades to a no-op with a warning
+    rather than crashing the pipeline.
+    """
+    try:
+        from voxcity.generator.pipeline import flatten_water_dem_by_component
+    except ImportError:
+        print("  [water] installed voxcity predates the public water-DEM "
+              "flattener; water surfaces are NOT flattened")
+        return dem_grid, {"applied": False,
+                          "reason": "voxcity_flattener_unavailable",
+                          "water_body_count": 0, "water_cell_count": 0,
+                          "water_dem_min_values": []}
+    flattened, info = flatten_water_dem_by_component(
+        dem_grid, np.flipud(np.asarray(land_cover_grid)), land_cover_source,
+        enabled=enabled, connectivity=connectivity)
+    return flattened, info
+
+
 class VoxCityGML:
     """End-to-end CityGML → VoxCity pipeline.
 
@@ -120,6 +158,12 @@ class VoxCityGML:
                 "voxel_min_z": art.voxel_min_z,
                 # Pairs with voxels.classes, so it converts with it.
                 "mesh_vegetation_mask": _to_south_up(art.mesh_vegetation_mask),
+                # The same three key names voxcity's own pipeline
+                # publishes, so a consumer need not know which package
+                # built the model.
+                "flatten_water_dem": art.flatten_water_dem,
+                "water_dem_connectivity": art.water_dem_connectivity,
+                "water_dem_flattening": art.water_dem_flattening,
             },
         )
 
@@ -197,6 +241,18 @@ class PipelineArtifacts:
     # always populates this with a real array (all-False on the legacy path),
     # so consumers of run_core's artifacts need no None branch.
     mesh_vegetation_mask: Optional[np.ndarray] = None
+
+    # Water-DEM flattening record (mirrors voxcity's extras contract).
+    # Appended last and defaulted for the same reason ``dem_source`` is:
+    # callers outside this package construct synthetic artifacts, so a new
+    # field must never displace an existing one.  ``water_dem_flattening``
+    # is the info dict ``_flatten_water_dem`` returns -- ``applied``,
+    # ``reason``, ``water_body_count``, ``water_cell_count``,
+    # ``water_dem_min_values``.  ``None`` only on such synthetic artifacts;
+    # ``run_core`` always populates it.
+    flatten_water_dem: bool = True
+    water_dem_connectivity: int = 4
+    water_dem_flattening: Optional[dict] = None
 
 
 def _resolve_dem_step(cfg, collection, rectangle):
@@ -359,6 +415,22 @@ def run_core(cfg: VoxelizerConfig) -> PipelineArtifacts:
         land_cover_grid = _resize_int_grid(land_cover_grid, *dem_grid.shape)
         print(f"  Resized land cover grid to {land_cover_grid.shape}")
 
+    # Flatten each connected water body's DEM to one level, HERE and not
+    # later: steps [4/5] and [5/5] below both read ``dem_grid[r, c]`` as
+    # their ground datum (``buildings/processor.py``,
+    # ``canopy/processor.py``), so flattening after them would leave
+    # building and vegetation heights measured against a DEM that no
+    # longer exists.  ``getattr`` with defaults matches how ``dem_source``
+    # is read: optional config fields, tolerant of older configs.
+    flatten_water = bool(getattr(cfg, "flatten_water_dem", True))
+    water_conn = int(getattr(cfg, "water_dem_connectivity", 4))
+    dem_grid, water_dem_info = _flatten_water_dem(
+        dem_grid, land_cover_grid, land_cover_source,
+        enabled=flatten_water, connectivity=water_conn)
+    if water_dem_info["applied"]:
+        print(f"  Flattened {water_dem_info['water_body_count']} water "
+              f"body(ies) across {water_dem_info['water_cell_count']} cells")
+
     # -- Step 4: Building grids ---------------------------------------
     print("\n[4/5] Rasterising buildings and bridges...")
     building_height_grid, building_min_height_grid, building_id_grid = \
@@ -408,7 +480,7 @@ def run_core(cfg: VoxelizerConfig) -> PipelineArtifacts:
             building_shell_threshold=vox_params.building_shell_threshold,
             shell_anchor=vox_params.shell_anchor,
             underground_depth=cfg.terrain_underground_depth,
-            flatten_water_dem=cfg.flatten_water_dem,
+            flatten_water_dem=flatten_water,
             info_out=vox_info,
         )
         # Both keys are part of voxelize_citygml_meshes' info_out contract.
@@ -432,6 +504,9 @@ def run_core(cfg: VoxelizerConfig) -> PipelineArtifacts:
             building_id_grid, voxel_grid, building_code=BUILDING_CODE,
         )
     else:
+        # No water carve on this path, and none is needed: this voxelizer
+        # fills ground per-column straight from the DEM, so the flatten
+        # above is already the whole fix here.
         from voxcity.generator.voxelizer import Voxelizer
         voxelizer = Voxelizer(
             voxel_size=cfg.meshsize,
@@ -472,6 +547,9 @@ def run_core(cfg: VoxelizerConfig) -> PipelineArtifacts:
         voxel_grid=voxel_grid,
         voxel_min_z=voxel_min_z,
         mesh_vegetation_mask=mesh_vegetation_mask,
+        flatten_water_dem=flatten_water,
+        water_dem_connectivity=water_conn,
+        water_dem_flattening=water_dem_info,
     )
 
 

@@ -310,6 +310,14 @@ class VoxelizerConfig:
                       [SW, NW, NE, SE].  When given, ``center_lon`` /
                       ``center_lat`` / ``size_meters`` are ignored and the
                       centre is derived from the vertex centroid.
+        flatten_water_dem: If True (default), flatten each connected water
+                      body's DEM to a single elevation and carve the voxel
+                      ground in those columns to match, so rivers/lakes
+                      come out flat instead of quantizing across the
+                      bank/water-surface elevations mixed into the terrain
+                      TIN.  Same default as voxcity's raster pipeline.
+        water_dem_connectivity: Pixel connectivity (4 or 8) used to find
+                      connected water bodies for ``flatten_water_dem``.
     """
     citygml_path: Union[str, List[str]] = ""
     rectangle_vertices: Optional[List[Tuple[float, float]]] = None
@@ -341,6 +349,11 @@ class VoxelizerConfig:
     terrain_underground_depth: float = 0.0
     include_bridges: bool = True
     use_parse_cache: bool = True
+    # Flatten each connected water body's DEM to one level and carve the
+    # voxel ground to match (rivers must not carry terrain-TIN bank noise).
+    # Same semantics/defaults as voxcity's raster pipeline.
+    flatten_water_dem: bool = True
+    water_dem_connectivity: int = 4
 
     def __post_init__(self):
         if self.voxelization_mode not in VOXELIZATION_MODES:
@@ -348,6 +361,10 @@ class VoxelizerConfig:
         if self.buffer_meters < 0:
             raise ValueError(
                 f"buffer_meters must be >= 0, got {self.buffer_meters}")
+        if self.water_dem_connectivity not in (4, 8):
+            raise ValueError(
+                f"water_dem_connectivity must be 4 or 8, got "
+                f"{self.water_dem_connectivity}")
 
     def resolved_voxel_params(self) -> ResolvedVoxelParams:
         """Mode defaults with explicit threshold overrides applied.

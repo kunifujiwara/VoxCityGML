@@ -286,3 +286,19 @@ def test_run_and_export_forwards_explicit_threshold_override(stub_export,
     assert kwargs['building_shell_threshold'] == 0.5
     assert kwargs['occupancy_threshold'] == 0.25
     assert kwargs['shell_anchor'] == 'connected'
+
+
+def test_voxelizer_config_water_flatten_fields_default_on():
+    cfg = VoxelizerConfig(citygml_path="x")
+    assert cfg.flatten_water_dem is True
+    assert cfg.water_dem_connectivity == 4
+
+
+def test_voxelizer_config_rejects_bad_connectivity():
+    with pytest.raises(ValueError, match="water_dem_connectivity"):
+        VoxelizerConfig(citygml_path="x", water_dem_connectivity=6)
+
+
+def test_voxelizer_config_accepts_connectivity_8():
+    cfg = VoxelizerConfig(citygml_path="x", water_dem_connectivity=8)
+    assert cfg.water_dem_connectivity == 8

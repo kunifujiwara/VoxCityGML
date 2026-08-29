@@ -48,7 +48,13 @@ from .buildings.processor import (
     meshes_to_building_grids,
 )
 from .canopy.processor import get_canopy_grids
-from .voxelizer3d import BUILDING_CODE, voxelize_citygml_meshes
+from .voxelizer3d import (
+    BUILDING_CODE, voxelize_citygml_meshes,
+    # The water CARVE's land-cover converter.  The flatten standardises with
+    # the SAME function so the two halves of the water fix cannot disagree
+    # about which cells are water; see ``_flatten_water_dem``.
+    _convert_land_cover,
+)
 
 
 def _to_south_up(arr):
@@ -67,28 +73,71 @@ def _to_south_up(arr):
     return None if arr is None else np.ascontiguousarray(np.flipud(arr))
 
 
+#: VoxCity's standard land-cover codes are 1-based (1..14); 9 is Water.
+#: Spans the range and includes water itself, so a source whose conversion
+#: is not the identity cannot pass the probe below by accident.
+_STANDARD_CODE_PROBE = np.array([[1, 9, 14]], dtype=np.int64)
+
+
+def _encode_standard_codes(standard_lc):
+    """Label an already-standard grid with a source voxcity won't re-convert.
+
+    ``flatten_water_dem_by_component`` converts whatever grid it is handed,
+    so a grid that is already in standard codes must be given a source name
+    whose conversion is a no-op.  ``convert_land_cover`` grew its
+    ``"Standard"`` pass-through branch at the same time as the public
+    flattener, and ``pyproject`` pins only ``voxcity>=1.3.2``.  On an older
+    install ``"Standard"`` is not an error but simply an UNKNOWN source,
+    and the else-branch there adds 1: water would read as 10, the ``== 9``
+    mask would come back empty, and the flatten would no-op while
+    reporting ``reason="no_water_cells"`` -- a false answer, not a failure.
+
+    So probe rather than trust the name.  When the probe fails, fall back
+    to ``"OpenStreetMap"`` with the codes pre-decremented: that branch is a
+    plain ``+1`` on every voxcity that has shipped a flattener, so the
+    round trip restores the standard codes exactly.
+    """
+    from voxcity.utils.lc import convert_land_cover
+    passthrough = convert_land_cover(_STANDARD_CODE_PROBE.copy(),
+                                     land_cover_source="Standard")
+    if np.array_equal(passthrough, _STANDARD_CODE_PROBE):
+        return standard_lc, "Standard"
+    return standard_lc.astype(np.int64) - 1, "OpenStreetMap"
+
+
 def _flatten_water_dem(dem_grid, land_cover_grid, land_cover_source, *,
                        enabled, connectivity):
     """Flatten each connected water body's DEM to one level.
 
     Reuses voxcity's shared rule so voxcitygml and voxcity cannot drift on
-    what "flat water" means.
+    what "flat water" means.  Three things differ across that seam, and
+    this adapter owns all three so no caller has to know about any of them.
 
-    The two grids are in OPPOSITE row frames and the shared rule assumes
-    they are not: it labels the water mask and indexes ``dem_grid`` with
-    the result directly.  ``dem_grid`` is NORTH-up
-    (``terrain/processor.py``) while ``land_cover_grid`` is SOUTH-up
-    (``landcover/processor.py``), so the mask is flipud'd here --
+    *Frame.*  ``dem_grid`` is NORTH-up (``terrain/processor.py``) while
+    ``land_cover_grid`` is SOUTH-up (``landcover/processor.py``), and the
+    shared rule assumes one frame: it labels the water mask and indexes
+    ``dem_grid`` with the result directly.  The mask is flipud'd here --
     once, on the land-cover side only -- and the returned DEM stays
-    north-up for the rest of the pipeline.  Passing the pair through
-    unflipped raises nothing and yields a plausible grid; it just flattens
-    the vertically mirrored set of cells.  Same conversion, same reason, as
-    ``_apply_land_cover`` and ``_carve_water_to_dem_surface`` in
-    ``voxelizer3d``.
+    north-up.  Unflipped, nothing raises; it just flattens the vertically
+    mirrored cells.  Same conversion, same reason, as ``_apply_land_cover``
+    and ``_carve_water_to_dem_surface`` in ``voxelizer3d``.
 
-    ``pyproject`` pins ``voxcity>=1.3.2``, which does not guarantee the
-    public name, so an older install degrades to a no-op with a warning
-    rather than crashing the pipeline.
+    *Code space.*  voxcitygml's ``_convert_land_cover`` has a CityGML
+    branch (those codes are already 1-based) that voxcity's has not, so
+    handing voxcity the raw source name sends CityGML water through the
+    unknown-source ``+1``: 9 becomes 10, the mask comes back EMPTY, and the
+    flatten silently no-ops on the very source the PLATEAU path uses --
+    while the carve, which uses voxcitygml's converter, still sees the
+    water and conforms voxel ground to the unflattened DEM.  Measured on
+    real PLATEAU data that left 1270 distinct DEM levels inside the Sumida
+    and reported ``no_water_cells``.  Standardising HERE, with the carve's
+    own converter, forces both halves of the fix through one definition of
+    water; ``_encode_standard_codes`` then keeps voxcity from converting a
+    second time.
+
+    *Availability.*  ``pyproject`` pins ``voxcity>=1.3.2``, which
+    guarantees neither the public flattener (handled below) nor the
+    ``"Standard"`` pass-through (see ``_encode_standard_codes``).
     """
     try:
         from voxcity.generator.pipeline import flatten_water_dem_by_component
@@ -99,10 +148,12 @@ def _flatten_water_dem(dem_grid, land_cover_grid, land_cover_source, *,
                           "reason": "voxcity_flattener_unavailable",
                           "water_body_count": 0, "water_cell_count": 0,
                           "water_dem_min_values": []}
-    flattened, info = flatten_water_dem_by_component(
-        dem_grid, np.flipud(np.asarray(land_cover_grid)), land_cover_source,
+    standard_lc = np.flipud(_convert_land_cover(np.asarray(land_cover_grid),
+                                                land_cover_source))
+    codes, encoded_source = _encode_standard_codes(standard_lc)
+    return flatten_water_dem_by_component(
+        dem_grid, codes, encoded_source,
         enabled=enabled, connectivity=connectivity)
-    return flattened, info
 
 
 class VoxCityGML:
@@ -430,6 +481,11 @@ def run_core(cfg: VoxelizerConfig) -> PipelineArtifacts:
     if water_dem_info["applied"]:
         print(f"  Flattened {water_dem_info['water_body_count']} water "
               f"body(ies) across {water_dem_info['water_cell_count']} cells")
+    elif flatten_water:
+        # Say so out loud.  Silence here is what let a broken water mask
+        # look exactly like a dry AOI for two commits.
+        print(f"  [water] no DEM flattening applied "
+              f"({water_dem_info['reason']})")
 
     # -- Step 4: Building grids ---------------------------------------
     print("\n[4/5] Rasterising buildings and bridges...")

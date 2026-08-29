@@ -11,6 +11,10 @@ from voxcitygml.models import (
 #: The anchors the shell rasterizer actually implements -- imported, not
 #: restated, so this stays a real check rather than a second opinion.
 from voxcitygml.voxelizer3d import SHELL_ANCHORS
+#: The converter the water CARVE uses.  Imported so the agreement test
+#: below asks the carve itself what water is, rather than restating a
+#: per-source table that could drift away from it.
+from voxcitygml.voxelizer3d import _convert_land_cover
 
 #: Centre coordinates only ``run_core`` can supply, so a caller that used
 #: ``cfg``'s instead is caught.
@@ -334,12 +338,15 @@ _OSM_WATER = 8
 #: Rows 0-2 of the north-up DEM: the water body, carrying TWO levels -- the
 #: intra-river cliff this feature exists to remove.
 _WATER_ROWS = 3
+#: The water body spans only the WESTERN columns, so the fixture is
+#: asymmetric along columns as well as rows (see ``_asymmetric_water_grids``).
+_WATER_COLS = 6
 _WATER_TOP_LEVEL = 8.0
 _WATER_BODY_MIN = 3.0
 
 
 def _asymmetric_water_grids():
-    """A DEM / land-cover pair whose water body sits in the world NORTH.
+    """A DEM / land-cover pair whose water body sits in the world NORTH-WEST.
 
     Deliberately asymmetric along ROWS.  The two grids live in opposite row
     frames -- ``dem_grid`` is north-up, ``land_cover_grid`` south-up
@@ -348,6 +355,12 @@ def _asymmetric_water_grids():
     plausible output, wrong rivers.  A uniform or vertically symmetric
     fixture cannot see that; this one can, because the mirrored rows carry
     different values than the real ones.
+
+    Asymmetric along COLUMNS too, and that is a separate guarantee: on a
+    column-uniform fixture ``fliplr`` is the identity, so a spurious EXTRA
+    flip on top of the correct one would survive every assertion.  Here the
+    water covers only columns 0-5, so a mirrored mask flattens columns 4-9
+    instead and the eastern columns give it away.
     """
     dem = np.zeros((10, 10), dtype=np.float64)
     dem[0, :] = _WATER_TOP_LEVEL
@@ -357,7 +370,7 @@ def _asymmetric_water_grids():
     # SOUTH-up land cover: its row 9 is the NORTHERN edge, so the water rows
     # are 7-9 here and land on DEM rows 0-2 only after a flipud.
     lc = np.zeros((10, 10), dtype=np.int32)
-    lc[10 - _WATER_ROWS:, :] = _OSM_WATER
+    lc[10 - _WATER_ROWS:, :_WATER_COLS] = _OSM_WATER
     return dem, lc
 
 
@@ -391,9 +404,13 @@ def test_water_dem_flattening_respects_the_land_cover_frame(water_pipeline,
     art = pl.run_core(cfg)
     dem = art.dem_grid
 
-    assert np.all(dem[:_WATER_ROWS, :] == _WATER_BODY_MIN), (
-        "the northern water body did not collapse to its own minimum -- "
-        "the land-cover mask was probably applied in the wrong row frame")
+    assert np.all(dem[:_WATER_ROWS, :_WATER_COLS] == _WATER_BODY_MIN), (
+        "the north-western water body did not collapse to its own minimum "
+        "-- the land-cover mask was probably applied in the wrong frame")
+    # The eastern half of those same rows is dry land and must be untouched;
+    # this is what a spurious left-right flip trips over.
+    assert np.all(dem[0, _WATER_COLS:] == _WATER_TOP_LEVEL)
+    assert np.all(dem[1:_WATER_ROWS, _WATER_COLS:] == _WATER_BODY_MIN)
     for r in range(_WATER_ROWS, 10):
         assert np.all(dem[r, :] == 20.0 + (r - _WATER_ROWS)), (
             f"land row {r} was flattened; only water cells may change")
@@ -413,7 +430,7 @@ def test_water_dem_flattening_reaches_artifacts_and_extras(water_pipeline,
     assert info["applied"] is True
     assert info["reason"] == "applied"
     assert info["water_body_count"] == 1
-    assert info["water_cell_count"] == _WATER_ROWS * 10
+    assert info["water_cell_count"] == _WATER_ROWS * _WATER_COLS
     assert info["water_dem_min_values"] == [_WATER_BODY_MIN]
 
     city = pl.VoxCityGML(cfg).run()
@@ -422,7 +439,8 @@ def test_water_dem_flattening_reaches_artifacts_and_extras(water_pipeline,
     assert city.extras["water_dem_flattening"]["applied"] is True
     # C3: the DEM the model carries must be the flattened one, or the
     # voxelizer's carve targets a level the stored DEM never agreed to.
-    assert np.all(city.dem.elevation[-_WATER_ROWS:, :] == _WATER_BODY_MIN), (
+    assert np.all(
+        city.dem.elevation[-_WATER_ROWS:, :_WATER_COLS] == _WATER_BODY_MIN), (
         "assemble_voxcity received the pre-flattening DEM "
         "(south-up, so the northern water rows are the LAST ones)")
 
@@ -449,9 +467,15 @@ def test_flatten_runs_before_building_and_canopy_rasterisation(water_pipeline,
     for stage in ('building_dem', 'canopy_dem'):
         seen = water_pipeline[stage]
         assert seen is not None, f"{stage} was never recorded"
-        assert np.all(seen[:_WATER_ROWS, :] == _WATER_BODY_MIN), (
+        assert np.all(seen[:_WATER_ROWS, :_WATER_COLS] == _WATER_BODY_MIN), (
             f"{stage} was handed the pre-flattening DEM")
         np.testing.assert_array_equal(seen, art.dem_grid)
+
+    # The voxelizer is the other half of the fix: its carve conforms voxel
+    # ground to whatever DEM it is given, so handing it the pre-flatten grid
+    # while storing the flattened one is exactly the C3 desync.
+    np.testing.assert_array_equal(
+        water_pipeline['voxelize_kwargs']['dem_grid'], art.dem_grid)
 
 
 def test_older_voxcity_degrades_instead_of_crashing(water_pipeline,
@@ -469,6 +493,198 @@ def test_older_voxcity_degrades_instead_of_crashing(water_pipeline,
     assert art.water_dem_flattening["applied"] is False
     assert art.water_dem_flattening["reason"] == "voxcity_flattener_unavailable"
     _assert_cliff_intact(art.dem_grid)
+
+
+#: Every land-cover source voxcitygml supports.  ``CityGML`` is the one
+#: the PLATEAU integration path actually uses, and the one whose codes
+#: voxcity's converter does NOT know about.
+_LAND_COVER_SOURCES = [
+    "OpenStreetMap", "CityGML", "Urbanwatch", "ESA WorldCover",
+    "ESRI 10m Annual Land Cover", "Dynamic World V1", "OpenEarthMapJapan",
+]
+
+
+def _carve_water_codes(source):
+    """The raw codes THE CARVE calls water, asked of the carve's converter.
+
+    Not a hand-written table: the whole point of the agreement test is that
+    one side is derived from the carve and the other is measured off the
+    flatten, so a table restating either would defeat it.
+    """
+    probe = np.arange(-1, 16, dtype=np.int64).reshape(1, -1)
+    return probe[0][_convert_land_cover(probe.copy(), source)[0] == 9]
+
+
+def _dry_code(source):
+    """A raw code this source does NOT call water."""
+    water = set(_carve_water_codes(source).tolist())
+    return next(c for c in range(16) if c not in water)
+
+
+def _assert_flatten_sees_the_water(source, code, connectivity=4):
+    """The flatten must flatten exactly the cells the carve calls water."""
+    lc = np.full((6, 6), _dry_code(source), dtype=np.int64)
+    lc[:3, :] = code                    # SOUTH-up: the southern half
+    dem = np.arange(36, dtype=np.float64).reshape(6, 6)
+
+    flattened, info = pl._flatten_water_dem(
+        dem, lc, source, enabled=True, connectivity=connectivity)
+
+    # South-up rows 0-2 are north-up rows 3-5.  Pinning the whole grid, not
+    # just a count, catches an empty mask, a mirrored mask and an
+    # over-broad mask with one assertion.
+    expected = dem.copy()
+    expected[3:, :] = dem[3:, :].min()
+    np.testing.assert_array_equal(
+        flattened, expected,
+        err_msg=(f"{source} raw water code {code}: the flatten did not "
+                 f"flatten the cells the carve calls water"))
+    assert info["water_cell_count"] == 18, (
+        f"{source} raw water code {code}: flatten counted "
+        f"{info['water_cell_count']} water cells, carve sees 18")
+    assert info["water_body_count"] == 1
+    assert info["applied"] is True
+    assert info["reason"] == "applied"
+
+
+@pytest.mark.parametrize('source', _LAND_COVER_SOURCES)
+def test_carve_and_flatten_agree_on_what_water_is(source):
+    """The two halves of the fix must share one definition of water.
+
+    They convert land cover with DIFFERENT functions: the carve uses
+    voxcitygml's ``_convert_land_cover``, which has a CityGML branch
+    (those codes are already 1-based); voxcity's has no such branch and
+    its unknown-source else adds 1, turning CityGML water (9) into 10 so
+    the ``== 9`` mask comes back EMPTY.  The flatten then no-ops on the
+    exact source the PLATEAU path uses while reporting
+    ``no_water_cells`` -- a false answer rather than an error, and one no
+    OpenStreetMap fixture can see, because OSM is the single source where
+    the two converters happen to agree.
+
+    Parametrised over every source so this dies once and stays dead, in
+    either package and in either direction.
+    """
+    codes = _carve_water_codes(source)
+    assert codes.size, f"no water code found for {source}"
+    for code in codes:
+        _assert_flatten_sees_the_water(source, int(code))
+
+
+def test_citygml_source_flattens_through_the_whole_pipeline(stub_pipeline,
+                                                            monkeypatch,
+                                                            tmp_path):
+    """The above at ``run_core`` level, on the PLATEAU pairing.
+
+    ``land_cover_source='CityGML'`` with LOD2 CityGML terrain is what every
+    PLATEAU integration test in this repo runs; the unit test above would
+    still pass if ``run_core`` stopped routing through the adapter.
+    """
+    dem, lc = _asymmetric_water_grids()
+    lc = np.where(lc == _OSM_WATER, 9, 0).astype(np.int32)   # CityGML codes
+    monkeypatch.setattr(pl, 'terrain_meshes_to_dem_grid',
+                        lambda *a, **k: dem.copy())
+    monkeypatch.setattr(pl, 'get_land_cover_grid', lambda *a, **k: lc.copy())
+
+    cfg = replace(_config(tmp_path), land_cover_source='CityGML')
+    art = pl.run_core(cfg)
+
+    assert art.water_dem_flattening["applied"] is True, (
+        f"CityGML water was invisible to the flatten: "
+        f"{art.water_dem_flattening}")
+    assert art.water_dem_flattening["water_cell_count"] == (
+        _WATER_ROWS * _WATER_COLS)
+    assert np.all(art.dem_grid[:_WATER_ROWS, :_WATER_COLS] == _WATER_BODY_MIN)
+
+
+def test_flatten_works_without_voxcitys_standard_passthrough(monkeypatch):
+    """``convert_land_cover``'s ``"Standard"`` branch is as new as the flattener.
+
+    ``pyproject`` pins only ``voxcity>=1.3.2``, so it may be absent -- and
+    absent it is not an error but an UNKNOWN source, whose else-branch adds
+    1 and silently reintroduces the empty-mask bug.  Emulate that install
+    and require the flatten to still be correct, rather than merely to warn.
+    """
+    import voxcity.utils.lc as vlc
+    real = vlc.convert_land_cover
+
+    def older_convert(input_array, land_cover_source=None, **kwargs):
+        if land_cover_source == "Standard":      # did not exist yet
+            return np.asarray(input_array).copy() + 1
+        return real(input_array, land_cover_source=land_cover_source,
+                    **kwargs)
+
+    monkeypatch.setattr(vlc, 'convert_land_cover', older_convert)
+    # CityGML is the source that depends on the standardisation entirely.
+    _assert_flatten_sees_the_water("CityGML", 9)
+
+
+def test_a_run_that_flattens_nothing_says_why(stub_pipeline, tmp_path, capsys):
+    """A broken water mask must not be indistinguishable from a dry AOI.
+
+    The stub land cover is all zeros, so nothing is water and the flatten
+    reports ``no_water_cells``.  That is the same message a genuinely
+    broken mask produces, and printing NOTHING on this path is what let
+    the CityGML no-op hide for two commits: the fix has to be audible.
+    """
+    pl.run_core(_config(tmp_path))
+    out = capsys.readouterr().out
+    assert "no DEM flattening applied" in out
+    assert "no_water_cells" in out
+
+
+def test_water_dem_connectivity_reaches_the_flattener():
+    """The knob must change the ANSWER, not merely be recorded.
+
+    Two water blocks that touch only at a corner: separate bodies under
+    4-connectivity, one body under 8.  Every other assertion in this file
+    reads the value back off the config or the artifact, so a flattener
+    call with ``connectivity`` hardcoded to 4 survives all of them.
+    """
+    # SOUTH-up land cover; blocks touch diagonally at (7,1)/(8,2).
+    lc = np.zeros((10, 10), dtype=np.int32)
+    lc[6:8, 0:2] = _OSM_WATER          # -> north-up rows 2-3, cols 0-1
+    lc[8:10, 2:4] = _OSM_WATER         # -> north-up rows 0-1, cols 2-3
+    dem = np.full((10, 10), 50.0)
+    dem[2:4, 0:2] = [[10.0, 11.0], [11.0, 11.0]]     # southern block
+    dem[0:2, 2:4] = [[20.0, 21.0], [21.0, 21.0]]     # northern block
+
+    flat4, info4 = pl._flatten_water_dem(dem, lc, 'OpenStreetMap',
+                                         enabled=True, connectivity=4)
+    assert info4["water_body_count"] == 2
+    assert sorted(info4["water_dem_min_values"]) == [10.0, 20.0]
+    assert np.all(flat4[2:4, 0:2] == 10.0)
+    assert np.all(flat4[0:2, 2:4] == 20.0), (
+        "the corner-touching blocks were merged under 4-connectivity")
+
+    flat8, info8 = pl._flatten_water_dem(dem, lc, 'OpenStreetMap',
+                                         enabled=True, connectivity=8)
+    assert info8["water_body_count"] == 1
+    assert info8["water_dem_min_values"] == [10.0]
+    assert np.all(flat8[2:4, 0:2] == 10.0)
+    assert np.all(flat8[0:2, 2:4] == 10.0), (
+        "connectivity=8 never reached the flattener")
+
+
+def test_run_core_forwards_water_dem_connectivity(stub_pipeline, monkeypatch,
+                                                  tmp_path):
+    """...and ``run_core`` must hand the config's value down, not a default."""
+    lc = np.zeros((10, 10), dtype=np.int32)
+    lc[6:8, 0:2] = _OSM_WATER
+    lc[8:10, 2:4] = _OSM_WATER
+    dem = np.full((10, 10), 50.0)
+    dem[2:4, 0:2] = 10.0
+    dem[0:2, 2:4] = 20.0
+    monkeypatch.setattr(pl, 'terrain_meshes_to_dem_grid',
+                        lambda *a, **k: dem.copy())
+    monkeypatch.setattr(pl, 'get_land_cover_grid', lambda *a, **k: lc.copy())
+
+    art4 = pl.run_core(replace(_config(tmp_path), water_dem_connectivity=4))
+    assert art4.water_dem_flattening["water_body_count"] == 2
+    assert np.all(art4.dem_grid[0:2, 2:4] == 20.0)
+
+    art8 = pl.run_core(replace(_config(tmp_path), water_dem_connectivity=8))
+    assert art8.water_dem_flattening["water_body_count"] == 1
+    assert np.all(art8.dem_grid[0:2, 2:4] == 10.0)
 
 
 def test_voxelizer_config_rejects_bad_connectivity():

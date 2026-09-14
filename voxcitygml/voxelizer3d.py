@@ -254,6 +254,18 @@ def voxelize_citygml_meshes(
                 assembled ``VoxCity`` see both of them south-up.  Both
                 statements are true at once: a reader who acts on only one of
                 them writes a mirror bug.
+        grid_shape: Keyword-only override for the voxel grid's
+            ``(n_rows, n_cols)``.  Omit it (the default) for every caller
+            whose ``rectangle_vertices`` are lon/lat -- the grid is then
+            sized from ``compute_grid_params``, the same geodesic derivation
+            every 2-D rasteriser uses, so the voxel grid pairs cell-for-cell
+            with the DEM/land-cover/building grids.  Set it only when
+            ``rectangle_vertices`` are a synthetic local frame (e.g. metres
+            in ``[0, N]^2``, as in ``tests/test_terrain_building_contact.py``)
+            with no geodesic side length to derive from.  A value that does
+            not match the caller's own 2-D grid is not detected here: it is
+            taken verbatim and will silently misalign against any 2-D grid
+            the caller pairs it with.
     """
     gp, transformer = _compute_grid_params_3d(
         rectangle_vertices,
@@ -398,6 +410,15 @@ def _compute_grid_params_3d(
     *,
     grid_shape: Optional[Tuple[int, int]] = None,
 ) -> Tuple[Grid3DParams, object]:
+    """Derive the 3-D voxel grid's bounds, cell counts and lon/lat<->local
+    transformer from the target rectangle and the collected meshes' z range.
+
+    ``grid_shape=None`` (the canonical, production-correct derivation) reads
+    the cell counts off ``compute_grid_params`` -- the same 2-D frame every
+    rasteriser sizes from. A non-``None`` value overrides the cell counts
+    verbatim for callers working in a synthetic local frame; see the
+    override block below for the rationale and its validation.
+    """
     # Degenerate input would make theta = atan2(0, 0) = 0.0 and silently
     # produce a 1-cell garbage grid.  The 2-D `compute_grid_params` applies
     # the same guard, and today's pipeline always runs it first -- but this
@@ -456,7 +477,9 @@ def _compute_grid_params_3d(
     if grid_shape is None:
         n_rows, n_cols = compute_grid_params(rectangle_vertices, meshsize).shape
     else:
-        n_rows, n_cols = grid_shape
+        n_rows, n_cols = (int(grid_shape[0]), int(grid_shape[1]))
+        if n_rows < 1 or n_cols < 1:
+            raise ValueError(f"grid_shape must be positive; got {grid_shape}")
     n_z = max(1, int((z_max - z_min) / meshsize + 0.5))
 
     gp = Grid3DParams(

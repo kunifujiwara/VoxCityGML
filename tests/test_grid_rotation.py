@@ -653,3 +653,77 @@ def test_export_meshes_obj_requires_rectangle_vertices(tmp_path):
             watertight=False,
             voxel_size=5.0,
         )
+
+
+# ---------------------------------------------------------------------
+# The 3-D voxel frame must size to the same cells as the 2-D frame
+# ---------------------------------------------------------------------
+
+class _NoMeshes:
+    """Empty collection: `_compute_grid_params_3d` only reads the four mesh
+    lists to find the z range, and an empty one takes the documented
+    z_min=0.0 / z_max=meshsize fallback."""
+    terrain = buildings = bridges = vegetation = ()
+
+
+def test_voxel_frame_adopts_the_2d_cell_counts_at_a_half_cell_boundary():
+    """`run_core` pairs these two grids cell-for-cell, and
+    `fill_building_id_gaps` refuses a mismatch rather than mis-attributing
+    every column, so a disagreement fails LOD2 generation outright.
+
+    250.52 m x 250.00 m at 1 m is a measured trigger: the geodesic side
+    length `compute_grid_params` sizes from has already crossed 250.5 while
+    the projected bbox the voxeliser measures has not, so the frames sized
+    251 and 250 columns for one rectangle.
+    """
+    from voxcitygml.voxelizer3d import _compute_grid_params_3d
+
+    clon, clat = 139.765, 35.681
+    rect = _geodesic_rect(clon, clat, 250.52, 250.0, 0.0)
+    gp2d = compute_grid_params(rect, 1.0)
+    gp3d, _ = _compute_grid_params_3d(
+        rect, clon, clat, 1.0, _NoMeshes(), 0.0, None)
+    assert (gp3d.n_rows, gp3d.n_cols) == (gp2d.n_rows, gp2d.n_cols)
+
+
+def test_voxel_frame_matches_the_2d_frame_across_a_size_sweep():
+    """One boundary is an anecdote. Sweeping a half-cell crossing in 2 cm
+    steps catches the whole band where the two measurements straddle the
+    rounding threshold; before the fix this band is 2-4% of all sizes."""
+    from voxcitygml.voxelizer3d import _compute_grid_params_3d
+
+    clon, clat = 139.765, 35.681
+    bad = []
+    for i in range(60):
+        width = 250.0 + i * 0.02
+        rect = _geodesic_rect(clon, clat, width, 250.0, 0.0)
+        gp2d = compute_grid_params(rect, 1.0)
+        gp3d, _ = _compute_grid_params_3d(
+            rect, clon, clat, 1.0, _NoMeshes(), 0.0, None)
+        if (gp3d.n_rows, gp3d.n_cols) != (gp2d.n_rows, gp2d.n_cols):
+            bad.append((round(width, 2), (gp2d.n_rows, gp2d.n_cols),
+                        (gp3d.n_rows, gp3d.n_cols)))
+    assert not bad, f"frames disagreed at {bad}"
+
+
+def test_voxel_frame_keeps_the_raw_projected_bbox_as_its_lattice_anchor():
+    """Adopting the 2-D counts must not rebase the bounds.
+
+    Rows index as `(max_y - y) / voxel_size` and columns as
+    `(x - min_x) / voxel_size` (`Grid3DParams.xyz_to_indices`), so `min_x`
+    and `max_y` are the lattice origin, not free metadata: shifting them to
+    make the extent a whole number of voxels would move every voxel by up
+    to half a cell.
+    """
+    from voxcitygml.citygml.coordinates import create_rectangle_frame_transformer
+    from voxcitygml.voxelizer3d import _compute_grid_params_3d
+
+    clon, clat = 139.765, 35.681
+    rect = _geodesic_rect(clon, clat, 250.52, 250.0, 0.0)
+    gp3d, _ = _compute_grid_params_3d(
+        rect, clon, clat, 1.0, _NoMeshes(), 0.0, None)
+
+    transformer = create_rectangle_frame_transformer(clon, clat, rect)
+    rx, ry = transformer.transform([v[0] for v in rect], [v[1] for v in rect])
+    assert gp3d.min_x == min(rx)
+    assert gp3d.max_y == max(ry)

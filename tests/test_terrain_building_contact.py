@@ -349,10 +349,12 @@ def run_water_pipeline(path, monkeypatch, flatten_water_dem):
         underground_depth=UNDERGROUND,
         flatten_water_dem=flatten_water_dem,
         info_out=info,
+        grid_shape=(n, n),
     )
     gp, _ = v3._compute_grid_params_3d(
         water_rect(), 0.0, 0.0, VS, collection,
         underground_depth=UNDERGROUND, dem_grid=dem,
+        grid_shape=(n, n),
     )
     # The recomputed gp must describe the grid that came back, or every
     # index this module asserts is measured against the wrong frame.

@@ -727,3 +727,21 @@ def test_voxel_frame_keeps_the_raw_projected_bbox_as_its_lattice_anchor():
     rx, ry = transformer.transform([v[0] for v in rect], [v[1] for v in rect])
     assert gp3d.min_x == min(rx)
     assert gp3d.max_y == max(ry)
+
+
+def test_voxel_frame_uses_an_explicit_grid_shape_verbatim():
+    """The escape hatch for callers working in a synthetic local frame.
+
+    `tests/test_terrain_building_contact.py` drives the voxeliser through an
+    IdentityTransformer on `[0, 40]^2` local-metre vertices, which are not
+    lon/lat and have no geodesic side length. Such a caller states its own
+    cell counts; the default geodesic derivation would read those vertices
+    as degrees.
+    """
+    from voxcitygml.voxelizer3d import _compute_grid_params_3d
+
+    clon, clat = 139.765, 35.681
+    rect = _geodesic_rect(clon, clat, 250.52, 250.0, 0.0)
+    gp3d, _ = _compute_grid_params_3d(
+        rect, clon, clat, 1.0, _NoMeshes(), 0.0, None, grid_shape=(7, 9))
+    assert (gp3d.n_rows, gp3d.n_cols) == (7, 9)

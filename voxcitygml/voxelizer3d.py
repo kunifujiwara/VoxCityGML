@@ -187,6 +187,7 @@ def voxelize_citygml_meshes(
     flatten_water_dem: bool = True,
     *,
     info_out: Optional[dict] = None,
+    grid_shape: Optional[Tuple[int, int]] = None,
 ) -> np.ndarray:
     """Voxelize CityGML meshes on a shared 3D grid.
 
@@ -262,6 +263,7 @@ def voxelize_citygml_meshes(
         collection,
         underground_depth=underground_depth,
         dem_grid=dem_grid,
+        grid_shape=grid_shape,
     )
 
     voxel_grid = _allocate_voxel_grid(gp, max_voxel_ram_mb=max_voxel_ram_mb)
@@ -393,6 +395,8 @@ def _compute_grid_params_3d(
     collection: CityGMLMeshCollection,
     underground_depth: float = 0.0,
     dem_grid: Optional[np.ndarray] = None,
+    *,
+    grid_shape: Optional[Tuple[int, int]] = None,
 ) -> Tuple[Grid3DParams, object]:
     # Degenerate input would make theta = atan2(0, 0) = 0.0 and silently
     # produce a 1-cell garbage grid.  The 2-D `compute_grid_params` applies
@@ -441,33 +445,18 @@ def _compute_grid_params_3d(
     # (which extrudes down to min_z) is thickened towards the subsurface.
     z_min -= max(0.0, float(underground_depth))
 
-    # Cell counts come from the canonical 2-D frame, never from this
-    # function's own bbox. Both measure the same side -- geodesic length
-    # there, projected bbox here -- so a side within floating-point reach of
-    # a half cell rounds up in one frame and down in the other, and run_core
-    # then pairs the two grids (fill_building_id_gaps refuses a mismatch).
-    # The bounds below stay raw: rows index off max_y, columns off min_x.
-    #
-    # Only apply this when rectangle_vertices are in geodetic coordinates
-    # (lon/lat). Detect this by checking if all vertices have reasonable
-    # geodetic ranges AND if the rectangle extent looks geodetic (roughly
-    # in one geographic location, not spanning the globe).
-    lons = [v[0] for v in rectangle_vertices]
-    lats = [v[1] for v in rectangle_vertices]
-    is_geodetic = (
-        all(-180.0 <= lon <= 180.0 for lon in lons) and
-        all(-90.0 <= lat <= 90.0 for lat in lats) and
-        max(lons) - min(lons) < 10.0 and  # reasonable extent for one region
-        max(lats) - min(lats) < 10.0
-    )
-    
-    if is_geodetic:
-        gp_2d = compute_grid_params(rectangle_vertices, meshsize)
-        n_rows, n_cols = gp_2d.n_rows, gp_2d.n_cols
+    # Cell counts come from the canonical 2-D frame, never from the bbox
+    # above. Both measure the same side -- geodesic length there, projected
+    # bbox here -- so a side within floating-point reach of a half cell
+    # rounds up in one frame and down in the other, and run_core then pairs
+    # the two grids (fill_building_id_gaps refuses a mismatch). A caller
+    # working in a synthetic local frame, whose vertices are not lon/lat,
+    # supplies grid_shape instead. The bounds stay raw either way: rows
+    # index off max_y, columns off min_x.
+    if grid_shape is None:
+        n_rows, n_cols = compute_grid_params(rectangle_vertices, meshsize).shape
     else:
-        # Fallback for local coordinate systems: use the original formula
-        n_cols = max(1, int((max_x - min_x) / meshsize + 0.5))
-        n_rows = max(1, int((max_y - min_y) / meshsize + 0.5))
+        n_rows, n_cols = grid_shape
     n_z = max(1, int((z_max - z_min) / meshsize + 0.5))
 
     gp = Grid3DParams(

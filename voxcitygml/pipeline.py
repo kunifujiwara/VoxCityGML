@@ -522,6 +522,10 @@ def run_core(cfg: VoxelizerConfig) -> PipelineArtifacts:
         # fields are Optional and default to None ("the mode decides"), so
         # forwarding them directly would ship None into the voxelizer.
         vox_params = cfg.resolved_voxel_params()
+        # The 2-D rasterisers above each sized themselves from this same
+        # frame; passing it here is what makes fill_building_id_gaps' pairing
+        # below hold by construction rather than by two roundings agreeing.
+        gp_2d = compute_grid_params(rectangle, cfg.meshsize)
         voxel_grid = voxelize_citygml_meshes(
             collection, rectangle, center_lon, center_lat, cfg.meshsize,
             dem_grid=dem_grid,
@@ -538,6 +542,7 @@ def run_core(cfg: VoxelizerConfig) -> PipelineArtifacts:
             underground_depth=cfg.terrain_underground_depth,
             flatten_water_dem=flatten_water,
             info_out=vox_info,
+            grid_shape=gp_2d.shape,
         )
         # Both keys are part of voxelize_citygml_meshes' info_out contract.
         # Subscript, not .get(): a missing key means that contract broke, and

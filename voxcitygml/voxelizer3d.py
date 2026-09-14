@@ -20,7 +20,7 @@ from .citygml.coordinates import (
     swap_coordinates_3d,
     create_rectangle_frame_transformer,
 )
-from .grid_utils import check_non_degenerate
+from .grid_utils import check_non_degenerate, compute_grid_params
 from .watertight import make_watertight_mesh
 from .terrain_solid import build_terrain_solid
 
@@ -187,6 +187,7 @@ def voxelize_citygml_meshes(
     flatten_water_dem: bool = True,
     *,
     info_out: Optional[dict] = None,
+    grid_shape: Optional[Tuple[int, int]] = None,
 ) -> np.ndarray:
     """Voxelize CityGML meshes on a shared 3D grid.
 
@@ -253,6 +254,18 @@ def voxelize_citygml_meshes(
                 assembled ``VoxCity`` see both of them south-up.  Both
                 statements are true at once: a reader who acts on only one of
                 them writes a mirror bug.
+        grid_shape: Keyword-only override for the voxel grid's
+            ``(n_rows, n_cols)``.  Omit it (the default) for every caller
+            whose ``rectangle_vertices`` are lon/lat -- the grid is then
+            sized from ``compute_grid_params``, the same geodesic derivation
+            every 2-D rasteriser uses, so the voxel grid pairs cell-for-cell
+            with the DEM/land-cover/building grids.  Set it only when
+            ``rectangle_vertices`` are a synthetic local frame (e.g. metres
+            in ``[0, N]^2``, as in ``tests/test_terrain_building_contact.py``)
+            with no geodesic side length to derive from.  A value that does
+            not match the caller's own 2-D grid is not detected here: it is
+            taken verbatim and will silently misalign against any 2-D grid
+            the caller pairs it with.
     """
     gp, transformer = _compute_grid_params_3d(
         rectangle_vertices,
@@ -262,6 +275,7 @@ def voxelize_citygml_meshes(
         collection,
         underground_depth=underground_depth,
         dem_grid=dem_grid,
+        grid_shape=grid_shape,
     )
 
     voxel_grid = _allocate_voxel_grid(gp, max_voxel_ram_mb=max_voxel_ram_mb)
@@ -393,7 +407,18 @@ def _compute_grid_params_3d(
     collection: CityGMLMeshCollection,
     underground_depth: float = 0.0,
     dem_grid: Optional[np.ndarray] = None,
+    *,
+    grid_shape: Optional[Tuple[int, int]] = None,
 ) -> Tuple[Grid3DParams, object]:
+    """Derive the 3-D voxel grid's bounds, cell counts and lon/lat<->local
+    transformer from the target rectangle and the collected meshes' z range.
+
+    ``grid_shape=None`` (the canonical, production-correct derivation) reads
+    the cell counts off ``compute_grid_params`` -- the same 2-D frame every
+    rasteriser sizes from. A non-``None`` value overrides the cell counts
+    verbatim for callers working in a synthetic local frame; see the
+    override block below for the rationale and its validation.
+    """
     # Degenerate input would make theta = atan2(0, 0) = 0.0 and silently
     # produce a 1-cell garbage grid.  The 2-D `compute_grid_params` applies
     # the same guard, and today's pipeline always runs it first -- but this
@@ -441,8 +466,20 @@ def _compute_grid_params_3d(
     # (which extrudes down to min_z) is thickened towards the subsurface.
     z_min -= max(0.0, float(underground_depth))
 
-    n_cols = max(1, int((max_x - min_x) / meshsize + 0.5))
-    n_rows = max(1, int((max_y - min_y) / meshsize + 0.5))
+    # Cell counts come from the canonical 2-D frame, never from the bbox
+    # above. Both measure the same side -- geodesic length there, projected
+    # bbox here -- so a side within floating-point reach of a half cell
+    # rounds up in one frame and down in the other, and run_core then pairs
+    # the two grids (fill_building_id_gaps refuses a mismatch). A caller
+    # working in a synthetic local frame, whose vertices are not lon/lat,
+    # supplies grid_shape instead. The bounds stay raw either way: rows
+    # index off max_y, columns off min_x.
+    if grid_shape is None:
+        n_rows, n_cols = compute_grid_params(rectangle_vertices, meshsize).shape
+    else:
+        n_rows, n_cols = (int(grid_shape[0]), int(grid_shape[1]))
+        if n_rows < 1 or n_cols < 1:
+            raise ValueError(f"grid_shape must be positive; got {grid_shape}")
     n_z = max(1, int((z_max - z_min) / meshsize + 0.5))
 
     gp = Grid3DParams(

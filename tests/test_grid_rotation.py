@@ -367,8 +367,10 @@ def test_rectangle_frame_is_not_the_plain_frame_when_rotated():
 def test_voxelizer_grid_tight_for_rotated_rect(rotation):
     """3-D grid *dimensions* follow the rectangle sides, not the lon/lat bbox.
 
-    This pins grid **shape** only.  Frame origin/orientation agreement is a
-    separate concern, pinned by ``test_frames_agree_on_rowcol`` below.
+    Cell counts are the canonical 2-D derivation verbatim (no rounding of
+    their own), so this pins exact equality, not a tolerance.  Frame
+    origin/orientation agreement is a separate concern, pinned by
+    ``test_frames_agree_on_rowcol`` below.
     """
     from voxcity.geoprocessor.raster.core import compute_grid_geometry
     from voxcitygml.voxelizer3d import _compute_grid_params_3d
@@ -377,14 +379,13 @@ def test_voxelizer_grid_tight_for_rotated_rect(rotation):
     rect = _geodesic_rect(139.77, 35.65, 1500.0, 600.0, rotation)
     gp3, _ = _compute_grid_params_3d(rect, 139.77, 35.65, 5.0,
                                      CityGMLMeshCollection())
-    # A 45-degree bbox would inflate rows+cols by ~40%+.
     n_rows_v, n_cols_v = compute_grid_geometry(rect, 5.0)["grid_size"]
-    assert abs(gp3.n_rows - n_rows_v) <= 2
-    assert abs(gp3.n_cols - n_cols_v) <= 2
+    assert gp3.n_rows == n_rows_v
+    assert gp3.n_cols == n_cols_v
     # and the same shape as the 2-D affine frame used by the rasterizers
     gp2 = compute_grid_params(rect, 5.0)
-    assert abs(gp3.n_rows - gp2.n_rows) <= 2
-    assert abs(gp3.n_cols - gp2.n_cols) <= 2
+    assert gp3.n_rows == gp2.n_rows
+    assert gp3.n_cols == gp2.n_cols
 
 
 # ---------------------------------------------------------------------
@@ -653,3 +654,124 @@ def test_export_meshes_obj_requires_rectangle_vertices(tmp_path):
             watertight=False,
             voxel_size=5.0,
         )
+
+
+# ---------------------------------------------------------------------
+# The 3-D voxel frame must size to the same cells as the 2-D frame
+# ---------------------------------------------------------------------
+
+class _NoMeshes:
+    """Empty collection: `_compute_grid_params_3d` only reads the four mesh
+    lists to find the z range, and an empty one takes the documented
+    z_min=0.0 / z_max=meshsize fallback."""
+    terrain = buildings = bridges = vegetation = ()
+
+
+def test_voxel_frame_adopts_the_2d_cell_counts_at_a_half_cell_boundary():
+    """`run_core` pairs these two grids cell-for-cell, and
+    `fill_building_id_gaps` refuses a mismatch rather than mis-attributing
+    every column, so a disagreement fails LOD2 generation outright.
+
+    250.52 m x 250.00 m at 1 m is a measured trigger: the geodesic side
+    length `compute_grid_params` sizes from has already crossed 250.5 while
+    the projected bbox the voxeliser measures has not, so the frames sized
+    251 and 250 columns for one rectangle.
+    """
+    from voxcitygml.voxelizer3d import _compute_grid_params_3d
+
+    clon, clat = 139.765, 35.681
+    rect = _geodesic_rect(clon, clat, 250.52, 250.0, 0.0)
+    gp2d = compute_grid_params(rect, 1.0)
+    gp3d, _ = _compute_grid_params_3d(
+        rect, clon, clat, 1.0, _NoMeshes(), 0.0, None)
+    assert (gp3d.n_rows, gp3d.n_cols) == (gp2d.n_rows, gp2d.n_cols)
+
+
+def test_voxel_frame_matches_the_2d_frame_across_a_size_sweep():
+    """One boundary is an anecdote; sweep a wide band instead of re-testing
+    the single width the neighbour test above already pins.
+
+    Widths run 100 m to ~985 m in ~22.7 m steps -- a step not aligned to
+    any half-cell boundary, so across 40 steps the phase relative to the
+    rounding threshold (width mod meshsize/2) cycles through many different
+    values rather than staying fixed. Runs at meshsize 1.0 and 5.0, whose
+    half-cell thresholds (0.5 m and 2.5 m) sit at different points along
+    that sweep, so a regression that only trips one meshsize's boundary
+    still gets caught. This stays honest under drift in `clat`, the base
+    width or the step: any of those still lands on a band of real
+    boundary-adjacent widths, not just 250.52."""
+    from voxcitygml.voxelizer3d import _compute_grid_params_3d
+
+    clon, clat = 139.765, 35.681
+    bad = []
+    for meshsize in (1.0, 5.0):
+        for i in range(40):
+            width = 100.0 + i * 22.7
+            rect = _geodesic_rect(clon, clat, width, 250.0, 0.0)
+            gp2d = compute_grid_params(rect, meshsize)
+            gp3d, _ = _compute_grid_params_3d(
+                rect, clon, clat, meshsize, _NoMeshes(), 0.0, None)
+            if (gp3d.n_rows, gp3d.n_cols) != (gp2d.n_rows, gp2d.n_cols):
+                bad.append((meshsize, round(width, 2),
+                            (gp2d.n_rows, gp2d.n_cols),
+                            (gp3d.n_rows, gp3d.n_cols)))
+    assert not bad, f"frames disagreed at {bad}"
+
+
+def test_voxel_frame_keeps_the_raw_projected_bbox_as_its_lattice_anchor():
+    """Adopting the 2-D counts must not rebase the bounds.
+
+    Rows index as `(max_y - y) / voxel_size` and columns as
+    `(x - min_x) / voxel_size` (`Grid3DParams.xyz_to_indices`), so `min_x`
+    and `max_y` are the lattice origin, not free metadata: shifting them to
+    make the extent a whole number of voxels would move every voxel by up
+    to half a cell.
+    """
+    from voxcitygml.citygml.coordinates import create_rectangle_frame_transformer
+    from voxcitygml.voxelizer3d import _compute_grid_params_3d
+
+    clon, clat = 139.765, 35.681
+    rect = _geodesic_rect(clon, clat, 250.52, 250.0, 0.0)
+    gp3d, _ = _compute_grid_params_3d(
+        rect, clon, clat, 1.0, _NoMeshes(), 0.0, None)
+
+    transformer = create_rectangle_frame_transformer(clon, clat, rect)
+    rx, ry = transformer.transform([v[0] for v in rect], [v[1] for v in rect])
+    assert gp3d.min_x == min(rx)
+    assert gp3d.max_y == max(ry)
+
+
+def test_voxel_frame_uses_an_explicit_grid_shape_verbatim():
+    """The escape hatch for callers working in a synthetic local frame.
+
+    `tests/test_terrain_building_contact.py` drives the voxeliser through an
+    IdentityTransformer on `[0, 40]^2` local-metre vertices, which are not
+    lon/lat and have no geodesic side length. Such a caller states its own
+    cell counts; the default geodesic derivation would read those vertices
+    as degrees.
+    """
+    from voxcitygml.voxelizer3d import _compute_grid_params_3d
+
+    clon, clat = 139.765, 35.681
+    rect = _geodesic_rect(clon, clat, 250.52, 250.0, 0.0)
+    gp3d, _ = _compute_grid_params_3d(
+        rect, clon, clat, 1.0, _NoMeshes(), 0.0, None, grid_shape=(7, 9))
+    assert (gp3d.n_rows, gp3d.n_cols) == (7, 9)
+
+
+def test_voxel_frame_rejects_a_non_positive_grid_shape():
+    """The override is taken verbatim (see the test above), with no floor
+    of its own -- unlike the default path, which voxcity's own
+    `compute_grid_params` already floors at `max(1, ...)`. A zero or
+    negative override must raise rather than reach `_resize_float_grid` /
+    `_resize_int_grid`, which would happily zoom the DEM, land cover and
+    canopy into a degenerate shape with no visible symptom."""
+    from voxcitygml.voxelizer3d import _compute_grid_params_3d
+
+    clon, clat = 139.765, 35.681
+    rect = _geodesic_rect(clon, clat, 250.52, 250.0, 0.0)
+    for grid_shape in [(0, 9), (7, 0), (-7, 9), (7, -9)]:
+        with pytest.raises(ValueError):
+            _compute_grid_params_3d(
+                rect, clon, clat, 1.0, _NoMeshes(), 0.0, None,
+                grid_shape=grid_shape)

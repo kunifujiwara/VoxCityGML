@@ -1,3 +1,5 @@
+import os
+
 import numpy as np
 import pytest
 
@@ -54,10 +56,38 @@ import trimesh
 
 from voxcitygml.models import Mesh3D, CityGMLMeshCollection
 from voxcitygml.voxelizer3d import (_MESHLIB_VOXEL_AVAILABLE, BUILDING_CODE,
-                                    voxelize_citygml_meshes)
+                                    GROUND_CODE, TREE_CODE, voxelize_citygml_meshes)
 
 needs_meshlib = pytest.mark.skipif(not _MESHLIB_VOXEL_AVAILABLE,
                                    reason="building fill needs meshlib")
+
+
+def test_meshlib_available_or_explicitly_opted_out():
+    """The non-skippable guard (see ``tests/test_inclusive_voxelization.py``,
+    where this pattern originates).  Every ``needs_meshlib``-marked test in
+    this file exercises re-voxelization through actual building fill, and
+    would happily vanish into "skipped" if meshlib were missing -- exactly
+    the configuration where none of ``voxcitygml.refine``'s re-voxelization
+    behaviour, nor ``grid_params=``'s alignment, gets checked at all.  This
+    test has no skipif: it fails the run unless meshlib is present or a
+    human explicitly opted out via VOXCITYGML_ALLOW_NO_MESHLIB=1."""
+    if _MESHLIB_VOXEL_AVAILABLE:
+        return
+    if os.environ.get("VOXCITYGML_ALLOW_NO_MESHLIB"):
+        pytest.skip(
+            "meshlib unavailable; VOXCITYGML_ALLOW_NO_MESHLIB=1 explicitly "
+            "accepts that every meshlib-dependent test in this module will "
+            "now skip too -- this file verifies nothing about refined "
+            "re-voxelization in this run.")
+    pytest.fail(
+        "meshlib is not installed, so every meshlib-dependent test in "
+        "tests/test_refine.py is about to SKIP rather than run -- a green "
+        "suite in that state does not mean voxcitygml.refine's re-"
+        "voxelization (grid_params alignment, orientation flips, "
+        "max_height_m clipping) holds; it means it was never checked.  "
+        "Install meshlib, or set VOXCITYGML_ALLOW_NO_MESHLIB=1 to "
+        "explicitly accept an unverified run.",
+        pytrace=False)
 
 
 def _box_building(transformer, x0, y0, sx, sy, z0, sz):
@@ -127,6 +157,25 @@ class _Ns(dict):
     __getattr__ = dict.__getitem__
 
 
+def _dem_ramp(gp):
+    """South-up DEM: strictly increasing with the row index (south -> north
+    in the south-up convention), so a dropped or duplicated flipud disagrees
+    with the correct answer almost everywhere -- unlike an all-zero DEM,
+    which cannot distinguish the two at all."""
+    ramp = np.arange(gp.n_rows, dtype=np.float64) * 0.3
+    return np.repeat(ramp[:, None], gp.n_cols, axis=1)
+
+
+def _canopy_top(gp):
+    """South-up canopy top: a single non-zero cell in a known off-centre row
+    (row 5, far from both the middle row and the test building's footprint),
+    so a dropped or duplicated flip moves the tree to a different row/block
+    instead of merely changing a magnitude."""
+    top = np.zeros((gp.n_rows, gp.n_cols))
+    top[5, 5] = 8.0
+    return top
+
+
 def _model_from(gp, coll, voxel_grid_north_up, extras_overrides=None):
     rows, cols = gp.n_rows, gp.n_cols
     extras = {"rectangle_vertices": RECT, "center_lon": CLON, "center_lat": CLAT,
@@ -137,8 +186,8 @@ def _model_from(gp, coll, voxel_grid_north_up, extras_overrides=None):
     return _Ns(voxels=_Ns(classes=south),
                buildings=_Ns(meta=_Ns(meshsize=gp.voxel_size)),
                land_cover=_Ns(classes=np.zeros((rows, cols), np.int64)),
-               dem=_Ns(elevation=np.zeros((rows, cols))),
-               tree_canopy=_Ns(top=np.zeros((rows, cols)), bottom=None),
+               dem=_Ns(elevation=_dem_ramp(gp)),
+               tree_canopy=_Ns(top=_canopy_top(gp), bottom=None),
                extras=extras)
 
 
@@ -208,3 +257,79 @@ def test_grid_params_from_model_refuses_a_grid_that_does_not_match_the_frame():
     city = _model_from(gp, coll, wrong)
     with pytest.raises(ValueError, match="frame"):
         grid_params_from_model(city)
+
+
+def _ground_top_z(grid_south, gp):
+    """Per-column physical z (m) of the top face of the tallest ground-surface
+    cell in a south-up grid, or NaN where there is none.  ``refine_voxel_grids``
+    always passes a ``land_cover_grid``, and ``_apply_land_cover`` recolours
+    the topmost GROUND_CODE cell of every column to a positive land-cover
+    code (see ``_ground_surface_index``'s docstring in voxelizer3d.py) -- so
+    "ground surface" here, like there, means GROUND_CODE OR any positive
+    code, not GROUND_CODE alone."""
+    is_ground = (grid_south == GROUND_CODE) | (grid_south > 0)
+    has_any = is_ground.any(axis=2)
+    top_idx_from_end = np.argmax(is_ground[:, :, ::-1], axis=2)
+    idx = is_ground.shape[2] - 1 - top_idx_from_end
+    z = gp.min_z + (idx + 1) * gp.voxel_size
+    return np.where(has_any, z, np.nan)
+
+
+@needs_meshlib
+def test_refine_voxel_grids_applies_the_dem_and_canopy_flips_correctly():
+    """``refine.py`` flips the model's south-up DEM/canopy north-up before
+    handing them to the voxelizer, then flips the result back south-up.  The
+    OTHER tests in this file build ``_model_from`` on an all-zero DEM and
+    canopy, so dropping or duplicating either flip would not fail any of
+    them -- a flipped or unflipped all-zero raster is identical.  This test
+    uses the module's asymmetric fixtures (``_dem_ramp``, ``_canopy_top``)
+    instead: a ramp monotone in the row index, and an off-centre canopy
+    spike, both of which disagree with themselves under a mirror almost
+    everywhere.
+
+    Verified this fails without the fix: with the DEM's ``np.flipud`` in
+    ``refine.py`` removed, the max column-0 terrain-top disagreement below
+    was 27.5 m (5.5 coarse voxels) against a base built with the SAME
+    ramp -- far past the one-coarse-voxel quantization tolerance used here
+    -- and the canopy block assertion failed outright (no TREE_CODE landed
+    in the expected fine block). Restored before committing.
+    """
+    gp, coll = _base_params_and_collection()
+    dem_north = np.ascontiguousarray(np.flipud(_dem_ramp(gp)))
+    canopy_north = np.ascontiguousarray(np.flipud(_canopy_top(gp)))
+    lc = np.zeros((gp.n_rows, gp.n_cols), np.int64)
+
+    # Ground truth: voxelize the base grid directly, doing the same
+    # north-up flip refine.py does (and passing the same all-zero
+    # land_cover_grid it does, since a non-None land_cover_grid makes
+    # ``_apply_land_cover`` recolour the topmost GROUND_CODE cell to a
+    # positive code -- see ``_ground_top_z`` above), so this does not just
+    # re-exercise refine.py's own flip on both sides of the comparison.
+    base_grid = voxelize_citygml_meshes(
+        coll, RECT, CLON, CLAT, gp.voxel_size, dem_grid=dem_north,
+        canopy_top=canopy_north, land_cover_grid=lc,
+        land_cover_source="OpenStreetMap", grid_params=gp)
+    city = _model_from(gp, coll, base_grid)  # dem/canopy default to the same ramp/spike
+    base_south = city.voxels.classes
+
+    (fine,) = refine_voxel_grids(city, (2,))
+
+    # Terrain: column 0 never touches the test building's footprint
+    # (columns ~20-26), so its ground top is DEM-driven throughout.
+    base_top = _ground_top_z(base_south, gp)
+    fine_top = _ground_top_z(fine, gp.refined(2))
+    base_col0 = base_top[:, 0]
+    fine_col0_down = fine_top[0::2, 0][:len(base_col0)]
+    diff = np.nanmax(np.abs(fine_col0_down - base_col0))
+    assert diff <= gp.voxel_size + 1e-6, (
+        f"refined terrain top disagrees with the base by {diff} m at column 0 "
+        f"(tolerance {gp.voxel_size} m, one base voxel of quantization slack) "
+        "-- looks like a dropped/duplicated DEM flip")
+
+    # Canopy: base row 5 must carry TREE_CODE (that is where the spike is),
+    # and the refined grid's corresponding 2x2 block (south-up rows 10-11,
+    # cols 10-11) must too.
+    assert (base_south[5, 5, :] == TREE_CODE).any()
+    assert (fine[10:12, 10:12, :] == TREE_CODE).any(), (
+        "no TREE_CODE in the refined block that should nest under the base "
+        "canopy spike at row 5 -- looks like a dropped/duplicated canopy flip")

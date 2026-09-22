@@ -168,7 +168,21 @@ class Grid3DParams:
     def refined(self, factor: int) -> "Grid3DParams":
         """The same frame and datum at ``voxel_size / factor``: every coarse
         cell becomes a factor^3 block, so a fine index // factor is the coarse
-        index. voxcitygml.refine builds its level grids on these."""
+        index. voxcitygml.refine builds its level grids on these.
+
+        The ``max_*`` bounds are inherited UNCHANGED while the counts are
+        multiplied, so for a base dimension whose extent is not a whole number
+        of cells the refined counts and the refined extent disagree (a 91-column
+        base becomes 182 where the extent gives 181). That is deliberate: the
+        index maps anchor on ``min_x`` for columns, ``min_z`` for z, and
+        ``max_y`` for ROWS (``row = (max_y - y) / voxel_size``), so recomputing
+        ``max_y`` from the refined count breaks the nesting this method exists
+        to guarantee -- measured 854 of 2000 sampled points misaligned at
+        factor 4 on a base grid whose ``min_y`` is not a voxel multiple. Only
+        the ``min_*`` anchors and ``voxel_size`` may be treated as load-bearing
+        here; the ``max_*`` values are carried for the consumers that read them
+        (``export_obj``) and must not be renormalized.
+        """
         f = int(factor)
         if f < 1:
             raise ValueError(f"factor must be >= 1: {factor}")

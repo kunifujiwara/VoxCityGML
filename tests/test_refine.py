@@ -172,7 +172,8 @@ def test_assembly_extras_carry_the_frame_centre():
 
 
 from voxcitygml.refine import (MeshSourceUnavailable, _collection_for,
-                               grid_params_from_model, refine_voxel_grids)
+                               grid_params_from_model, refine_voxel_grids,
+                               resolve_collection)
 
 
 class _Ns(dict):
@@ -337,6 +338,46 @@ def test_collection_for_reparse_records_a_none_lod_preference_faithfully(tmp_pat
 
     _collection_for(city, None)
     assert captured["building_lod"] is None
+
+
+@needs_meshlib
+def test_resolve_collection_lets_a_caller_reparse_once_for_many_levels(tmp_path, monkeypatch):
+    """``resolve_collection`` is public specifically so a caller building
+    several levels from one model (e.g. voxcitywind's level-stack
+    dispatcher, one ``refine_voxel_grids`` call per level/factor) can
+    resolve the mesh source ONCE and pass it to every call via
+    ``collection=``, instead of each call re-resolving -- and, on the
+    re-parse path, re-parsing -- independently. Pins that this actually
+    works: with the live collection lost and a ``citygml_paths`` directory
+    that still exists, one ``resolve_collection`` call followed by two
+    ``refine_voxel_grids(..., collection=resolved)`` calls must invoke the
+    parser exactly once, not once per ``refine_voxel_grids`` call."""
+    gp, coll = _base_params_and_collection()
+    dem = np.zeros((gp.n_rows, gp.n_cols))
+    grid = voxelize_citygml_meshes(coll, RECT, CLON, CLAT, gp.voxel_size, dem_grid=dem,
+                                   grid_params=gp)
+    citygml_dir = tmp_path / "citygml"
+    citygml_dir.mkdir()
+    city = _model_from(gp, coll, grid, {
+        "citygml_collection": None,             # lost, as after save/load
+        "citygml_paths": [str(citygml_dir)],
+    })
+
+    calls = {"n": 0}
+
+    def fake_parse(path, **kwargs):
+        calls["n"] += 1
+        return coll   # the real fixture collection, so voxelization below succeeds
+
+    monkeypatch.setattr("voxcitygml.citygml.parser.parse_citygml_directory", fake_parse)
+
+    resolved = resolve_collection(city)
+    assert calls["n"] == 1
+
+    refine_voxel_grids(city, (2,), collection=resolved)
+    refine_voxel_grids(city, (2,), collection=resolved)
+
+    assert calls["n"] == 1, f"parser ran {calls['n']} times reusing one resolved collection, expected 1"
 
 
 @needs_meshlib

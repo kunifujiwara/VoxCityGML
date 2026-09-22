@@ -11,6 +11,10 @@ Mesh source, in order: the ``collection`` argument; ``extras['citygml_collection
 (live only -- it does not survive save/load); a one-off re-parse of
 ``extras['citygml_paths']`` when those directories still exist. Otherwise
 ``MeshSourceUnavailable`` is raised and the caller degrades to upsampling.
+See ``resolve_collection`` -- a caller building several levels from one
+model should call it ONCE and pass the result as ``collection=`` to every
+``refine_voxel_grids`` call, so the re-parse path (when it applies) runs
+once rather than once per level.
 """
 from __future__ import annotations
 
@@ -144,7 +148,25 @@ def grid_params_from_model(city) -> Grid3DParams:
 _UNSET = object()
 
 
-def _collection_for(city, collection) -> CityGMLMeshCollection:
+def resolve_collection(city, collection: Optional[CityGMLMeshCollection] = None) -> CityGMLMeshCollection:
+    """Resolve the mesh collection ``refine_voxel_grids`` would use for
+    ``city``, in the same three-source order it applies internally:
+
+    1. ``collection``, when given, is returned as-is.
+    2. ``city.extras['citygml_collection']``, when the model still carries a
+       live in-memory collection (it does not survive save/load).
+    3. A one-off re-parse of ``city.extras['citygml_paths']`` (or
+       ``citygml_path``), when at least one of those directories still
+       exists on disk.
+
+    Raises ``MeshSourceUnavailable`` when none of the three apply.
+
+    A caller building SEVERAL levels from the same model (e.g. a level-stack
+    dispatcher calling ``refine_voxel_grids`` once per factor) should call
+    this ONCE and pass the result as ``collection=`` to every
+    ``refine_voxel_grids`` call, rather than letting each call re-resolve
+    (and, on the re-parse path, re-parse) it independently.
+    """
     if collection is not None:
         return collection
     extras = city.extras or {}
@@ -190,6 +212,11 @@ def _collection_for(city, collection) -> CityGMLMeshCollection:
     return coll
 
 
+#: The old name, kept so nothing else breaks. ``resolve_collection`` is the
+#: public entry point now.
+_collection_for = resolve_collection
+
+
 def refine_voxel_grids(city, factors: Sequence[int],
                        collection: Optional[CityGMLMeshCollection] = None,
                        max_height_m=None) -> List[np.ndarray]:
@@ -225,7 +252,7 @@ def refine_voxel_grids(city, factors: Sequence[int],
                            voxel_size=gp_full.voxel_size)
     else:
         gp0 = gp_full
-    coll = _collection_for(city, collection)
+    coll = resolve_collection(city, collection)
     lon, lat = _centre(extras)
     rect = extras["rectangle_vertices"]
     base = np.asarray(city.voxels.classes)

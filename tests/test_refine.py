@@ -3,7 +3,7 @@ import os
 import numpy as np
 import pytest
 
-from voxcitygml.voxelizer3d import Grid3DParams, _frame_extent
+from voxcitygml.voxelizer3d import Grid3DParams, frame_extent
 
 RECT = [(139.770, 35.646), (139.770, 35.650), (139.775, 35.650), (139.775, 35.646)]
 CLON = (RECT[0][0] + RECT[2][0]) / 2
@@ -38,12 +38,12 @@ def test_frame_extent_matches_compute_grid_params_3d():
     from voxcitygml.models import CityGMLMeshCollection
     from voxcitygml.voxelizer3d import _compute_grid_params_3d
     gp, _ = _compute_grid_params_3d(RECT, CLON, CLAT, 5.0, CityGMLMeshCollection())
-    _, min_x, max_x, min_y, max_y = _frame_extent(RECT, CLON, CLAT)
+    _, min_x, max_x, min_y, max_y = frame_extent(RECT, CLON, CLAT)
     assert (min_x, max_x, min_y, max_y) == (gp.min_x, gp.max_x, gp.min_y, gp.max_y)
 
 
 def test_frame_transformer_inverse_round_trips():
-    tr, min_x, max_x, min_y, max_y = _frame_extent(RECT, CLON, CLAT)
+    tr, min_x, max_x, min_y, max_y = frame_extent(RECT, CLON, CLAT)
     rng = np.random.default_rng(1)
     x = rng.uniform(min_x, max_x, 50)
     y = rng.uniform(min_y, max_y, 50)
@@ -90,7 +90,7 @@ def test_meshlib_available_or_explicitly_opted_out():
         pytrace=False)
 
 
-def _box_building(transformer, x0, y0, sx, sy, z0, sz):
+def _box_building(transformer, x0, y0, sx, sy, z0, sz, feature_type="building"):
     """A closed box in the local metre frame, returned as Mesh3D (lat, lon, z)."""
     b = trimesh.creation.box(extents=[sx, sy, sz])
     b.apply_translation([x0 + sx / 2, y0 + sy / 2, z0 + sz / 2])
@@ -98,11 +98,11 @@ def _box_building(transformer, x0, y0, sx, sy, z0, sz):
     lon, lat = transformer.inverse(v[:, 0], v[:, 1])
     verts = np.column_stack([lat, lon, v[:, 2]])
     return Mesh3D(vertices=verts, faces=np.asarray(b.faces, dtype=np.int32),
-                  feature_type="building")
+                  feature_type=feature_type)
 
 
 def _base_params_and_collection():
-    tr, min_x, max_x, min_y, max_y = _frame_extent(RECT, CLON, CLAT)
+    tr, min_x, max_x, min_y, max_y = frame_extent(RECT, CLON, CLAT)
     vs = 5.0
     n_cols = int((max_x - min_x) / vs + 0.5)
     n_rows = int((max_y - min_y) / vs + 0.5)
@@ -110,6 +110,24 @@ def _base_params_and_collection():
                       min_y=min_y, max_y=max_y, min_z=-5.0, max_z=55.0, voxel_size=vs)
     bldg = _box_building(tr, min_x + 100.0, min_y + 120.0, 30.0, 20.0, 0.0, 25.0)
     return gp, CityGMLMeshCollection(buildings=[bldg])
+
+
+def _bridge_params_and_collection():
+    """Same grid as ``_base_params_and_collection``, but with a 60x10x1 m
+    bridge deck whose bottom sits 12 m above the (flat, elevation-0) ground,
+    instead of a building. Bridges are voxelized as thin shells (surface +
+    dilation + fill) rather than a watertight solid, so the air gap under
+    the deck is not automatically preserved by construction -- worth its
+    own fixture, not a variant of the building one."""
+    tr, min_x, max_x, min_y, max_y = frame_extent(RECT, CLON, CLAT)
+    vs = 5.0
+    n_cols = int((max_x - min_x) / vs + 0.5)
+    n_rows = int((max_y - min_y) / vs + 0.5)
+    gp = Grid3DParams(n_rows=n_rows, n_cols=n_cols, n_z=12, min_x=min_x, max_x=max_x,
+                      min_y=min_y, max_y=max_y, min_z=-5.0, max_z=55.0, voxel_size=vs)
+    deck_x0, deck_y0 = min_x + 100.0, min_y + 120.0
+    deck = _box_building(tr, deck_x0, deck_y0, 60.0, 10.0, 12.0, 1.0, feature_type="bridge")
+    return gp, CityGMLMeshCollection(bridges=[deck]), deck_x0, deck_y0
 
 
 @needs_meshlib
@@ -181,7 +199,11 @@ def _canopy_top(gp):
     return top
 
 
-def _model_from(gp, coll, voxel_grid_north_up, extras_overrides=None):
+def _model_from(gp, coll, voxel_grid_north_up, extras_overrides=None, dem=None, canopy_top=None):
+    """``dem``/``canopy_top`` default to the module's asymmetric fixtures
+    (``_dem_ramp``, ``_canopy_top``); pass explicit arrays (e.g. flat zeros)
+    when a test's expected numbers were measured against a flat DEM and the
+    ramp would change them."""
     rows, cols = gp.n_rows, gp.n_cols
     extras = {"rectangle_vertices": RECT, "center_lon": CLON, "center_lat": CLAT,
               "voxel_min_z": gp.min_z, "building_lod": 2, "land_cover_source": "OpenStreetMap",
@@ -191,8 +213,9 @@ def _model_from(gp, coll, voxel_grid_north_up, extras_overrides=None):
     return _Ns(voxels=_Ns(classes=south),
                buildings=_Ns(meta=_Ns(meshsize=gp.voxel_size)),
                land_cover=_Ns(classes=np.zeros((rows, cols), np.int64)),
-               dem=_Ns(elevation=_dem_ramp(gp)),
-               tree_canopy=_Ns(top=_canopy_top(gp), bottom=None),
+               dem=_Ns(elevation=_dem_ramp(gp) if dem is None else dem),
+               tree_canopy=_Ns(top=_canopy_top(gp) if canopy_top is None else canopy_top,
+                               bottom=None),
                extras=extras)
 
 
@@ -374,10 +397,10 @@ def test_refine_voxel_grids_applies_the_dem_and_canopy_flips_correctly():
 
     Verified this fails without the fix: with the DEM's ``np.flipud`` in
     ``refine.py`` removed, the max column-0 terrain-top disagreement below
-    was 27.5 m (5.5 coarse voxels) against a base built with the SAME
-    ramp -- far past the one-coarse-voxel quantization tolerance used here
-    -- and the canopy block assertion failed outright (no TREE_CODE landed
-    in the expected fine block). Restored before committing.
+    was 27.5 m against a base built with the SAME ramp -- nearly 8x the
+    3.5 m tolerance used below -- and the canopy block assertion failed
+    outright (no TREE_CODE landed in the expected fine block). Restored
+    before committing.
     """
     gp, coll = _base_params_and_collection()
     dem_north = np.ascontiguousarray(np.flipud(_dem_ramp(gp)))
@@ -406,10 +429,17 @@ def test_refine_voxel_grids_applies_the_dem_and_canopy_flips_correctly():
     base_col0 = base_top[:, 0]
     fine_col0_down = fine_top[0::2, 0][:len(base_col0)]
     diff = np.nanmax(np.abs(fine_col0_down - base_col0))
-    assert diff <= gp.voxel_size + 1e-6, (
+    # Tolerance chosen with real headroom: with the DEM pre-resampled at
+    # grid_mode=True (refine_voxel_grids), this measures 2.5 m (one FINE
+    # voxel) on this fixture -- down from 5.0 m (one base voxel, zero
+    # margin against a 5.000001 m tolerance) before that fix, when the
+    # voxelizer's own endpoint-aligned resize introduced a phase error on
+    # top of the quantization. 3.5 m leaves 1.0 m of margin above the
+    # measured value while staying far below the 27-30 m a dropped/
+    # duplicated flip produces (see the docstring above).
+    assert diff <= 3.5, (
         f"refined terrain top disagrees with the base by {diff} m at column 0 "
-        f"(tolerance {gp.voxel_size} m, one base voxel of quantization slack) "
-        "-- looks like a dropped/duplicated DEM flip")
+        "(tolerance 3.5 m) -- looks like a dropped/duplicated DEM flip")
 
     # Canopy: base row 5 must carry TREE_CODE (that is where the spike is),
     # and the refined grid's corresponding 2x2 block (south-up rows 10-11,
@@ -418,3 +448,41 @@ def test_refine_voxel_grids_applies_the_dem_and_canopy_flips_correctly():
     assert (fine[10:12, 10:12, :] == TREE_CODE).any(), (
         "no TREE_CODE in the refined block that should nest under the base "
         "canopy spike at row 5 -- looks like a dropped/duplicated canopy flip")
+
+
+@needs_meshlib
+def test_refine_voxel_grids_keeps_air_under_a_bridge_deck_at_every_level():
+    """The design calls the air under a bridge deck load-bearing: an
+    obstruction analysis (wind, sunlight) needs the space UNDER a deck to
+    stay open at every refinement level, not get swallowed by the bridge's
+    own thin-shell fill. Measured directly rather than merely probed: of
+    the cells from the grid floor up to (excluding) the deck's first solid
+    cell, the AIR fraction is 1/2, 3/5 and 8/12 at factors 1, 2 and 4 --
+    increasing with resolution (the deck's fixed 1 m thickness costs a
+    shrinking share of ever-finer cells), and never zero."""
+    gp, coll, deck_x0, deck_y0 = _bridge_params_and_collection()
+    flat_dem = np.zeros((gp.n_rows, gp.n_cols))
+    base_grid = voxelize_citygml_meshes(coll, RECT, CLON, CLAT, gp.voxel_size,
+                                        dem_grid=flat_dem, grid_params=gp)
+    # Flat DEM, not the module's default ramp: the expected air/total counts
+    # below were measured against elevation 0 everywhere.
+    city = _model_from(gp, coll, base_grid, dem=flat_dem, canopy_top=np.zeros((gp.n_rows, gp.n_cols)))
+
+    grids = refine_voxel_grids(city, (1, 2, 4))
+
+    deck_cx, deck_cy = deck_x0 + 30.0, deck_y0 + 5.0
+    expected = {1: (1, 2), 2: (3, 5), 4: (8, 12)}
+    for f, grid in zip((1, 2, 4), grids):
+        gpf = gp.refined(f)
+        col = int((deck_cx - gpf.min_x) / gpf.voxel_size)
+        row_north = int((gpf.max_y - deck_cy) / gpf.voxel_size)
+        row_south = gpf.n_rows - 1 - row_north
+        column = grid[row_south, col, :]
+        building_idx = np.where(column == BUILDING_CODE)[0]
+        assert building_idx.size > 0, f"no deck found under its own footprint at factor {f}"
+        deck_bottom = int(building_idx.min())
+        air_below = int(np.sum(column[:deck_bottom] == 0))
+        assert air_below > 0, f"no air left under the deck at factor {f}"
+        assert (air_below, deck_bottom) == expected[f], (
+            f"factor {f}: expected {expected[f]} (air, total) cells below the "
+            f"deck, got {(air_below, deck_bottom)}")

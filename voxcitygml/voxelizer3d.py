@@ -297,7 +297,7 @@ def voxelize_citygml_meshes(
             raise ValueError(
                 f"meshsize {meshsize} does not match grid_params.voxel_size "
                 f"{gp.voxel_size}")
-        transformer, *_ = _frame_extent(rectangle_vertices, center_lon, center_lat)
+        transformer, *_ = frame_extent(rectangle_vertices, center_lon, center_lat)
 
     voxel_grid = _allocate_voxel_grid(gp, max_voxel_ram_mb=max_voxel_ram_mb)
 
@@ -420,9 +420,13 @@ def voxelize_citygml_meshes(
     return voxel_grid
 
 
-def _frame_extent(rectangle_vertices, center_lon: float, center_lat: float):
+def frame_extent(rectangle_vertices, center_lon: float, center_lat: float):
     """(transformer, min_x, max_x, min_y, max_y) of the rectangle in its own
-    rotated metric frame -- the horizontal anchor every Grid3DParams shares."""
+    rotated metric frame -- the horizontal anchor every Grid3DParams shares.
+
+    Public (no leading underscore): used by both grid-building paths in this
+    module and by ``voxcitygml.refine`` to rebuild the same frame outside it.
+    """
     _sw, _nw, _ne, _se = [tuple(v[:2]) for v in rectangle_vertices]
     check_non_degenerate(_sw, _nw, _ne)
     transformer = create_rectangle_frame_transformer(
@@ -447,7 +451,7 @@ def _compute_grid_params_3d(
     # the same guard, and today's pipeline always runs it first -- but this
     # function is module-level and takes raw vertices, so the guard travels
     # with it rather than relying on the current call order.
-    transformer, min_x, max_x, min_y, max_y = _frame_extent(
+    transformer, min_x, max_x, min_y, max_y = frame_extent(
         rectangle_vertices, center_lon, center_lat)
 
     all_z = []

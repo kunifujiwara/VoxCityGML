@@ -197,6 +197,7 @@ def voxelize_citygml_meshes(
     shell_anchor: str = "connected",
     underground_depth: float = 0.0,
     flatten_water_dem: bool = True,
+    grid_params: Optional[Grid3DParams] = None,
     *,
     info_out: Optional[dict] = None,
 ) -> np.ndarray:
@@ -265,16 +266,24 @@ def voxelize_citygml_meshes(
                 assembled ``VoxCity`` see both of them south-up.  Both
                 statements are true at once: a reader who acts on only one of
                 them writes a mirror bug.
+        grid_params: Use these grid parameters verbatim instead of deriving
+            them from the mesh bounds. ``voxcitygml.refine`` passes
+            ``Grid3DParams.refined(f)`` so a finer grid shares the base grid's
+            origin and vertical datum exactly. ``meshsize`` must equal
+            ``grid_params.voxel_size``.
     """
-    gp, transformer = _compute_grid_params_3d(
-        rectangle_vertices,
-        center_lon,
-        center_lat,
-        meshsize,
-        collection,
-        underground_depth=underground_depth,
-        dem_grid=dem_grid,
-    )
+    if grid_params is None:
+        gp, transformer = _compute_grid_params_3d(
+            rectangle_vertices, center_lon, center_lat, meshsize, collection,
+            underground_depth=underground_depth, dem_grid=dem_grid,
+        )
+    else:
+        gp = grid_params
+        if not np.isclose(float(meshsize), gp.voxel_size):
+            raise ValueError(
+                f"meshsize {meshsize} does not match grid_params.voxel_size "
+                f"{gp.voxel_size}")
+        transformer, *_ = _frame_extent(rectangle_vertices, center_lon, center_lat)
 
     voxel_grid = _allocate_voxel_grid(gp, max_voxel_ram_mb=max_voxel_ram_mb)
 

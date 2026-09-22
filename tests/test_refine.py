@@ -100,3 +100,19 @@ def test_explicit_grid_params_are_used_verbatim_and_refine_nests():
         gp.n_rows, 2, gp.n_cols, 2, gp.n_z, 2).any(axis=(1, 3, 5))
     covered = child_any[coarse == BUILDING_CODE].mean()
     assert covered >= 0.9
+
+
+def test_assembly_extras_carry_the_frame_centre():
+    from voxcitygml.pipeline import assembly_extras
+    import types
+    cfg = types.SimpleNamespace(citygml_path="p")
+    art = types.SimpleNamespace(
+        citygml_paths=["p"], land_cover_source="OpenStreetMap",
+        canopy_height_source="Static", dem_source=None, collection="COLL",
+        voxel_min_z=-5.0, mesh_vegetation_mask=np.zeros((2, 2), bool),
+        flatten_water_dem=True, water_dem_connectivity=4, water_dem_flattening={},
+        center_lon=139.7725, center_lat=35.648)
+    ex = assembly_extras(cfg, art)
+    assert ex["center_lon"] == 139.7725 and ex["center_lat"] == 35.648
+    assert ex["citygml_collection"] == "COLL" and ex["voxel_min_z"] == -5.0
+    assert ex["mesh_vegetation_mask"].shape == (2, 2)

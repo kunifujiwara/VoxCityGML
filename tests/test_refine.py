@@ -116,3 +116,95 @@ def test_assembly_extras_carry_the_frame_centre():
     assert ex["center_lon"] == 139.7725 and ex["center_lat"] == 35.648
     assert ex["citygml_collection"] == "COLL" and ex["voxel_min_z"] == -5.0
     assert ex["mesh_vegetation_mask"].shape == (2, 2)
+
+
+from voxcitygml.refine import (MeshSourceUnavailable, grid_params_from_model,
+                               refine_voxel_grids)
+
+
+class _Ns(dict):
+    """Attribute access over a dict, for VoxCity look-alikes."""
+    __getattr__ = dict.__getitem__
+
+
+def _model_from(gp, coll, voxel_grid_north_up, extras_overrides=None):
+    rows, cols = gp.n_rows, gp.n_cols
+    extras = {"rectangle_vertices": RECT, "center_lon": CLON, "center_lat": CLAT,
+              "voxel_min_z": gp.min_z, "building_lod": 2, "land_cover_source": "OpenStreetMap",
+              "citygml_collection": coll, "flatten_water_dem": True}
+    extras.update(extras_overrides or {})
+    south = np.ascontiguousarray(np.flipud(voxel_grid_north_up)).astype(np.int8)
+    return _Ns(voxels=_Ns(classes=south),
+               buildings=_Ns(meta=_Ns(meshsize=gp.voxel_size)),
+               land_cover=_Ns(classes=np.zeros((rows, cols), np.int64)),
+               dem=_Ns(elevation=np.zeros((rows, cols))),
+               tree_canopy=_Ns(top=np.zeros((rows, cols)), bottom=None),
+               extras=extras)
+
+
+@needs_meshlib
+def test_grid_params_from_model_reproduces_the_frame():
+    gp, coll = _base_params_and_collection()
+    dem = np.zeros((gp.n_rows, gp.n_cols))
+    grid = voxelize_citygml_meshes(coll, RECT, CLON, CLAT, gp.voxel_size, dem_grid=dem,
+                                   grid_params=gp)
+    city = _model_from(gp, coll, grid)
+    got = grid_params_from_model(city)
+    assert (got.n_rows, got.n_cols, got.n_z) == (gp.n_rows, gp.n_cols, gp.n_z)
+    assert got.min_x == pytest.approx(gp.min_x) and got.max_y == pytest.approx(gp.max_y)
+    assert got.min_z == gp.min_z and got.voxel_size == gp.voxel_size
+
+
+@needs_meshlib
+def test_refine_voxel_grids_returns_aligned_south_up_grids():
+    gp, coll = _base_params_and_collection()
+    dem = np.zeros((gp.n_rows, gp.n_cols))
+    grid = voxelize_citygml_meshes(coll, RECT, CLON, CLAT, gp.voxel_size, dem_grid=dem,
+                                   grid_params=gp)
+    city = _model_from(gp, coll, grid)
+    (g2,) = refine_voxel_grids(city, (2,))
+    base = city.voxels.classes
+    assert g2.shape == tuple(2 * s for s in base.shape) and g2.dtype == base.dtype
+    # south-up like the base: the building's row band doubles in place
+    rows0 = np.where((base == BUILDING_CODE).any(axis=(1, 2)))[0]
+    rows2 = np.where((g2 == BUILDING_CODE).any(axis=(1, 2)))[0]
+    assert abs(rows2.min() / 2 - rows0.min()) <= 1 and abs(rows2.max() / 2 - rows0.max()) <= 1
+
+
+@needs_meshlib
+def test_refine_voxel_grids_accepts_an_explicit_collection_when_extras_lost_it():
+    gp, coll = _base_params_and_collection()
+    dem = np.zeros((gp.n_rows, gp.n_cols))
+    grid = voxelize_citygml_meshes(coll, RECT, CLON, CLAT, gp.voxel_size, dem_grid=dem,
+                                   grid_params=gp)
+    city = _model_from(gp, coll, grid, {"citygml_collection": None})
+    (g2,) = refine_voxel_grids(city, (2,), collection=coll)
+    assert (g2 == BUILDING_CODE).any()
+
+
+def test_refine_voxel_grids_without_meshes_or_paths_raises_named_error():
+    gp, coll = _base_params_and_collection()
+    city = _model_from(gp, coll, np.zeros((gp.n_rows, gp.n_cols, gp.n_z), np.int16),
+                       {"citygml_collection": None, "citygml_paths": None})
+    with pytest.raises(MeshSourceUnavailable, match="citygml_collection"):
+        refine_voxel_grids(city, (2,))
+
+
+@needs_meshlib
+def test_refine_voxel_grids_max_height_m_shortens_the_column():
+    gp, coll = _base_params_and_collection()
+    dem = np.zeros((gp.n_rows, gp.n_cols))
+    grid = voxelize_citygml_meshes(coll, RECT, CLON, CLAT, gp.voxel_size, dem_grid=dem,
+                                   grid_params=gp)
+    city = _model_from(gp, coll, grid)
+    (g2,) = refine_voxel_grids(city, (2,), max_height_m=12.0)   # ceil(12/5) = 3 base cells
+    assert g2.shape == (2 * gp.n_rows, 2 * gp.n_cols, 6)
+    assert (g2 == BUILDING_CODE).any()
+
+
+def test_grid_params_from_model_refuses_a_grid_that_does_not_match_the_frame():
+    gp, coll = _base_params_and_collection()
+    wrong = np.zeros((gp.n_rows + 1, gp.n_cols, gp.n_z), np.int16)
+    city = _model_from(gp, coll, wrong)
+    with pytest.raises(ValueError, match="frame"):
+        grid_params_from_model(city)

@@ -241,14 +241,25 @@ def test_refine_voxel_grids_without_meshes_or_paths_raises_named_error():
 
 @needs_meshlib
 def test_refine_voxel_grids_max_height_m_shortens_the_column():
+    """``max_height_m`` clips BEFORE voxelizing, so a clip with no guard cell
+    lets ``_apply_land_cover`` recolour the ARTIFICIAL ceiling as if it were
+    the true ground surface -- a false land-cover skin that only the clipped
+    levels would carry (level 0 in voxcitywind's stack is clipped AFTER
+    voxelization, by ``clip_height``, and never sees it). The fix voxelizes
+    one guard base cell above the clip and slices it back off, so a clipped
+    run must agree with an unclipped run EXACTLY over the retained cells --
+    not just share a shape and contain a building somewhere."""
     gp, coll = _base_params_and_collection()
     dem = np.zeros((gp.n_rows, gp.n_cols))
     grid = voxelize_citygml_meshes(coll, RECT, CLON, CLAT, gp.voxel_size, dem_grid=dem,
                                    grid_params=gp)
     city = _model_from(gp, coll, grid)
-    (g2,) = refine_voxel_grids(city, (2,), max_height_m=12.0)   # ceil(12/5) = 3 base cells
-    assert g2.shape == (2 * gp.n_rows, 2 * gp.n_cols, 6)
-    assert (g2 == BUILDING_CODE).any()
+    k = 3   # ceil(12/5) = 3 base cells
+    (clipped,) = refine_voxel_grids(city, (2,), max_height_m=12.0)
+    (full,) = refine_voxel_grids(city, (2,))
+    assert clipped.shape == (2 * gp.n_rows, 2 * gp.n_cols, 2 * k)
+    assert np.array_equal(clipped, full[:, :, :2 * k])
+    assert (clipped == BUILDING_CODE).any()
 
 
 def test_grid_params_from_model_refuses_a_grid_that_does_not_match_the_frame():

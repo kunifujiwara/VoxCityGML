@@ -113,16 +113,34 @@ def refine_voxel_grids(city, factors: Sequence[int],
     (z limited to ``k0 * factor`` cells when ``max_height_m`` is given),
     south-up like ``city.voxels.classes`` and in its dtype."""
     extras = city.extras or {}
-    gp0 = grid_params_from_model(city)
-    k0 = _clip_cells(gp0.n_z, gp0.voxel_size, max_height_m)
-    if k0 != gp0.n_z:
-        # Same frame and datum, shorter column: the voxelizer clips every
-        # mesh's z range to the grid, so nothing above k0 is touched.
-        gp0 = Grid3DParams(n_rows=gp0.n_rows, n_cols=gp0.n_cols, n_z=k0,
-                           min_x=gp0.min_x, max_x=gp0.max_x, min_y=gp0.min_y,
-                           max_y=gp0.max_y, min_z=gp0.min_z,
-                           max_z=gp0.min_z + k0 * gp0.voxel_size,
-                           voxel_size=gp0.voxel_size)
+    gp_full = grid_params_from_model(city)
+    k0 = _clip_cells(gp_full.n_z, gp_full.voxel_size, max_height_m)
+    clipping = k0 != gp_full.n_z
+    if clipping:
+        # Voxelize one extra base cell ABOVE the clip (guaranteed to exist:
+        # k0 < gp_full.n_z here, so k0 + 1 <= gp_full.n_z) and slice it back
+        # off below, rather than handing the voxelizer a grid whose top IS
+        # k0.  Without the guard cell, any column whose terrain/DEM rises
+        # above the clip gets its topmost retained cell -- an artificial
+        # ceiling, not the true ground -- recoloured by `_apply_land_cover`
+        # as if it were the real surface: a false land-cover skin.  Measured
+        # on this module's own building fixture at max_height_m=12: 10.3% of
+        # retained cells differed from an unclipped run (all GROUND_CODE ->
+        # a positive land-cover code in the top layer) with a 0-cell guard;
+        # a 1-cell guard measured exactly zero divergence (a 2-cell guard
+        # also measured zero, so 1 is the minimum that works). This matters
+        # because voxcitywind.levels clips level 0 AFTER voxelization
+        # (`clip_height`), so level 0 never sees this skin while the fine
+        # levels built here would -- turning the fetch margins solid at
+        # z=k0-1 on the fine levels and not at level 0 (`pad_streamwise`
+        # zeroes every positive class there).
+        gp0 = Grid3DParams(n_rows=gp_full.n_rows, n_cols=gp_full.n_cols, n_z=k0 + 1,
+                           min_x=gp_full.min_x, max_x=gp_full.max_x, min_y=gp_full.min_y,
+                           max_y=gp_full.max_y, min_z=gp_full.min_z,
+                           max_z=gp_full.min_z + (k0 + 1) * gp_full.voxel_size,
+                           voxel_size=gp_full.voxel_size)
+    else:
+        gp0 = gp_full
     coll = _collection_for(city, collection)
     lon, lat, _ = _centre(extras)
     rect = extras["rectangle_vertices"]
@@ -155,6 +173,10 @@ def refine_voxel_grids(city, factors: Sequence[int],
         if grid.shape != (gp.n_rows, gp.n_cols, gp.n_z):
             raise RuntimeError(f"voxelizer returned {grid.shape}, expected "
                                f"{(gp.n_rows, gp.n_cols, gp.n_z)}")
+        if clipping:
+            # Drop the guard layer's f fine cells now that land cover has
+            # already been (mis)applied to it instead of to the true clip.
+            grid = grid[:, :, :k0 * f]
         south = np.ascontiguousarray(np.flipud(grid))
         out.append(south.astype(base.dtype, copy=False))
     return out

@@ -199,11 +199,13 @@ def _canopy_top(gp):
     return top
 
 
-def _model_from(gp, coll, voxel_grid_north_up, extras_overrides=None, dem=None, canopy_top=None):
-    """``dem``/``canopy_top`` default to the module's asymmetric fixtures
-    (``_dem_ramp``, ``_canopy_top``); pass explicit arrays (e.g. flat zeros)
-    when a test's expected numbers were measured against a flat DEM and the
-    ramp would change them."""
+def _model_from(gp, coll, voxel_grid_north_up, extras_overrides=None, dem=None, canopy_top=None,
+                land_cover=None):
+    """``dem``/``canopy_top``/``land_cover`` default to the module's
+    all-zero (land cover) or asymmetric (``_dem_ramp``, ``_canopy_top``)
+    fixtures; pass explicit arrays (e.g. flat zeros, a striped raster) when
+    a test's expected numbers were measured against a specific one and the
+    default would change them."""
     rows, cols = gp.n_rows, gp.n_cols
     extras = {"rectangle_vertices": RECT, "center_lon": CLON, "center_lat": CLAT,
               "voxel_min_z": gp.min_z, "building_lod": 2, "land_cover_source": "OpenStreetMap",
@@ -212,7 +214,8 @@ def _model_from(gp, coll, voxel_grid_north_up, extras_overrides=None, dem=None, 
     south = np.ascontiguousarray(np.flipud(voxel_grid_north_up)).astype(np.int8)
     return _Ns(voxels=_Ns(classes=south),
                buildings=_Ns(meta=_Ns(meshsize=gp.voxel_size)),
-               land_cover=_Ns(classes=np.zeros((rows, cols), np.int64)),
+               land_cover=_Ns(classes=np.zeros((rows, cols), np.int64) if land_cover is None
+                              else land_cover),
                dem=_Ns(elevation=_dem_ramp(gp) if dem is None else dem),
                tree_canopy=_Ns(top=_canopy_top(gp) if canopy_top is None else canopy_top,
                                bottom=None),
@@ -486,3 +489,47 @@ def test_refine_voxel_grids_keeps_air_under_a_bridge_deck_at_every_level():
         assert (air_below, deck_bottom) == expected[f], (
             f"factor {f}: expected {expected[f]} (air, total) cells below the "
             f"deck, got {(air_below, deck_bottom)}")
+
+
+def _land_cover_skin(grid):
+    """The (positive) land-cover code painted in each column, or -999 where
+    none was (e.g. no ground surface at all). With a flat DEM and no
+    buildings/vegetation there is at most one positive cell per column, so
+    ``max`` over z picks it out unambiguously (every other class code is
+    <= 0)."""
+    has_positive = (grid > 0).any(axis=2)
+    return np.where(has_positive, grid.max(axis=2), -999)
+
+
+@needs_meshlib
+def test_refine_voxel_grids_resamples_land_cover_by_nearest_repeat_at_factor4():
+    """Land cover must resample by nearest-neighbour ``np.repeat`` nesting,
+    not the endpoint-aligned ``zoom(order=0)`` the voxelizer's own
+    ``_resize_int_grid`` would otherwise apply -- see
+    ``_resample_land_cover``'s docstring for why a phase error here is
+    worse than a class relabel (it moves the water mask feeding the DEM
+    carve, not just a surface label). Factor 2 passes even without the
+    fix on this fixture (coincidence); factor 4 is where the old path
+    measurably displaced rows, so it is pinned here specifically."""
+    gp, _ = _base_params_and_collection()
+    coll = CityGMLMeshCollection()   # empty: no buildings to complicate the skin
+    flat_dem = np.zeros((gp.n_rows, gp.n_cols))
+    striped_lc = np.tile((np.arange(gp.n_rows) % 3)[:, None], (1, gp.n_cols)).astype(np.int64)
+
+    base_grid = voxelize_citygml_meshes(
+        coll, RECT, CLON, CLAT, gp.voxel_size, dem_grid=flat_dem,
+        land_cover_grid=striped_lc, land_cover_source="OpenStreetMap", grid_params=gp)
+    city = _model_from(gp, coll, base_grid, dem=flat_dem,
+                       canopy_top=np.zeros((gp.n_rows, gp.n_cols)), land_cover=striped_lc)
+
+    (fine,) = refine_voxel_grids(city, (4,))
+
+    base_skin = _land_cover_skin(city.voxels.classes)
+    fine_skin = _land_cover_skin(fine)
+    expected = np.repeat(np.repeat(base_skin, 4, axis=0), 4, axis=1)
+    assert fine_skin.shape == expected.shape
+    mismatched = int(np.sum(fine_skin != expected))
+    assert mismatched == 0, (
+        f"{mismatched} of {fine_skin.size} refined land-cover cells are not "
+        "the np.repeat nesting of the base's -- looks like the endpoint-"
+        "aligned zoom path, not nearest-neighbour np.repeat")

@@ -44,6 +44,36 @@ def _resample_grid_mode(arr: np.ndarray, target_rows: int, target_cols: int) -> 
     return zoom(arr, factor, order=1, grid_mode=True, mode="nearest")
 
 
+def _resample_land_cover(lc: np.ndarray, factor: int, target_rows: int, target_cols: int) -> np.ndarray:
+    """Nearest-neighbour upsample land cover by the exact integer ``factor``,
+    instead of handing the base-resolution array to the voxelizer's own
+    ``_resize_int_grid`` (``zoom(..., order=0)``, ``grid_mode=False`` --
+    the same endpoint-aligned phase error the DEM/canopy resample above
+    avoids). ``np.repeat`` nesting was measured exactly equal to a
+    ``grid_mode=True`` nearest-neighbour resample and is cheaper; it is also
+    orientation-agnostic for an integer factor (every child of a coarse
+    cell gets that cell's own value, regardless of which end of the axis
+    index 0 is), so unlike the DEM/canopy this needs no flip bookkeeping.
+
+    A phase error here is not merely a class relabel: ``build_cell_types``
+    maps every positive land-cover code to SOLID alike, so swapping one
+    land class for its neighbour is inert for the solver -- but this same
+    raster also drives the water mask feeding
+    ``_carve_water_to_dem_surface``, so a displaced channel edge becomes a
+    GROUND-HEIGHT change, not just a mislabelled surface. Measured on an
+    89x91 striped raster against the ``np.repeat`` nesting the level
+    contract implies: factor 2 was clean by coincidence, factor 4
+    displaced 14196 of 129584 cells (11%), with 39 of 356 rows shifted by
+    one fine row -- and factors up to 8 are reachable (four levels).
+    """
+    out = np.repeat(np.repeat(lc, factor, axis=0), factor, axis=1)
+    if out.shape != (target_rows, target_cols):
+        raise RuntimeError(
+            f"np.repeat land-cover resample gave {out.shape}, expected "
+            f"{(target_rows, target_cols)}")
+    return out
+
+
 def _centre(extras):
     """The frame anchor: ``extras['center_lon'/'center_lat']`` when recorded,
     else the target rectangle's four-vertex mean.
@@ -234,14 +264,33 @@ def refine_voxel_grids(city, factors: Sequence[int],
         # a DEM was measured to break its vertical datum and a step
         # (nearest-neighbour) resize is used instead. Do NOT change
         # ``_resize_float_grid`` itself: the main single-level pipeline
-        # depends on its current (grid_mode=False) behaviour.
+        # depends on its current (grid_mode=False) behaviour. Land cover
+        # gets its OWN pre-resample (``_resample_land_cover``, nearest via
+        # ``np.repeat``) rather than this bilinear one: interpolating class
+        # codes is meaningless, and this raster also drives the water mask
+        # feeding ``_carve_water_to_dem_surface`` -- see
+        # ``_resample_land_cover``'s docstring for the measured displacement
+        # and why it matters more than a class relabel would.
         dem_f = _resample_grid_mode(dem_n, gp.n_rows, gp.n_cols)
         top_f = None if top_n is None else _resample_grid_mode(top_n, gp.n_rows, gp.n_cols)
         bottom_f = (None if bottom_n is None
                    else _resample_grid_mode(bottom_n, gp.n_rows, gp.n_cols))
+        lc_f = _resample_land_cover(lc_s, f, gp.n_rows, gp.n_cols)
+        # The no-op claim above holds only because the voxelizer's own
+        # resize target is exactly (gp.n_rows, gp.n_cols) today. Pin that
+        # rather than trust it silently: if it ever changed, a shape
+        # mismatch here would otherwise become a second, undetected
+        # interpolation pass instead of a loud failure.
+        for name, arr in (("dem", dem_f), ("canopy_top", top_f),
+                          ("canopy_bottom", bottom_f), ("land_cover", lc_f)):
+            if arr is not None and arr.shape != (gp.n_rows, gp.n_cols):
+                raise RuntimeError(
+                    f"pre-resampled {name} raster is {arr.shape}, expected "
+                    f"{(gp.n_rows, gp.n_cols)}: the voxelizer's own resize "
+                    "target no longer matches this provider's assumption")
         grid = voxelize_citygml_meshes(
             coll, rect, lon, lat, gp.voxel_size,
-            dem_grid=dem_f, land_cover_grid=lc_s, canopy_top=top_f, canopy_bottom=bottom_f,
+            dem_grid=dem_f, land_cover_grid=lc_f, canopy_top=top_f, canopy_bottom=bottom_f,
             land_cover_source=extras.get("land_cover_source") or "OpenStreetMap",
             occupancy_threshold=vox.occupancy_threshold,
             building_shell_threshold=vox.building_shell_threshold,

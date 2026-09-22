@@ -165,6 +165,18 @@ class Grid3DParams:
         z = self.min_z + (zi + 0.5) * self.voxel_size
         return np.array([x, y, z], dtype=np.float64)
 
+    def refined(self, factor: int) -> "Grid3DParams":
+        """The same frame and datum at ``voxel_size / factor``: every coarse
+        cell becomes a factor^3 block, so a fine index // factor is the coarse
+        index. voxcitygml.refine builds its level grids on these."""
+        f = int(factor)
+        if f < 1:
+            raise ValueError(f"factor must be >= 1: {factor}")
+        return Grid3DParams(
+            n_rows=self.n_rows * f, n_cols=self.n_cols * f, n_z=self.n_z * f,
+            min_x=self.min_x, max_x=self.max_x, min_y=self.min_y, max_y=self.max_y,
+            min_z=self.min_z, max_z=self.max_z, voxel_size=self.voxel_size / f)
+
 
 def voxelize_citygml_meshes(
     collection: CityGMLMeshCollection,
@@ -385,6 +397,19 @@ def voxelize_citygml_meshes(
     return voxel_grid
 
 
+def _frame_extent(rectangle_vertices, center_lon: float, center_lat: float):
+    """(transformer, min_x, max_x, min_y, max_y) of the rectangle in its own
+    rotated metric frame -- the horizontal anchor every Grid3DParams shares."""
+    _sw, _nw, _ne, _se = [tuple(v[:2]) for v in rectangle_vertices]
+    check_non_degenerate(_sw, _nw, _ne)
+    transformer = create_rectangle_frame_transformer(
+        center_lon, center_lat, rectangle_vertices)
+    rect_lon = [v[0] for v in rectangle_vertices]
+    rect_lat = [v[1] for v in rectangle_vertices]
+    rx, ry = transformer.transform(rect_lon, rect_lat)
+    return transformer, float(min(rx)), float(max(rx)), float(min(ry)), float(max(ry))
+
+
 def _compute_grid_params_3d(
     rectangle_vertices: List[Tuple[float, float]],
     center_lon: float,
@@ -399,19 +424,8 @@ def _compute_grid_params_3d(
     # the same guard, and today's pipeline always runs it first -- but this
     # function is module-level and takes raw vertices, so the guard travels
     # with it rather than relying on the current call order.
-    _sw, _nw, _ne, _se = [tuple(v[:2]) for v in rectangle_vertices]
-    check_non_degenerate(_sw, _nw, _ne)
-
-    # Rotated local frame: the rectangle is axis-aligned in this frame, so
-    # the bbox below is tight even for a rotated target rectangle.
-    transformer = create_rectangle_frame_transformer(
-        center_lon, center_lat, rectangle_vertices)
-
-    rect_lon = [v[0] for v in rectangle_vertices]
-    rect_lat = [v[1] for v in rectangle_vertices]
-    rx, ry = transformer.transform(rect_lon, rect_lat)
-    min_x, max_x = float(min(rx)), float(max(rx))
-    min_y, max_y = float(min(ry)), float(max(ry))
+    transformer, min_x, max_x, min_y, max_y = _frame_extent(
+        rectangle_vertices, center_lon, center_lat)
 
     all_z = []
     for meshes in [collection.terrain, collection.buildings, collection.bridges, collection.vegetation]:

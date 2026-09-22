@@ -78,6 +78,12 @@ def grid_params_from_model(city) -> Grid3DParams:
                         min_z=float(min_z), max_z=float(min_z) + n_z * vs, voxel_size=vs)
 
 
+#: Distinguishes "key absent" (an older model, predating ``citygml_building_lod``)
+#: from "key present with value None" (this run's parser preference WAS
+#: "highest available") -- ``extras.get(..., None)`` cannot tell those apart.
+_UNSET = object()
+
+
 def _collection_for(city, collection) -> CityGMLMeshCollection:
     if collection is not None:
         return collection
@@ -93,16 +99,34 @@ def _collection_for(city, collection) -> CityGMLMeshCollection:
             "no mesh source: extras['citygml_collection'] is absent (it does not "
             "survive save/load) and no extras['citygml_paths'] directory exists")
     from .citygml.parser import parse_citygml_directory
-    lod = extras.get("building_lod")
+
+    # ``citygml_building_lod`` is the parser PREFERENCE this run used
+    # (``assembly_extras``, recorded faithfully including ``None`` =
+    # "highest available"). ``building_lod`` is only a fallback for models
+    # that predate it: some callers (e.g. VoxCityApp) write it as a TAG
+    # recording what LOD was actually parsed, not a preference, so it is
+    # used only when the real preference was never recorded.
+    lod = extras.get("citygml_building_lod", _UNSET)
+    if lod is _UNSET:
+        lod = extras.get("building_lod")
+    lod_pref = int(lod) if lod else None
+
+    # The buffered rectangle used at the base run, when recorded, so the
+    # re-parse sees the same buffer the terrain solid was built with at the
+    # outermost row/column; falls back to the target rectangle otherwise.
+    rect = extras.get("buffered_rectangle") or extras.get("rectangle_vertices")
+
     coll = parse_citygml_directory(
-        str(paths[0]), rectangle_vertices=extras.get("rectangle_vertices"),
+        str(paths[0]), rectangle_vertices=rect,
         feature_types=["terrain", "building", "bridge", "vegetation"],
-        building_lod=int(lod) if lod else None)
+        building_lod=lod_pref,
+        dem_path=extras.get("dem_path"),
+        tree_citygml_path=extras.get("tree_citygml_path"))
     for extra in paths[1:]:
         coll.merge(parse_citygml_directory(
-            str(extra), rectangle_vertices=extras.get("rectangle_vertices"),
+            str(extra), rectangle_vertices=rect,
             feature_types=["terrain", "building", "bridge", "vegetation"],
-            building_lod=int(lod) if lod else None))
+            building_lod=lod_pref))
     return coll
 
 
@@ -169,6 +193,7 @@ def refine_voxel_grids(city, factors: Sequence[int],
             building_shell_threshold=vox.building_shell_threshold,
             shell_anchor=vox.shell_anchor,
             flatten_water_dem=bool(extras.get("flatten_water_dem", True)),
+            max_voxel_ram_mb=extras.get("max_voxel_ram_mb"),
             grid_params=gp)
         if grid.shape != (gp.n_rows, gp.n_cols, gp.n_z):
             raise RuntimeError(f"voxelizer returned {grid.shape}, expected "

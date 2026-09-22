@@ -77,7 +77,26 @@ def assembly_extras(cfg, art) -> dict:
     """The extras dict handed to voxcity's assemble_voxcity. Module level so it
     can be tested without CityGML data. ``center_lon``/``center_lat`` are the
     3-D frame anchor; they are JSON scalars, so unlike the mesh collection
-    they survive save/load and let voxcitygml.refine rebuild the same frame."""
+    they survive save/load and let voxcitygml.refine rebuild the same frame.
+
+    ``max_voxel_ram_mb``, ``dem_path`` and ``tree_citygml_path`` are recorded
+    so a re-parse (``voxcitygml.refine._collection_for``, when the live
+    collection did not survive save/load) reproduces the base run's memory
+    guard and mesh sources instead of silently dropping them -- a dataset
+    with trees in a separate directory would otherwise lose its vegetation
+    meshes on the re-parse and get box crowns at the fine levels where the
+    base grid had real mesh trees.
+
+    ``citygml_building_lod`` records ``cfg.building_lod`` -- the parser
+    PREFERENCE this run used, ``None`` meaning "highest available" --
+    faithfully, including when it is ``None``.  This is deliberately a
+    different key from ``building_lod``: some callers (e.g. VoxCityApp)
+    write ``extras['building_lod']`` as a TAG recording what LOD was
+    actually parsed, not a preference, and conflating the two would let a
+    re-parse silently take "highest available" (feeding LOD3 meshes to the
+    fine levels of a grid built from LOD2) whenever that tag disagreed with
+    what should be re-requested.
+    """
     return {
         "citygml_path": cfg.citygml_path,
         "citygml_paths": art.citygml_paths,
@@ -95,6 +114,11 @@ def assembly_extras(cfg, art) -> dict:
         "water_dem_flattening": art.water_dem_flattening,
         "center_lon": float(art.center_lon),
         "center_lat": float(art.center_lat),
+        "buffered_rectangle": art.buffered_rectangle,
+        "max_voxel_ram_mb": cfg.max_voxel_ram_mb,
+        "citygml_building_lod": cfg.building_lod,
+        "dem_path": cfg.dem_path,
+        "tree_citygml_path": cfg.tree_citygml_path,
     }
 
 

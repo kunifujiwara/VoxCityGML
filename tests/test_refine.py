@@ -135,21 +135,26 @@ def test_explicit_grid_params_are_used_verbatim_and_refine_nests():
 def test_assembly_extras_carry_the_frame_centre():
     from voxcitygml.pipeline import assembly_extras
     import types
-    cfg = types.SimpleNamespace(citygml_path="p")
+    cfg = types.SimpleNamespace(citygml_path="p", max_voxel_ram_mb=2048.0,
+                                building_lod=None, dem_path=None, tree_citygml_path=None)
     art = types.SimpleNamespace(
         citygml_paths=["p"], land_cover_source="OpenStreetMap",
         canopy_height_source="Static", dem_source=None, collection="COLL",
         voxel_min_z=-5.0, mesh_vegetation_mask=np.zeros((2, 2), bool),
         flatten_water_dem=True, water_dem_connectivity=4, water_dem_flattening={},
-        center_lon=139.7725, center_lat=35.648)
+        center_lon=139.7725, center_lat=35.648, buffered_rectangle=RECT)
     ex = assembly_extras(cfg, art)
     assert ex["center_lon"] == 139.7725 and ex["center_lat"] == 35.648
     assert ex["citygml_collection"] == "COLL" and ex["voxel_min_z"] == -5.0
     assert ex["mesh_vegetation_mask"].shape == (2, 2)
+    assert ex["buffered_rectangle"] == RECT
+    assert ex["max_voxel_ram_mb"] == 2048.0
+    assert ex["citygml_building_lod"] is None
+    assert ex["dem_path"] is None and ex["tree_citygml_path"] is None
 
 
-from voxcitygml.refine import (MeshSourceUnavailable, grid_params_from_model,
-                               refine_voxel_grids)
+from voxcitygml.refine import (MeshSourceUnavailable, _collection_for,
+                               grid_params_from_model, refine_voxel_grids)
 
 
 class _Ns(dict):
@@ -237,6 +242,75 @@ def test_refine_voxel_grids_without_meshes_or_paths_raises_named_error():
                        {"citygml_collection": None, "citygml_paths": None})
     with pytest.raises(MeshSourceUnavailable, match="citygml_collection"):
         refine_voxel_grids(city, (2,))
+
+
+def test_collection_for_reparse_forwards_the_pipelines_settings(tmp_path, monkeypatch):
+    """No meshlib needed -- this pins ``_collection_for``'s re-parse kwargs
+    directly, without voxelizing anything.  Three settings used to be
+    dropped on the re-parse path (``dem_path``, ``tree_citygml_path``, and
+    the buffered rectangle used to build the terrain solid), and
+    ``building_lod`` was conflated with a same-named TAG some callers write
+    that is not a parser preference; this is the test that would have
+    caught all four."""
+    citygml_dir = tmp_path / "citygml"
+    citygml_dir.mkdir()
+    buffered = [(1.0, 2.0), (3.0, 4.0), (5.0, 6.0), (7.0, 8.0)]
+    extras = {
+        "citygml_collection": None,          # lost on save/load
+        "citygml_paths": [str(citygml_dir)],
+        "rectangle_vertices": RECT,
+        "buffered_rectangle": buffered,
+        "citygml_building_lod": 2,
+        "dem_path": "some_dem.tif",
+        "tree_citygml_path": "some_trees_dir",
+    }
+    city = _Ns(extras=extras)
+
+    captured = {}
+
+    def fake_parse(path, **kwargs):
+        captured["path"] = path
+        captured.update(kwargs)
+        return CityGMLMeshCollection()
+
+    monkeypatch.setattr("voxcitygml.citygml.parser.parse_citygml_directory", fake_parse)
+
+    result = _collection_for(city, None)
+
+    assert isinstance(result, CityGMLMeshCollection)
+    assert captured["path"] == str(citygml_dir)
+    assert captured["rectangle_vertices"] == buffered   # not rectangle_vertices
+    assert captured["building_lod"] == 2
+    assert captured["dem_path"] == "some_dem.tif"
+    assert captured["tree_citygml_path"] == "some_trees_dir"
+    assert captured["feature_types"] == ["terrain", "building", "bridge", "vegetation"]
+
+
+def test_collection_for_reparse_records_a_none_lod_preference_faithfully(tmp_path, monkeypatch):
+    """``citygml_building_lod`` must be distinguishable from an absent key:
+    ``None`` here means the base run's parser preference genuinely was
+    "highest available", not "unknown -- fall back to the legacy tag"."""
+    citygml_dir = tmp_path / "citygml"
+    citygml_dir.mkdir()
+    extras = {
+        "citygml_collection": None,
+        "citygml_paths": [str(citygml_dir)],
+        "rectangle_vertices": RECT,
+        "citygml_building_lod": None,
+        "building_lod": 3,   # a legacy tag that must NOT be used instead
+    }
+    city = _Ns(extras=extras)
+
+    captured = {}
+
+    def fake_parse(path, **kwargs):
+        captured.update(kwargs)
+        return CityGMLMeshCollection()
+
+    monkeypatch.setattr("voxcitygml.citygml.parser.parse_citygml_directory", fake_parse)
+
+    _collection_for(city, None)
+    assert captured["building_lod"] is None
 
 
 @needs_meshlib

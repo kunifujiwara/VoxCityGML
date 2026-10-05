@@ -157,9 +157,11 @@ is snapshotted in binary form and reused on every later run.
 
 ## Citation
 
-Please cite the [paper](https://doi.org/10.5194/isprs-annals-XII-4-W1-2026-137-2026) if you use `voxcitygml` in a scientific publication:
+Please cite both the [VoxCityGML paper](https://doi.org/10.5194/isprs-annals-XII-4-W1-2026-137-2026) and the [VoxCity paper](https://doi.org/10.1016/j.compenvurbsys.2025.102366) if you use `voxcitygml` in a scientific publication:
 
 Fujiwara K, Biljecki F., 2026. Open Urban Simulations All the Way: Extending VoxCity to CityGML and Project PLATEAU. ISPRS Annals of the Photogrammetry, Remote Sensing and Spatial Information Sciences, XII-4/W1-2026, pp.137–144. https://doi.org/10.5194/isprs-annals-XII-4-W1-2026-137-2026
+
+Fujiwara K, Tsurumi R, Kiyono T, Fan Z, Liang X, Lei B, Yap W, Ito K, Biljecki F., 2026. VoxCity: A Seamless Framework for Open Geospatial Data Integration, Grid-Based Semantic 3D City Model Generation, and Urban Environment Simulation. Computers, Environment and Urban Systems, 123, p.102366. https://doi.org/10.1016/j.compenvurbsys.2025.102366
 
 ```bibtex
 @article{fujiwara2026voxcitygml,
@@ -170,6 +172,16 @@ Fujiwara K, Biljecki F., 2026. Open Urban Simulations All the Way: Extending Vox
   pages = {137--144},
   year = {2026},
   doi = {10.5194/isprs-annals-XII-4-W1-2026-137-2026}
+}
+
+@article{fujiwara2025voxcity,
+  title={VoxCity: A Seamless Framework for Open Geospatial Data Integration, Grid-Based Semantic 3D City Model Generation, and Urban Environment Simulation},
+  author={Fujiwara, Kunihiko and Tsurumi, Ryuta and Kiyono, Tomoki and Fan, Zicheng and Liang, Xiucheng and Lei, Binyu and Yap, Winston and Ito, Koichi and Biljecki, Filip},
+  journal={Computers, Environment and Urban Systems},
+  volume = {123},
+  pages = {102366},
+  year = {2026},
+  doi = {10.1016/j.compenvurbsys.2025.102366}
 }
 ```
 

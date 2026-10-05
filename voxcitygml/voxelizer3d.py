@@ -165,6 +165,32 @@ class Grid3DParams:
         z = self.min_z + (zi + 0.5) * self.voxel_size
         return np.array([x, y, z], dtype=np.float64)
 
+    def refined(self, factor: int) -> "Grid3DParams":
+        """The same frame and datum at ``voxel_size / factor``: every coarse
+        cell becomes a factor^3 block, so a fine index // factor is the coarse
+        index. voxcitygml.refine builds its level grids on these.
+
+        The ``max_*`` bounds are inherited UNCHANGED while the counts are
+        multiplied, so for a base dimension whose extent is not a whole number
+        of cells the refined counts and the refined extent disagree (a 91-column
+        base becomes 182 where the extent gives 181). That is deliberate: the
+        index maps anchor on ``min_x`` for columns, ``min_z`` for z, and
+        ``max_y`` for ROWS (``row = (max_y - y) / voxel_size``), so recomputing
+        ``max_y`` from the refined count breaks the nesting this method exists
+        to guarantee -- measured 854 of 2000 sampled points misaligned at
+        factor 4 on a base grid whose ``min_y`` is not a voxel multiple. Only
+        the ``min_*`` anchors and ``voxel_size`` may be treated as load-bearing
+        here; the ``max_*`` values are carried for the consumers that read them
+        (``export_obj``) and must not be renormalized.
+        """
+        f = int(factor)
+        if f < 1:
+            raise ValueError(f"factor must be >= 1: {factor}")
+        return Grid3DParams(
+            n_rows=self.n_rows * f, n_cols=self.n_cols * f, n_z=self.n_z * f,
+            min_x=self.min_x, max_x=self.max_x, min_y=self.min_y, max_y=self.max_y,
+            min_z=self.min_z, max_z=self.max_z, voxel_size=self.voxel_size / f)
+
 
 def voxelize_citygml_meshes(
     collection: CityGMLMeshCollection,
@@ -185,6 +211,7 @@ def voxelize_citygml_meshes(
     shell_anchor: str = "connected",
     underground_depth: float = 0.0,
     flatten_water_dem: bool = True,
+    grid_params: Optional[Grid3DParams] = None,
     *,
     info_out: Optional[dict] = None,
     grid_shape: Optional[Tuple[int, int]] = None,
@@ -265,18 +292,26 @@ def voxelize_citygml_meshes(
             with no geodesic side length to derive from.  A value that does
             not match the caller's own 2-D grid is not detected here: it is
             taken verbatim and will silently misalign against any 2-D grid
-            the caller pairs it with.
+            the caller pairs it with.  Ignored when ``grid_params`` is given.
+        grid_params: Use these grid parameters verbatim instead of deriving
+            them from the mesh bounds. ``voxcitygml.refine`` passes
+            ``Grid3DParams.refined(f)`` so a finer grid shares the base grid's
+            origin and vertical datum exactly. ``meshsize`` must equal
+            ``grid_params.voxel_size``.
     """
-    gp, transformer = _compute_grid_params_3d(
-        rectangle_vertices,
-        center_lon,
-        center_lat,
-        meshsize,
-        collection,
-        underground_depth=underground_depth,
-        dem_grid=dem_grid,
-        grid_shape=grid_shape,
-    )
+    if grid_params is None:
+        gp, transformer = _compute_grid_params_3d(
+            rectangle_vertices, center_lon, center_lat, meshsize, collection,
+            underground_depth=underground_depth, dem_grid=dem_grid,
+            grid_shape=grid_shape,
+        )
+    else:
+        gp = grid_params
+        if not np.isclose(float(meshsize), gp.voxel_size):
+            raise ValueError(
+                f"meshsize {meshsize} does not match grid_params.voxel_size "
+                f"{gp.voxel_size}")
+        transformer, *_ = frame_extent(rectangle_vertices, center_lon, center_lat)
 
     voxel_grid = _allocate_voxel_grid(gp, max_voxel_ram_mb=max_voxel_ram_mb)
 
@@ -399,6 +434,23 @@ def voxelize_citygml_meshes(
     return voxel_grid
 
 
+def frame_extent(rectangle_vertices, center_lon: float, center_lat: float):
+    """(transformer, min_x, max_x, min_y, max_y) of the rectangle in its own
+    rotated metric frame -- the horizontal anchor every Grid3DParams shares.
+
+    Public (no leading underscore): used by both grid-building paths in this
+    module and by ``voxcitygml.refine`` to rebuild the same frame outside it.
+    """
+    _sw, _nw, _ne, _se = [tuple(v[:2]) for v in rectangle_vertices]
+    check_non_degenerate(_sw, _nw, _ne)
+    transformer = create_rectangle_frame_transformer(
+        center_lon, center_lat, rectangle_vertices)
+    rect_lon = [v[0] for v in rectangle_vertices]
+    rect_lat = [v[1] for v in rectangle_vertices]
+    rx, ry = transformer.transform(rect_lon, rect_lat)
+    return transformer, float(min(rx)), float(max(rx)), float(min(ry)), float(max(ry))
+
+
 def _compute_grid_params_3d(
     rectangle_vertices: List[Tuple[float, float]],
     center_lon: float,
@@ -424,19 +476,8 @@ def _compute_grid_params_3d(
     # the same guard, and today's pipeline always runs it first -- but this
     # function is module-level and takes raw vertices, so the guard travels
     # with it rather than relying on the current call order.
-    _sw, _nw, _ne, _se = [tuple(v[:2]) for v in rectangle_vertices]
-    check_non_degenerate(_sw, _nw, _ne)
-
-    # Rotated local frame: the rectangle is axis-aligned in this frame, so
-    # the bbox below is tight even for a rotated target rectangle.
-    transformer = create_rectangle_frame_transformer(
-        center_lon, center_lat, rectangle_vertices)
-
-    rect_lon = [v[0] for v in rectangle_vertices]
-    rect_lat = [v[1] for v in rectangle_vertices]
-    rx, ry = transformer.transform(rect_lon, rect_lat)
-    min_x, max_x = float(min(rx)), float(max(rx))
-    min_y, max_y = float(min(ry)), float(max(ry))
+    transformer, min_x, max_x, min_y, max_y = frame_extent(
+        rectangle_vertices, center_lon, center_lat)
 
     all_z = []
     for meshes in [collection.terrain, collection.buildings, collection.bridges, collection.vegetation]:

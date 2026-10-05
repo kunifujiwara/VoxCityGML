@@ -47,6 +47,7 @@ Model extras:
 from .models import VoxelizerConfig
 from .pipeline import VoxCityGML, generate_voxcity
 from .reapply import reapply_canopy
+from .refine import MeshSourceUnavailable, resolve_collection
 
 __version__ = "0.3.0"
 __author__ = "Kunihiko Fujiwara"
@@ -56,4 +57,6 @@ __all__ = [
     "VoxelizerConfig",
     "generate_voxcity",
     "reapply_canopy",
+    "MeshSourceUnavailable",
+    "resolve_collection",
 ]

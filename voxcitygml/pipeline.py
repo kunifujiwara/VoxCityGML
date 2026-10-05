@@ -73,6 +73,55 @@ def _to_south_up(arr):
     return None if arr is None else np.ascontiguousarray(np.flipud(arr))
 
 
+def assembly_extras(cfg, art) -> dict:
+    """The extras dict handed to voxcity's assemble_voxcity. Module level so it
+    can be tested without CityGML data. ``center_lon``/``center_lat`` are the
+    3-D frame anchor; they are JSON scalars, so unlike the mesh collection
+    they survive save/load and let voxcitygml.refine rebuild the same frame.
+
+    ``max_voxel_ram_mb``, ``dem_path`` and ``tree_citygml_path`` are recorded
+    so a re-parse (``voxcitygml.refine._collection_for``, when the live
+    collection did not survive save/load) reproduces the base run's memory
+    guard and mesh sources instead of silently dropping them -- a dataset
+    with trees in a separate directory would otherwise lose its vegetation
+    meshes on the re-parse and get box crowns at the fine levels where the
+    base grid had real mesh trees.
+
+    ``citygml_building_lod`` records ``cfg.building_lod`` -- the parser
+    PREFERENCE this run used, ``None`` meaning "highest available" --
+    faithfully, including when it is ``None``.  This is deliberately a
+    different key from ``building_lod``: some callers (e.g. VoxCityApp)
+    write ``extras['building_lod']`` as a TAG recording what LOD was
+    actually parsed, not a preference, and conflating the two would let a
+    re-parse silently take "highest available" (feeding LOD3 meshes to the
+    fine levels of a grid built from LOD2) whenever that tag disagreed with
+    what should be re-requested.
+    """
+    return {
+        "citygml_path": cfg.citygml_path,
+        "citygml_paths": art.citygml_paths,
+        "land_cover_source": art.land_cover_source,
+        "canopy_height_source": art.canopy_height_source,
+        "dem_source": art.dem_source,
+        "citygml_collection": art.collection,
+        "voxel_min_z": art.voxel_min_z,
+        # Pairs with voxels.classes, so it converts with it.
+        "mesh_vegetation_mask": _to_south_up(art.mesh_vegetation_mask),
+        # The same three key names voxcity's own pipeline publishes, so a
+        # consumer need not know which package built the model.
+        "flatten_water_dem": art.flatten_water_dem,
+        "water_dem_connectivity": art.water_dem_connectivity,
+        "water_dem_flattening": art.water_dem_flattening,
+        "center_lon": float(art.center_lon),
+        "center_lat": float(art.center_lat),
+        "buffered_rectangle": art.buffered_rectangle,
+        "max_voxel_ram_mb": cfg.max_voxel_ram_mb,
+        "citygml_building_lod": cfg.building_lod,
+        "dem_path": cfg.dem_path,
+        "tree_citygml_path": cfg.tree_citygml_path,
+    }
+
+
 #: VoxCity's standard land-cover codes are 1-based (1..14); 9 is Water.
 #: Spans the range and includes water itself, so a source whose conversion
 #: is not the identity cannot pass the probe below by accident.
@@ -199,23 +248,7 @@ class VoxCityGML:
             dem_grid=_to_south_up(art.dem_grid),
             canopy_height_top=_to_south_up(art.canopy_top),
             canopy_height_bottom=_to_south_up(art.canopy_bottom),
-            extras={
-                "citygml_path": cfg.citygml_path,
-                "citygml_paths": art.citygml_paths,
-                "land_cover_source": art.land_cover_source,
-                "canopy_height_source": art.canopy_height_source,
-                "dem_source": art.dem_source,
-                "citygml_collection": art.collection,
-                "voxel_min_z": art.voxel_min_z,
-                # Pairs with voxels.classes, so it converts with it.
-                "mesh_vegetation_mask": _to_south_up(art.mesh_vegetation_mask),
-                # The same three key names voxcity's own pipeline
-                # publishes, so a consumer need not know which package
-                # built the model.
-                "flatten_water_dem": art.flatten_water_dem,
-                "water_dem_connectivity": art.water_dem_connectivity,
-                "water_dem_flattening": art.water_dem_flattening,
-            },
+            extras=assembly_extras(cfg, art),
         )
 
         if cfg.save_output:

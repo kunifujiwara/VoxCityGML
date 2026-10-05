@@ -257,6 +257,17 @@ class _RectangleFrameTransformer:
         return (self._cos * x + self._sin * y,
                 -self._sin * x + self._cos * y)
 
+    def inverse(self, xs, ys):
+        """Local frame metres -> (lons, lats): undo the rotation, then the
+        base projection. Test geometry is built in the local frame and
+        converted with this, so it lands exactly where the forward
+        transform expects it."""
+        X = np.asarray(xs, dtype=np.float64)
+        Y = np.asarray(ys, dtype=np.float64)
+        x = self._cos * X - self._sin * Y
+        y = self._sin * X + self._cos * Y
+        return self._base.transform(x, y, direction="INVERSE")
+
 
 def create_rectangle_frame_transformer(center_lon: float, center_lat: float,
                                        rectangle_vertices):

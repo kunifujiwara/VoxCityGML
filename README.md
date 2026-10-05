@@ -155,6 +155,24 @@ is snapshotted in binary form and reused on every later run.
 6. **Voxelize** all meshes into a shared 3-D grid, overlay land-cover & canopy
 7. **Combine** all layers → VoxCity model
 
+## Citation
+
+Please cite the [paper](https://doi.org/10.5194/isprs-annals-XII-4-W1-2026-137-2026) if you use `voxcitygml` in a scientific publication:
+
+Fujiwara K, Biljecki F., 2026. Open Urban Simulations All the Way: Extending VoxCity to CityGML and Project PLATEAU. ISPRS Annals of the Photogrammetry, Remote Sensing and Spatial Information Sciences, XII-4/W1-2026, pp.137–144. https://doi.org/10.5194/isprs-annals-XII-4-W1-2026-137-2026
+
+```bibtex
+@article{fujiwara2026voxcitygml,
+  title={Open Urban Simulations All the Way: Extending VoxCity to CityGML and Project PLATEAU},
+  author={Fujiwara, Kunihiko and Biljecki, Filip},
+  journal={ISPRS Annals of the Photogrammetry, Remote Sensing and Spatial Information Sciences},
+  volume = {XII-4/W1-2026},
+  pages = {137--144},
+  year = {2026},
+  doi = {10.5194/isprs-annals-XII-4-W1-2026-137-2026}
+}
+```
+
 ## License
 
 This project is licensed under the MIT License — see [LICENSE](LICENSE) for details.
